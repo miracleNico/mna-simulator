@@ -60,9 +60,13 @@ FLOORS: dict[str, float] = {
     # HB mixer >= 2x
     "hb_mixer_h205": 2.0,
     "hb_mixer_h64": 2.0,
-    # MOR basis >= 2x, TPWL training >= 2x
-    "mor_basis_rlc_1035": 2.0,
-    "tpwl_train_sram_248": 2.0,
+    # MOR (P5): half of the median 1-thread speedup of three runs on a shared 4-CPU Linux VM:
+    # basis 30.8x (dense G/C to CSC included), TPWL training 152x, reduced AC 38.9x, reduced
+    # transient 74.3x. Thread counts change nothing at n < 2048 (MOR_PARALLEL_MIN_UNKNOWNS).
+    "mor_basis_rlc_1035": 15.0,
+    "tpwl_train_sram_248": 75.0,
+    "mor_ac_rlc_1035": 19.0,
+    "mor_tran_rlc_1035": 37.0,
 }
 
 # Thread scaling: core time at 1 thread / core time at N threads, on machines with >= N CPUs.

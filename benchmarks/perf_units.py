@@ -237,6 +237,22 @@ def parity_basis(ref_out: Any, core_out: Any) -> float:
     return subspace_distance(ref_out, core_out)
 
 
+def mor_output_values(result: Any) -> np.ndarray:
+    """Selected outputs of a ``SpectrumResult`` (magnitudes) or ``WaveformResult`` (values)."""
+
+    for name in ("magnitudes", "values"):
+        value = _field(result, name)
+        if value is not None:
+            return np.asarray(value, dtype=float)
+    return np.asarray(analysis_values(result), dtype=float)
+
+
+def parity_mor_output(ref_out: Any, core_out: Any) -> float:
+    """Reduced outputs (spectrum magnitudes or waveform values): ``max_rel_error``."""
+
+    return max_rel_error(mor_output_values(ref_out), mor_output_values(core_out))
+
+
 def parity_tpwl(ref_out: Any, core_out: Any) -> float:
     """TPWL training: training trajectory (relative error) and POD basis (subspace distance)."""
 
@@ -298,6 +314,13 @@ def _netlist(name: str, smoke: bool) -> str:
         return wl.sram_netlist(rows=10, cols=10, step="0.25n")
     if name == "rlc":
         return wl.rlc_mesh_netlist(4, 4) if smoke else wl.rlc_mesh_netlist(23, 23)
+    if name == "rlc_ac":
+        # The RLC mesh driven by an AC current source (its STEP source has no AC part, so the
+        # plain mesh's AC response is identically zero).
+        text = wl.rlc_mesh_netlist(4, 4) if smoke else wl.rlc_mesh_netlist(23, 23)
+        if not text.startswith("IIN n_0_0 0 STEP 1m 20n\n"):
+            raise RuntimeError("rlc_mesh_netlist no longer starts with the STEP source the AC variant replaces")
+        return text.replace("IIN n_0_0 0 STEP 1m 20n", "IIN n_0_0 0 AC 1m", 1)
     if name == "bjt":
         return wl.BJT_THREE_STAGE
     if name == "mixer_h205":
@@ -450,13 +473,27 @@ def _setup_basic(name: str, mode: str, full: dict[str, Any], smoke_overrides: di
     return setup
 
 
+def _mor_outputs(smoke: bool) -> list[str]:
+    """Selected outputs of the RLC-mesh MOR units: the mesh centre and the far corner.
+
+    Not the driven node n_0_0: with an output at the input node, the adjoint solve at the
+    expansion point 0 reproduces the input solve's direction, and the reference's single-pass
+    Gram-Schmidt accepts the rounding residual of that duplicate (relative size ~1e-16, above
+    its absolute 1e-14 threshold) as a basis column. Its basis is then numerically singular
+    (cond ~1e15) and every later column, and the reduced outputs, are rounding noise that no
+    other implementation reproduces. With these outputs both bases are orthonormal and equal
+    up to rotation (subspace distance ~1e-13).
+    """
+
+    return ["V(n_2_2)", "V(n_3_3)"] if smoke else ["V(n_11_11)", "V(n_22_22)"]
+
+
 def _setup_mor_basis_rlc(smoke: bool = False) -> dict[str, Any]:
     """Arguments of ``build_linear_krylov_basis`` as ``solve_transient_mor`` builds them."""
 
     ref = _reference_modules()
     w = _workload("rlc", smoke)
-    corner = "V(n_3_3)" if smoke else "V(n_22_22)"
-    outputs = ["V(n_0_0)", corner]
+    outputs = _mor_outputs(smoke)
     selector, output_labels = ref.mor_selectors.build_output_selector(w.labels, outputs)
     inputs = ref.mor_linear._source_directions(w.problem)
     order, _mode = ref.mor_metadata.resolve_mor_order(
@@ -492,6 +529,47 @@ def _setup_tpwl_sram(smoke: bool = False) -> dict[str, Any]:
         "f_tol": 1e-9,
         "output_count": 1,
     }
+
+
+def _setup_mor_ac_rlc(smoke: bool = False) -> dict[str, Any]:
+    """``solve_ac_mor`` keyword arguments on the AC-driven RLC mesh (validate=False)."""
+
+    w = _workload("rlc_ac", smoke)
+    outputs = _mor_outputs(smoke)
+    kwargs = {
+        "f_start": 1e6,
+        "f_stop": 1e9,
+        "points": 5 if smoke else 100,
+        "mor_output_nodes": outputs,
+        "mor_order": "auto",
+        "requested_method": "auto",
+        "validate": False,
+        "probe_nodes": outputs,
+        "max_iter": 10000,
+        "v_tol": 1e-9,
+        "f_tol": 1e-9,
+    }
+    return {"workload": w, "problem": w.problem, "netlist": w.netlist, "kwargs": kwargs}
+
+
+def _setup_mor_tran_rlc(smoke: bool = False) -> dict[str, Any]:
+    """``solve_transient_mor`` keyword arguments on the RLC mesh, 40 x 1 ns (validate=False)."""
+
+    w = _workload("rlc", smoke)
+    outputs = _mor_outputs(smoke)
+    kwargs = {
+        "t_stop": 30e-9 if smoke else 40e-9,
+        "t_step": 1e-9,
+        "mor_output_nodes": outputs,
+        "mor_order": "auto",
+        "requested_method": "auto",
+        "validate": False,
+        "probe_nodes": outputs,
+        "max_iter": 10000,
+        "v_tol": 1e-9,
+        "f_tol": 1e-9,
+    }
+    return {"workload": w, "problem": w.problem, "netlist": w.netlist, "kwargs": kwargs}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -560,6 +638,15 @@ def _ref_tpwl(inputs: dict[str, Any]) -> dict[str, Any]:
         f_tol=inputs["f_tol"],
         output_count=inputs["output_count"],
     )
+
+
+def _ref_mor_ac(inputs: dict[str, Any]) -> Any:
+    return _reference_modules().mor_linear.solve_ac_mor(inputs["problem"], **inputs["kwargs"])
+
+
+def _ref_mor_tran(inputs: dict[str, Any]) -> Any:
+    waveform, _metadata = _reference_modules().mor_linear.solve_transient_mor(inputs["problem"], **inputs["kwargs"])
+    return waveform
 
 
 # ---------------------------------------------------------------------------------------------
@@ -897,12 +984,63 @@ def _core_hb_mixer_h64(core_inputs: Any, num_threads: int) -> Any:
 # P5: model-order reduction.
 
 
-def _core_mor_basis_rlc_1035(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P5: native rational Krylov basis (mor_linear_basis)")
+def _core_mor_basis_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> np.ndarray:
+    """``mor.linear.build_linear_krylov_basis`` on the setup's dense ``G``/``C`` (CSC conversion included)."""
+
+    from mna_simulation.mor.linear import build_linear_krylov_basis
+
+    return build_linear_krylov_basis(
+        core_inputs["G"],
+        core_inputs["C"],
+        core_inputs["inputs"],
+        core_inputs["selector"],
+        core_inputs["shifts"],
+        core_inputs["order"],
+        num_threads=num_threads,
+    )
 
 
-def _core_tpwl_train_sram_248(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P5: native TPWL training (tpwl_train)")
+def _live_problem(netlist: str) -> Any:
+    from mna_simulation.mna_builder import build_mna_problem
+    from mna_simulation.netlist import parse_netlist_text
+
+    _native()
+    return build_mna_problem(parse_netlist_text(netlist))
+
+
+def _core_setup_tpwl(inputs: dict[str, Any]) -> dict[str, Any]:
+    """The live package's problem for ``_train_tpwl`` (untimed, like the reference's prebuilt problem)."""
+
+    keys = ("t_stop", "t_step", "order", "max_iter", "v_tol", "f_tol", "output_count")
+    return {"problem": _live_problem(inputs["netlist"]), **{key: inputs[key] for key in keys}}
+
+
+def _core_tpwl_train_sram_248(core_inputs: dict[str, Any], num_threads: int) -> dict[str, Any]:
+    """``mor.tpwl._train_tpwl``: native transient, native POD, native local models."""
+
+    from mna_simulation.mor.tpwl import _train_tpwl
+
+    params = {key: value for key, value in core_inputs.items() if key != "problem"}
+    return _train_tpwl(core_inputs["problem"], num_threads=num_threads, **params)
+
+
+def _core_setup_mor_live(inputs: dict[str, Any]) -> dict[str, Any]:
+    """The live problem built from the same netlist and the same keyword arguments (untimed)."""
+
+    return {"problem": _live_problem(inputs["netlist"]), "kwargs": dict(inputs["kwargs"])}
+
+
+def _core_mor_ac_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    from mna_simulation.mor.linear import solve_ac_mor
+
+    return solve_ac_mor(core_inputs["problem"], num_threads=num_threads, **core_inputs["kwargs"])
+
+
+def _core_mor_tran_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    from mna_simulation.mor.linear import solve_transient_mor
+
+    waveform, _metadata = solve_transient_mor(core_inputs["problem"], num_threads=num_threads, **core_inputs["kwargs"])
+    return waveform
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1219,7 +1357,7 @@ _register(
     phase="P5",
     tolerance=TOL_MOR,
     description=(
-        "rational Krylov basis (shifts 0, 1/h; outputs V(n_0_0), V(n_22_22); auto order) "
+        "rational Krylov basis (shifts 0, 1/h; outputs V(n_11_11), V(n_22_22); auto order) "
         "via mor.linear.build_linear_krylov_basis"
     ),
 )
@@ -1230,10 +1368,43 @@ _register(
     setup=_setup_tpwl_sram,
     reference=_ref_tpwl,
     core=_core_tpwl_train_sram_248,
+    core_setup=_core_setup_tpwl,
     parity=parity_tpwl,
     phase="P5",
     tolerance=TOL_MOR,
     description="TPWL training on the SRAM .tran 6n/0.25n (full transient, POD, local models) via mor.tpwl._train_tpwl",
+)
+_register(
+    id="mor_ac_rlc_1035",
+    category="mor",
+    size={**_RLC, "points": 100, "order": 12},
+    setup=_setup_mor_ac_rlc,
+    reference=_ref_mor_ac,
+    core=_core_mor_ac_rlc_1035,
+    core_setup=_core_setup_mor_live,
+    parity=parity_mor_output,
+    phase="P5",
+    tolerance=TOL_MOR,
+    description=(
+        "linear Krylov MOR .ac 1 MHz..1 GHz, 100 points, outputs V(n_11_11), V(n_22_22), AC-driven RLC mesh "
+        "(mor.linear.solve_ac_mor, validate=False)"
+    ),
+)
+_register(
+    id="mor_tran_rlc_1035",
+    category="mor",
+    size={**_RLC, "steps": 40, "order": 12},
+    setup=_setup_mor_tran_rlc,
+    reference=_ref_mor_tran,
+    core=_core_mor_tran_rlc_1035,
+    core_setup=_core_setup_mor_live,
+    parity=parity_mor_output,
+    phase="P5",
+    tolerance=TOL_MOR,
+    description=(
+        "linear Krylov MOR .tran 40 x 1 ns, outputs V(n_11_11), V(n_22_22), RLC mesh "
+        "(mor.linear.solve_transient_mor, validate=False)"
+    ),
 )
 
 

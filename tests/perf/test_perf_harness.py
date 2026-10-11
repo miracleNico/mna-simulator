@@ -63,6 +63,9 @@ PLAN_UNITS = {
     # MOR basis and TPWL training
     "mor_basis_rlc_1035",
     "tpwl_train_sram_248",
+    # reduced AC / transient end to end (P5)
+    "mor_ac_rlc_1035",
+    "mor_tran_rlc_1035",
 }
 
 # Units whose native side exists today (P0: _core.klu_solve).
