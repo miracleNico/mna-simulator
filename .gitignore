@@ -11,3 +11,26 @@ app/web/.vite/
 # Editors / OS
 .DS_Store
 Thumbs.db
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/
+
+# Packaging / build outputs. Anchored to the repository root so that the
+# tracked frontend bundle in app/web/dist/ (and future rebuilds of it) is not
+# silently ignored; whether to keep tracking it is a separate decision.
+*.egg-info/
+/build/
+/dist/
+/wheelhouse/
+*.whl
+
+# Native extension artefacts
+*.so
+*.pyd
+cpp/build*/
+
+# Coverage
+.coverage*
+htmlcov/

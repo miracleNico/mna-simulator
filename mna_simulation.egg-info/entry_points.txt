@@ -1,2 +1,0 @@
-[console_scripts]
-mna-sim = mna_simulation.cli:main

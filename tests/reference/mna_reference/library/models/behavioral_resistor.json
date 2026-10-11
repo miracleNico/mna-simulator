@@ -1,0 +1,13 @@
+{
+  "name": "behavioral_resistor",
+  "symbol": "X",
+  "pins": ["p", "n"],
+  "parameter_schema": {
+    "resistance_expr": "Resistance expression or parameter"
+  },
+  "backend_model_type": "prototype",
+  "defaults": {
+    "resistance_expr": "1k"
+  },
+  "stamp_hook": "prototype_behavioral_resistor"
+}
