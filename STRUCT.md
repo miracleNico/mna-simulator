@@ -27,6 +27,10 @@ This document describes the project-authored source, config, docs, and tests. It
 ### `STRUCT.md`
 - This file-by-file architecture reference.
 
+### `PERFORMANCE_PLAN.md`
+- Measured performance review of the Python core (profiles of the SRAM, RLC mesh, BJT amplifier, and harmonic-balance workloads).
+- Prioritized plan for multithreading and solver changes, and the research on a C++ kernel migration.
+
 ### `pyproject.toml`
 - Python package metadata.
 - Declares runtime dependencies (`numpy`, `scipy`, `sympy`, `fastapi`, `uvicorn`, etc.).
@@ -266,6 +270,18 @@ This document describes the project-authored source, config, docs, and tests. It
 
 ### `benchmarks/benchmark_basic.py`
 - Lightweight benchmark for the basic solver path.
+
+### `benchmarks/workload_netlists.py`
+- Netlist generators for the representative workloads (10x10 Level-1 SRAM, 23x23 RLC mesh, three-stage BJT amplifier, close-tone HB mixer).
+
+### `benchmarks/benchmark_workloads.py`
+- Wall-clock table (optionally with cProfile hot spots) for the workloads referenced by `PERFORMANCE_PLAN.md`.
+
+### `benchmarks/blas_contention.py`
+- Runs concurrent simulations under different `OPENBLAS_NUM_THREADS` settings to show the multithreaded-BLAS oversubscription collapse.
+
+### `benchmarks/prototypes/`
+- Research prototypes behind the plan: vectorized NumPy, Numba, and pybind11 C++ Level-1 MOS kernels, a kernel comparison harness, and a cached sparse-LU versus dense solve benchmark. Not imported by the package.
 
 ## Legacy: `legacy/`
 
