@@ -1,13 +1,15 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=1.0", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "mna-simulation"
-version = "0.60.0"
+version = "0.70.0"
 description = "Layered MNA circuit simulator with CLI, API, and schematic UI scaffold."
 readme = "README.md"
 requires-python = ">=3.12"
+# Notices of the third-party code compiled into mna_simulation._core (shipped in .dist-info/licenses).
+license-files = ["cpp/third_party/LICENSES/*"]
 dependencies = [
   "numpy",
   "scipy",
@@ -22,10 +24,40 @@ dependencies = [
 dev = [
   "pytest>=8,<9",
   "httpx>=0.27,<1",
+  "pytest-cov>=5",
+  "threadpoolctl>=3",
 ]
 
 [project.scripts]
 mna-sim = "mna_simulation.cli:main"
 
-[tool.setuptools.packages.find]
-include = ["mna_simulation*"]
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.26"
+cmake.source-dir = "cpp"
+cmake.build-type = "Release"
+cmake.define.MNA_BUILD_TESTS = "OFF"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["mna_simulation"]
+# nanobind STABLE_ABI + cp312: one abi3 wheel serves CPython 3.12 and later.
+wheel.py-api = "cp312"
+# Editable installs use the default redirect mode: re-run `pip install -e .` after adding
+# or moving Python modules or changing C++ sources (the in-place mode would build inside cpp/).
+wheel.exclude = ["**/__pycache__", "**/*.pyc"]
+sdist.exclude = [
+  "app/web/node_modules",
+  "app/web/dist",
+  "__pycache__",
+  "*.egg-info",
+  "build",
+  "build-cpp",
+  "legacy",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "perf: performance measurements (timing-sensitive, not run by default in CI gates)",
+  "slow: long-running tests",
+  "differential: compares the native core against the Python reference implementation",
+]
