@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -146,6 +147,13 @@ TEST_CASE("singular matrices raise JACOBIAN_SINGULAR") {
                   lu.factor(std::vector<double>{1.0, 1.0});
               }) == ErrorCode::JacobianSingular);
     }
+    SUBCASE("no entries at all (empty value array)") {
+        CHECK(code_of([] {
+                  KluSolver lu;
+                  lu.analyze(3, std::vector<std::int32_t>{0, 0, 0, 0}, std::vector<std::int32_t>{});
+                  lu.factor(std::vector<double>{});
+              }) == ErrorCode::JacobianSingular);
+    }
     SUBCASE("solver stays usable after a singular factorization") {
         KluSolver lu;
         lu.analyze(2, std::vector<std::int32_t>{0, 2, 4}, std::vector<std::int32_t>{0, 1, 0, 1});
@@ -262,4 +270,67 @@ TEST_CASE("KluSolver is movable") {
     std::vector<double> one = {1.0};
     a.solve(one);
     CHECK(one[0] == doctest::Approx(0.5));
+}
+
+TEST_CASE("transpose solve matches a solve with the explicit transpose") {
+    // B = [[4, 2, 0], [1, 3, 5], [0, 1, 6]] (non-symmetric, det 40) and its
+    // transpose built by hand on the same (symmetric) pattern.
+    const std::vector<std::int32_t> Bp = {0, 2, 5, 7};
+    const std::vector<std::int32_t> Bi = {0, 1, 0, 1, 2, 1, 2};
+    const std::vector<double> Bx = {4.0, 1.0, 2.0, 3.0, 1.0, 5.0, 6.0};
+    const std::vector<double> BTx = {4.0, 2.0, 1.0, 3.0, 5.0, 1.0, 6.0};
+    KluSolver lu;
+    lu.analyze(3, Bp, Bi);
+    lu.factor(Bx);
+    KluSolver lt;
+    lt.analyze(3, Bp, Bi);
+    lt.factor(BTx);
+
+    const std::vector<double> x = {1.5, -2.0, 0.25};
+    std::vector<double> b = multiply(Bp, Bi, BTx, x);  // b = B^T x
+    std::vector<double> b_explicit = b;
+    lu.tsolve(b);
+    lt.solve(b_explicit);
+    for (std::size_t i = 0; i < x.size(); ++i) {
+        CHECK(b[i] == doctest::Approx(x[i]).epsilon(1e-14));
+        CHECK(b[i] == doctest::Approx(b_explicit[i]).epsilon(1e-14));
+    }
+    // conjugate has no effect for real matrices; several right-hand sides.
+    std::vector<double> two = multiply(Bp, Bi, BTx, x);
+    const std::vector<double> second = multiply(Bp, Bi, BTx, std::vector<double>{0.0, 1.0, 0.0});
+    two.insert(two.end(), second.begin(), second.end());
+    lu.tsolve(two, 2, /*conjugate=*/true);
+    CHECK(two[0] == doctest::Approx(1.5).epsilon(1e-14));
+    CHECK(two[4] == doctest::Approx(1.0).epsilon(1e-14));
+    CHECK(std::abs(two[3]) < 1e-14);
+    CHECK(std::abs(two[5]) < 1e-14);
+
+    KluSolver empty;
+    empty.analyze(0, std::vector<std::int32_t>{0}, std::vector<std::int32_t>{});
+    empty.factor(std::vector<double>{});
+    std::vector<double> none;
+    empty.tsolve(none);
+    CHECK(none.empty());
+}
+
+TEST_CASE("refactor falls back to a full factorization when the pivot ratio collapses") {
+    // A1 = [[1, 1], [1, 2]] pivots on the diagonal. A2 = [[1e-20, 1], [1, 1e-20]]
+    // refactors without a zero pivot in that order (whichever column comes
+    // first), but the pivots 1e-20 and 1e-20 - 1e20 give rcond = 1e-40 <
+    // kRefactorRcondFloor: a full factorization with fresh pivoting runs instead.
+    const std::vector<std::int32_t> Ap = {0, 2, 4};
+    const std::vector<std::int32_t> Ai = {0, 1, 0, 1};
+    KluSolver lu;
+    lu.analyze(2, Ap, Ai);
+    lu.factor(std::vector<double>{1.0, 1.0, 1.0, 2.0});
+    const std::vector<double> ax2 = {1e-20, 1.0, 1.0, 1e-20};
+    CHECK(lu.refactor(ax2) == FactorPath::FullFactor);
+    CHECK(lu.rcond() >= mna::linear::kRefactorRcondFloor);
+    const std::vector<double> x = {2.0, -1.0};
+    std::vector<double> b = multiply(Ap, Ai, ax2, x);
+    lu.solve(b);
+    CHECK(b[0] == doctest::Approx(2.0).epsilon(1e-14));
+    CHECK(b[1] == doctest::Approx(-1.0).epsilon(1e-14));
+    CHECK(std::string(mna::linear::factor_path_name(FactorPath::FullFactor)) == "full_factor");
+    CHECK(std::string(mna::linear::factor_path_name(FactorPath::Refactor)) == "refactor");
 }
