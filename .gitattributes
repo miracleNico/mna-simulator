@@ -1,0 +1,2 @@
+# The frozen Python oracle is hashed byte for byte; keep it LF on every platform.
+tests/reference/** text eol=lf

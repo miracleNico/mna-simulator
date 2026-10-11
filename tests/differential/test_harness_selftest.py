@@ -43,7 +43,9 @@ def _tree_digest(root: Path) -> tuple[int, str]:
         if path.is_file() and "__pycache__" not in path.parts and path.name != "FROZEN_AT.txt"
     )
     for path in files:
-        digest.update(path.relative_to(root).as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+        # Windows checkouts may convert line endings; the recipe hashes LF-normalized bytes.
+        content = path.read_bytes().replace(b"\r\n", b"\n")
+        digest.update(path.relative_to(root).as_posix().encode() + b"\0" + content + b"\0")
     return len(files), digest.hexdigest()
 
 

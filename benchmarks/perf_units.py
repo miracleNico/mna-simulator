@@ -158,9 +158,10 @@ def subspace_distance(ref_basis: Any, core_basis: Any) -> float:
         return 0.0
     qa, _ = np.linalg.qr(a)
     qb, _ = np.linalg.qr(b)
-    cosines = np.linalg.svd(qa.T @ qb, compute_uv=False)
-    smallest = float(min(np.min(cosines), 1.0))
-    return float(np.sqrt(max(0.0, 1.0 - smallest * smallest)))
+    # Largest singular value of (I - Qa Qa^T) Qb = sin of the largest principal angle.
+    # (sqrt(1 - cos^2) would turn a one-ulp error in cos into sqrt(eps) ~ 1.5e-8.)
+    residual = qb - qa @ (qa.T @ qb)
+    return float(min(np.linalg.norm(residual, 2), 1.0))
 
 
 def _dense(value: Any) -> Any:

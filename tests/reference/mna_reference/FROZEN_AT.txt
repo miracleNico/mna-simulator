@@ -5,4 +5,4 @@ source: mna_simulation/ (all subpackages and library/models/*.json, __pycache__ 
 verified: every file is byte-identical to `git show e5172cb:mna_simulation/<path>`
 files: 25
 tree_sha256: b5bd5fd57d7a4c80ad3ac251e0733e5988280f6719c315dfcb432479e2f9e304
-tree_sha256_recipe: sha256 over sorted POSIX relative paths, each fed as path + NUL + file bytes + NUL; __pycache__ and this file excluded (checked by tests/differential/test_harness_selftest.py)
+tree_sha256_recipe: sha256 over sorted POSIX relative paths, each fed as path + NUL + file bytes (CRLF normalized to LF) + NUL; __pycache__ and this file excluded (checked by tests/differential/test_harness_selftest.py)
