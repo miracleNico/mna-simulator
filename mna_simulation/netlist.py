@@ -70,21 +70,7 @@ class Component:
         if not parts:
             error_handler("NETLIST_FATAL: Empty component definition.")
 
-        name_token = parts[0]
-        explicit = cls.EXPLICIT_TYPE_PATTERN.match(name_token)
-        if explicit is not None:
-            name = explicit.group(1)
-            type_ = explicit.group(2).upper()
-        else:
-            if not cls.COMPONENT_PATTERN.match(name_token):
-                error_handler(f"COMPONENT_ERROR: Invalid component name: '{name_token}'")
-            name = name_token
-            type_ = cls.get_type(name)
-            if type_ is None:
-                error_handler(
-                    f"COMPONENT_ERROR: Cannot infer type from '{name_token}'. "
-                    f"Use '<name>:<TYPE>' to declare the type explicitly."
-                )
+        name, type_ = _name_and_type(parts[0])
 
         component = cls(name=name)
         component.type = type_
@@ -121,29 +107,27 @@ class Component:
         """
 
         upper_name = name.upper()
-        for prefix, normalized in (
-            ("VCVS", "VCVS"),
-            ("VCCS", "VCCS"),
-            ("CCVS", "CCVS"),
-            ("CCCS", "CCCS"),
-            ("GND", "GND"),
-            ("R", "R"),
-            ("C", "C"),
-            ("L", "L"),
-            ("V", "V"),
-            ("I", "I"),
-            ("E", "VCVS"),
-            ("G", "VCCS"),
-            ("F", "CCCS"),
-            ("H", "CCVS"),
-            ("D", "D"),
-            ("B", "B"),
-            ("Q", "QNPN"),
-            ("M", "NMOS"),
-        ):
-            if upper_name.startswith(prefix):
-                return normalized
-        return None
+        # Only names starting with V, C or G have a multi-letter prefix; every other
+        # prefix is the single first letter (same result as testing the prefixes
+        # VCVS, VCCS, CCVS, CCCS, GND, R, C, L, V, I, E, G, F, H, D, B, Q, M in order).
+        initial = upper_name[:1]
+        if initial == "V":
+            if upper_name.startswith("VCVS"):
+                return "VCVS"
+            if upper_name.startswith("VCCS"):
+                return "VCCS"
+            return "V"
+        if initial == "C":
+            if upper_name.startswith("CCVS"):
+                return "CCVS"
+            if upper_name.startswith("CCCS"):
+                return "CCCS"
+            return "C"
+        if initial == "G":
+            if upper_name.startswith("GND"):
+                return "GND"
+            return "VCCS"
+        return _SINGLE_LETTER_TYPES.get(initial)
 
     @classmethod
     def _parse_passive(cls, component: "Component", parts: list[str]) -> None:
@@ -378,10 +362,7 @@ class Component:
 
     @staticmethod
     def _validate_distinct_nodes(component: "Component") -> None:
-        if component.node1 == component.node2:
-            error_handler(
-                f"COMPONENT_ERROR: '{component.name}' has conflict in nodes: '{component.node1, component.node2}'"
-            )
+        _check_distinct_nodes(component.name, component.node1, component.node2)
 
     def validate(self) -> bool:
         """Validate node names and parameter shapes."""
@@ -390,7 +371,7 @@ class Component:
             error_handler(f"NETLIST_FATAL: '{self.name}' has unknown component type.")
 
         if self.type == "GND":
-            if self.node1 is None or not self.NODE_PATTERN.match(self.node1):
+            if self.node1 is None or not _node_name_ok(self.node1):
                 error_handler(
                     f"NETLIST_FATAL: '{self.name}' has invalid GND node name '{self.node1}'."
                 )
@@ -403,7 +384,7 @@ class Component:
             nodes_to_check.append(self.ctrl_node2)
 
         for node in nodes_to_check:
-            if node is None or not self.NODE_PATTERN.match(node):
+            if node is None or not _node_name_ok(node):
                 error_handler(
                     f"NETLIST_FATAL: '{self.name}' has invalid node name '{node}'. "
                     f"Use '0' for ground, or any alphanumeric identifier."
@@ -412,19 +393,19 @@ class Component:
         if self.type in {"V", "I"}:
             if self.subtype not in {"AC", "COS", "SIN", "DC", "FUNC", "STEP"}:
                 error_handler(f"NETLIST_FATAL: '{self.name}' has invalid subtype '{self.subtype}'.")
-            if self.subtype in {"DC", "AC"} and not self.INDEPENDENT_VAL_PATTERN.match(self.value or ""):
+            if self.subtype in {"DC", "AC"} and not _independent_value_ok(self.value or ""):
                 error_handler(f"NETLIST_FATAL: '{self.name}' has invalid value '{self.value}'.")
             if self.subtype in {"SIN", "COS", "STEP"}:
-                if not self.DEPENDENT_VAL_PATTERN.match(self.value or ""):
+                if not _dependent_value_ok(self.value or ""):
                     error_handler(f"NETLIST_FATAL: '{self.name}' has invalid source value '{self.value}'.")
-                if not self.DEPENDENT_VAL_PATTERN.match(self.value2 or ""):
+                if not _dependent_value_ok(self.value2 or ""):
                     error_handler(f"NETLIST_FATAL: '{self.name}' has invalid parameter '{self.value2}'.")
                 if self.subtype == "STEP" and self.value3 is not None and not self.DUTY_CYCLE.match(self.value3):
                     error_handler(f"NETLIST_FATAL: '{self.name}' has invalid duty cycle '{self.value3}'.")
             return True
 
         if self.type in {"R", "C", "L", "D"}:
-            if not self.INDEPENDENT_VAL_PATTERN.match(self.value or ""):
+            if not _independent_value_ok(self.value or ""):
                 error_handler(f"NETLIST_FATAL: '{self.name}' has invalid value format '{self.value}'.")
             return True
 
@@ -454,7 +435,7 @@ class Component:
                     ("re", self.metadata.get("re")),
                 )
             for label, value in values:
-                if value is not None and not self.INDEPENDENT_VAL_PATTERN.match(value):
+                if value is not None and not _independent_value_ok(value):
                     error_handler(f"NETLIST_FATAL: '{self.name}' has invalid {label} value '{value}'.")
             return True
 
@@ -478,17 +459,17 @@ class Component:
                     ("cbd", self.metadata.get("cbd")),
                 )
             for label, value in values:
-                if value is None or not self.DEPENDENT_VAL_PATTERN.match(value):
+                if value is None or not _dependent_value_ok(value):
                     error_handler(f"NETLIST_FATAL: '{self.name}' has invalid {label} value '{value}'.")
             return True
 
         if self.type in {"VCVS", "VCCS", "CCVS", "CCCS"}:
-            if self.type in {"VCVS", "VCCS"} and not self.DEPENDENT_VAL_PATTERN.match(self.value or ""):
+            if self.type in {"VCVS", "VCCS"} and not _dependent_value_ok(self.value or ""):
                 error_handler(f"NETLIST_FATAL: '{self.name}' has invalid gain value '{self.value}'.")
             if self.type in {"CCVS", "CCCS"}:
                 if not self.COMPONENT_PATTERN.match(self.ctrl_source or ""):
                     error_handler(f"NETLIST_FATAL: '{self.name}' has invalid controlling source '{self.ctrl_source}'.")
-                if not self.DEPENDENT_VAL_PATTERN.match(self.value or ""):
+                if not _dependent_value_ok(self.value or ""):
                     error_handler(f"NETLIST_FATAL: '{self.name}' has invalid gain value '{self.value}'.")
             return True
 
@@ -518,16 +499,103 @@ class Component:
         )
 
 
+# Single-letter name prefixes (``Component.get_type``); V, C and G also have the
+# multi-letter prefixes VCVS/VCCS, CCVS/CCCS and GND.
+_SINGLE_LETTER_TYPES = {
+    "R": "R",
+    "L": "L",
+    "I": "I",
+    "E": "VCVS",
+    "F": "CCCS",
+    "H": "CCVS",
+    "D": "D",
+    "B": "B",
+    "Q": "QNPN",
+    "M": "NMOS",
+}
+
+# Bound on each memo of regex results below (a long-lived server sees many node names).
+_MATCH_MEMO_LIMIT = 8192
+
+
+def _memoized_match(pattern: re.Pattern[str]):
+    """``bool(pattern.match(token))`` with a per-process memo on ``str`` tokens.
+
+    Netlists repeat node names and value literals many times; the regex runs once
+    per distinct token. Non-``str`` arguments go straight to the regex (and raise
+    what it raises).
+    """
+
+    memo: dict[str, bool] = {}
+    match = pattern.match
+
+    def matches(token: str) -> bool:
+        if type(token) is not str:
+            return match(token) is not None
+        ok = memo.get(token)
+        if ok is None:
+            ok = match(token) is not None
+            if len(memo) >= _MATCH_MEMO_LIMIT:
+                memo.clear()
+            memo[token] = ok
+        return ok
+
+    matches.memo = memo  # type: ignore[attr-defined]  # read inline by parse_netlist_text
+    return matches
+
+
+_node_name_ok = _memoized_match(Component.NODE_PATTERN)
+_independent_value_ok = _memoized_match(Component.INDEPENDENT_VAL_PATTERN)
+_dependent_value_ok = _memoized_match(Component.DEPENDENT_VAL_PATTERN)
+
+
+def _name_and_type(name_token: str) -> tuple[str, str]:
+    """Component name and normalized type of a name token (``R1``, ``Rload``, ``feedback:R``).
+
+    Raises the ``COMPONENT_ERROR``s of an invalid name or an unknown prefix.
+    """
+
+    if type(name_token) is str and ":" not in name_token:
+        explicit = None  # the explicit form needs a ':'
+    else:
+        explicit = Component.EXPLICIT_TYPE_PATTERN.match(name_token)
+    if explicit is not None:
+        return explicit.group(1), explicit.group(2).upper()
+    # ASCII identifiers starting with a letter always match NAME_BARE; anything else
+    # (Unicode letters that case-fold to ASCII under IGNORECASE, ...) asks the regex.
+    if not (
+        type(name_token) is str and name_token.isascii() and name_token.isidentifier() and name_token[0] != "_"
+    ) and not Component.COMPONENT_PATTERN.match(name_token):
+        error_handler(f"COMPONENT_ERROR: Invalid component name: '{name_token}'")
+    type_ = Component.get_type(name_token)
+    if type_ is None:
+        error_handler(
+            f"COMPONENT_ERROR: Cannot infer type from '{name_token}'. "
+            f"Use '<name>:<TYPE>' to declare the type explicitly."
+        )
+    return name_token, type_
+
+
+def _check_distinct_nodes(name: str, node1: str | None, node2: str | None) -> None:
+    if node1 == node2:
+        error_handler(f"COMPONENT_ERROR: '{name}' has conflict in nodes: '{node1, node2}'")
+
+
 @dataclass(slots=True)
 class Netlist:
-    """Validated netlist container."""
+    """Validated netlist container.
+
+    ``parse_netlist_text`` fills it with ``ComponentRecord``s (``add_component`` and
+    ``validate`` read only the ``type``/node fields both classes share); ``to_ir``
+    needs ``Component``s.
+    """
 
     components: list[Component] = field(default_factory=list)
     voltage_source_node_sets: list[frozenset[str]] = field(default_factory=list)
     current_source_nodes: list[str] = field(default_factory=list)
     other_nodes: list[str] = field(default_factory=list)
 
-    def add_component(self, component: Component) -> None:
+    def add_component(self, component: Component | ComponentRecord) -> None:
         self.components.append(component)
         if component.type == "GND":
             # GND lines participate in node-name discovery but don't drive
@@ -560,11 +628,8 @@ class Netlist:
             if component.type == "GND" and component.node1:
                 ground_aliases.add(component.node1)
 
-        def alias(node: str) -> str:
-            return "0" if node in ground_aliases else node
-
         normalized_v_sets = [
-            frozenset(alias(n) for n in s) for s in self.voltage_source_node_sets
+            frozenset(("0" if n in ground_aliases else n) for n in s) for s in self.voltage_source_node_sets
         ]
         for s in normalized_v_sets:
             if len(s) == 1 and "0" in s:
@@ -574,8 +639,8 @@ class Netlist:
         if normalized_v_sets and len(normalized_v_sets) > len(set(normalized_v_sets)):
             error_handler("NETLIST_FATAL: Voltage source parallel conflict: Two or more voltage sources are in parallel.")
 
-        normalized_current_nodes = [alias(n) for n in self.current_source_nodes]
-        normalized_other_nodes = {alias(n) for n in self.other_nodes}
+        normalized_current_nodes = [("0" if n in ground_aliases else n) for n in self.current_source_nodes]
+        normalized_other_nodes = {("0" if n in ground_aliases else n) for n in self.other_nodes}
         if normalized_current_nodes:
             counts = collections.Counter(normalized_current_nodes)
             junction_nodes = {node for node, count in counts.items() if count > 1}
@@ -599,10 +664,35 @@ class Netlist:
 def _split_component_line(line: str) -> list[str]:
     """Split a component line while preserving FUNC expressions as one tail."""
 
-    parts = line.split(maxsplit=5)
+    # The first four tokens of ``split()`` and ``split(maxsplit=5)`` are the same.
+    parts = line.split()
     if len(parts) >= 4 and parts[3].upper() == "FUNC":
-        return parts
-    return line.split()
+        return line.split(maxsplit=5)
+    return parts
+
+
+# First token after the terminals, for the types whose remaining tokens ("tail")
+# are parsed and validated independently of the name and the node names.
+_TAIL_START = {
+    "R": 3,
+    "C": 3,
+    "L": 3,
+    "B": 3,
+    "D": 3,
+    "V": 3,
+    "I": 3,
+    "NMOS": 4,
+    "PMOS": 4,
+    "QNPN": 4,
+    "QPNP": 4,
+}
+# Node-order message of the three-terminal parsers (node1 == node2).
+_SAME_TERMINALS_MESSAGE = {
+    "NMOS": "drain and source must be different.",
+    "PMOS": "drain and source must be different.",
+    "QNPN": "collector and emitter must be different.",
+    "QPNP": "collector and emitter must be different.",
+}
 
 
 def parse_directive(line: str) -> DirectiveRecord:
@@ -647,31 +737,133 @@ def parse_directive(line: str) -> DirectiveRecord:
 
 
 def parse_netlist_text(netlist_text: str) -> CircuitIR:
-    """Parse multiline netlist text into a validated IR."""
+    """Parse multiline netlist text into a validated IR.
+
+    Lines of the types in ``_TAIL_START`` that repeat the parameter tokens of an
+    earlier line of the same type (``... PMOS LEVEL1 0.7m 0.4 0.02 2f 1f``, ``4f``,
+    ``200Meg``) reuse that line's parsed fields: those tokens are parsed and
+    validated independently of the name and the nodes, so only the name and the
+    node checks run, in the order ``Component.from_parts`` runs them (same errors),
+    followed by ``Netlist.add_component``'s bookkeeping. Every other line goes
+    through ``Component.from_parts``.
+    """
 
     netlist = Netlist()
     directives: list[DirectiveRecord] = []
-    lines = netlist_text.splitlines()
+    records = netlist.components
+    append_record = records.append
+    add_component = netlist.add_component
+    voltage_source_node_sets = netlist.voltage_source_node_sets
+    extend_current_source_nodes = netlist.current_source_nodes.extend
+    extend_other_nodes = netlist.other_nodes.extend
+    record_class = ComponentRecord
+    node_name_ok = _node_name_ok
+    node_name_known = _node_name_ok.memo.get  # type: ignore[attr-defined]
+    single_letter_types = _SINGLE_LETTER_TYPES
+    get_type = Component.get_type
+    tail_start = _TAIL_START
+    # (type, tail tokens) -> the first record parsed from them
+    prototypes: dict[tuple[str, tuple[str, ...]], ComponentRecord] = {}
 
-    for raw_line in lines:
+    for raw_line in netlist_text.splitlines():
         line = raw_line.strip()
-        if not line or line.startswith("*") or line.startswith("#"):
+        if not line:
             continue
-        if line.lower() == ".end":
-            break
-        if line.startswith("."):
+        first = line[0]
+        if first == "*" or first == "#":
+            continue
+        if first == ".":
+            if line.lower() == ".end":
+                break
             directives.append(parse_directive(line))
             continue
 
-        parts = _split_component_line(line)
-        component = Component.from_parts(parts)
-        netlist.add_component(component)
+        parts = line.split()
+        if len(parts) >= 4 and parts[3].upper() == "FUNC":
+            parts = line.split(maxsplit=5)
 
-    if not netlist.components:
+        name = parts[0]
+        # A bare ASCII identifier starting with a letter is a valid name (see
+        # _name_and_type); its type comes from the prefix.
+        if name.isascii() and name.isidentifier() and name[0] != "_":
+            type_ = single_letter_types.get(name[0].upper()) or get_type(name)
+            if type_ is None:
+                name, type_ = _name_and_type(name)  # raises "Cannot infer type"
+        else:
+            name, type_ = _name_and_type(name)
+        start = tail_start.get(type_)
+        key = None
+        if start is not None and len(parts) >= start:
+            key = (type_, tuple(parts[start:]))
+            prototype = prototypes.get(key)
+            if prototype is not None:
+                node1 = parts[1]
+                if start == 4:
+                    ctrl_node1 = parts[2]
+                    node2 = parts[3]
+                    if node1 == node2:
+                        error_handler(f"COMPONENT_ERROR: '{name}' {_SAME_TERMINALS_MESSAGE[type_]}")
+                    if node_name_known(node1) is not True and not node_name_ok(node1):
+                        _invalid_node_name(name, node1)
+                    if node_name_known(node2) is not True and not node_name_ok(node2):
+                        _invalid_node_name(name, node2)
+                    if node_name_known(ctrl_node1) is not True and not node_name_ok(ctrl_node1):
+                        _invalid_node_name(name, ctrl_node1)
+                else:
+                    ctrl_node1 = None
+                    node2 = parts[2]
+                    if node1 == node2:
+                        _check_distinct_nodes(name, node1, node2)
+                    if node_name_known(node1) is not True and not node_name_ok(node1):
+                        _invalid_node_name(name, node1)
+                    if node_name_known(node2) is not True and not node_name_ok(node2):
+                        _invalid_node_name(name, node2)
+                final_type = prototype.type
+                append_record(
+                    record_class(
+                        name,
+                        final_type,
+                        node1,
+                        node2,
+                        prototype.value,
+                        prototype.subtype,
+                        ctrl_node1,
+                        None,
+                        None,
+                        prototype.value2,
+                        prototype.value3,
+                        dict(prototype.metadata),
+                    )
+                )
+                # Netlist.add_component for these types (node tokens are non-empty,
+                # so ``node or "0"`` is the node itself).
+                if start == 4:
+                    extend_other_nodes((node1, node2, ctrl_node1))
+                elif final_type == "V":
+                    voltage_source_node_sets.append(frozenset((node1, node2)))
+                elif final_type == "I":
+                    extend_current_source_nodes((node1, node2))
+                else:
+                    extend_other_nodes((node1, node2))
+                continue
+
+        record = Component.from_parts(parts).to_record()
+        if key is not None:
+            prototypes[key] = record
+        add_component(record)
+
+    if not records:
         raise NetlistError("No components entered in netlist.")
 
     netlist.validate()
-    return netlist.to_ir(directives=directives, source_text=netlist_text)
+    return CircuitIR(components=records, directives=directives, source_text=netlist_text)
+
+
+def _invalid_node_name(name: str, node: str) -> None:
+    error_handler(
+        f"NETLIST_FATAL: '{name}' has invalid node name '{node}'. "
+        f"Use '0' for ground, or any alphanumeric identifier."
+    )
 
 
 def parse_netlist_file(path: str | Path) -> CircuitIR:

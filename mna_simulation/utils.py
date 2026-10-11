@@ -31,11 +31,36 @@ SUFFIX_FACTORS = {
 DEFAULT_GMIN_STEPS = [0.0, 1e-12, 1e-11, 1e-10, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5]
 
 
+# Per-process memo of ``parse_value`` on exact ``str`` inputs: netlists repeat the same
+# few literals ("0.4", "2f", "200Meg", ...) thousands of times. Only successful parses
+# are stored (a rejected literal raises on every call, from ``_parse_value_text``), and
+# the dict is emptied when it reaches ``_VALUE_CACHE_LIMIT`` entries so a long-lived
+# server cannot grow it without bound.
+_VALUE_CACHE: dict[str, float] = {}
+_VALUE_CACHE_LIMIT = 16384
+
+
 def parse_value(value: str | float | int) -> float:
     """Convert metric-suffixed strings to floating point values."""
 
+    if type(value) is str:
+        cached = _VALUE_CACHE.get(value)
+        if cached is not None:
+            return cached
+        result = _parse_value_text(value)
+        if len(_VALUE_CACHE) >= _VALUE_CACHE_LIMIT:
+            _VALUE_CACHE.clear()
+        _VALUE_CACHE[value] = result
+        return result
+
     if isinstance(value, (int, float)):
         return float(value)
+
+    return _parse_value_text(value)
+
+
+def _parse_value_text(value: str) -> float:
+    """The uncached ``parse_value`` of a string (regex match and suffix table)."""
 
     match = VALUE_PATTERN.fullmatch(value.strip())
     if not match:

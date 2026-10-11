@@ -209,6 +209,33 @@ def parity_matrices(ref_out: Any, core_out: Any) -> float:
     return worst
 
 
+def _ir_view(value: Any) -> Any:
+    """Type-aware nested view of a parsed ``CircuitIR`` (the oracle's classes are distinct types)."""
+
+    import dataclasses
+    import enum
+
+    if isinstance(value, enum.Enum):
+        return ("enum", value.value)
+    if isinstance(value, float):
+        return ("float", value.hex())
+    if value is None or isinstance(value, (bool, int, str)):
+        return (type(value).__name__, value)
+    if isinstance(value, dict):
+        return ("dict", [(_ir_view(k), _ir_view(v)) for k, v in value.items()])
+    if isinstance(value, (list, tuple)):
+        return (type(value).__name__, [_ir_view(v) for v in value])
+    if dataclasses.is_dataclass(value):
+        return (type(value).__name__, [(f.name, _ir_view(getattr(value, f.name))) for f in dataclasses.fields(value)])
+    return ("repr", repr(value))
+
+
+def parity_circuit_ir(ref_out: Any, core_out: Any) -> float:
+    """Netlist parse: 0 when both ``CircuitIR``s hold equal records/directives (values and types), else inf."""
+
+    return 0.0 if _ir_view(ref_out) == _ir_view(core_out) else float("inf")
+
+
 def analysis_values(result: Any) -> Any:
     """The numeric payload of a ``SimulationResult`` (or of an array passed straight through)."""
 
@@ -412,6 +439,10 @@ def _setup_circuit_build_rlc(smoke: bool = False) -> dict[str, Any]:
     return _setup_circuit_build("rlc", smoke)
 
 
+def _setup_netlist_parse_sram(smoke: bool = False) -> dict[str, Any]:
+    return {"netlist": _netlist("sram", smoke)}
+
+
 def _setup_assembly_sram(smoke: bool = False) -> dict[str, Any]:
     inputs = _setup_compiled_nl("sram", smoke, seed=4, high=1.2)
     inputs["G"] = inputs["workload"].problem.G
@@ -589,6 +620,10 @@ def _ref_compiled_f_and_j(inputs: dict[str, Any]) -> tuple[np.ndarray, np.ndarra
 
 def _ref_circuit_build(inputs: dict[str, Any]) -> Any:
     return _reference_modules().mna_builder.build_mna_problem(inputs["circuit"])
+
+
+def _ref_netlist_parse(inputs: dict[str, Any]) -> Any:
+    return _reference_modules().netlist.parse_netlist_text(inputs["netlist"])
 
 
 def _ref_assembly(inputs: dict[str, Any]) -> np.ndarray:
@@ -777,6 +812,14 @@ def _core_circuit_build_sram_248(core_inputs: dict[str, Any], num_threads: int) 
 
 def _core_circuit_build_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> Any:
     return _core_circuit_build(core_inputs, num_threads)
+
+
+def _core_netlist_parse_sram_248(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    """The live ``parse_netlist_text`` (pure Python front end; ``num_threads`` does not apply)."""
+
+    from mna_simulation.netlist import parse_netlist_text
+
+    return parse_netlist_text(core_inputs["netlist"])
 
 
 def _core_assembly_jacobian_sram_248(core_inputs: dict[str, Any], num_threads: int) -> KernelJacobian:
@@ -1128,6 +1171,18 @@ _register(
     phase="P1",
     tolerance=TOL_BUILD,
     description="MNA build of the parsed 23x23 RLC mesh (mna_builder.build_mna_problem)",
+)
+_register(
+    id="netlist_parse_sram_248",
+    category="assembly",
+    size={**_SRAM, "components": 1057},
+    setup=_setup_netlist_parse_sram,
+    reference=_ref_netlist_parse,
+    core=_core_netlist_parse_sram_248,
+    parity=parity_circuit_ir,
+    phase="P6",
+    tolerance=TOL_BUILD,
+    description="netlist text of the 10x10 SRAM to a validated CircuitIR (netlist.parse_netlist_text)",
 )
 _register(
     id="assembly_jacobian_sram_248",

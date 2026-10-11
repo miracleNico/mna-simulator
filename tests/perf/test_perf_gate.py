@@ -38,6 +38,11 @@ FLOORS: dict[str, float] = {
     "device_eval_diode_mixer": 1.0,
     # assembly >= 10x
     "assembly_jacobian_sram_248": 10.0,
+    # Python front end vs the frozen builder/parser (P6a): half of the measured 15-19x
+    # (SRAM build), 17-22x (RLC build) and 3.4-4.6x (SRAM parse) at --quick/--reps 9.
+    "circuit_build_sram_248": 7.5,
+    "circuit_build_rlc_1035": 9.0,
+    "netlist_parse_sram_248": 1.7,
     # direct solve RLC >= 10x (KLU vs dense LAPACK, ~40x measured for the real solve)
     "direct_solve_rlc_1035": 10.0,
     "direct_solve_complex_rlc_1035": 10.0,

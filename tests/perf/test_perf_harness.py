@@ -37,6 +37,7 @@ PLAN_UNITS = {
     # circuit build and Jacobian assembly
     "circuit_build_sram_248",
     "circuit_build_rlc_1035",
+    "netlist_parse_sram_248",
     "assembly_jacobian_sram_248",
     # factor and solve, n = 248 and 1035, real and complex
     "direct_solve_rlc_1035",

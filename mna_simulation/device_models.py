@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import numpy as np
 import re
 
@@ -78,10 +79,69 @@ def mos_level1_current_expression(component: ComponentRecord, drain_expr: str, g
     still conduct when the schematic swaps source and drain potentials.
     """
 
-    beta = parse_value(component.value or "1m")
-    vth = abs(parse_value(component.value2 or "0.4"))
-    lambda_ = parse_value(component.value3 or "0")
-    mos_type = component.type.upper()
+    try:
+        template = mos_level1_current_template(component.value, component.value2, component.value3, component.type)
+    except TypeError:
+        # Unhashable parameter objects cannot key the memo: build the text directly
+        # (which raises whatever the uncached construction raises).
+        return _mos_level1_current_text(
+            component.value, component.value2, component.value3, component.type, drain_expr, gate_expr, source_expr
+        )
+    return render_mos_level1_current(template, component.type, drain_expr, gate_expr, source_expr)
+
+
+def render_mos_level1_current(template: str, mos_type: str, drain_expr: str, gate_expr: str, source_expr: str) -> str:
+    """``mos_level1_current_expression`` text from a ``mos_level1_current_template`` of the same type."""
+
+    vgs_forward, vds_forward, vgs_reverse, vds_reverse, _ = _mos_level1_terminals(
+        mos_type, drain_expr, gate_expr, source_expr
+    )
+    return template % {"a": vgs_forward, "b": vds_forward, "c": vgs_reverse, "e": vds_reverse}
+
+
+# Placeholders for the four terminal-voltage expressions while a template is
+# generated, and their ``%`` keys. The expression is pure string concatenation of
+# these and of the parameter literals (float reprs, which never contain NUL or "%").
+_TEMPLATE_VOLTAGES = (("\x00A\x00", "%(a)s"), ("\x00B\x00", "%(b)s"), ("\x00C\x00", "%(c)s"), ("\x00E\x00", "%(e)s"))
+
+
+@functools.lru_cache(maxsize=1024)
+def mos_level1_current_template(value: str | None, value2: str | None, value3: str | None, mos_type: str) -> str:
+    """``%``-template of the Level-1 current for these parameter strings.
+
+    The keys are the four terminal-voltage expressions of ``_mos_level1_terminals``
+    (``a`` vgs forward, ``b`` vds forward, ``c`` vgs reverse, ``e`` vds reverse);
+    ``render_mos_level1_current`` fills them, giving character-for-character the
+    text ``_mos_level1_current_text`` builds (the same two functions build both,
+    and substituting a placeholder of a pure concatenation is exact). Memoized on
+    the parameter strings, so the devices of a netlist that share a parameter set
+    (the SRAM has four) parse and format them once. Parse errors are raised in the
+    same order as before and on every call (``lru_cache`` does not store exceptions).
+    """
+
+    beta, vth, lambda_ = _mos_level1_parameters(value, value2, value3)
+    sign = _mos_level1_terminals(mos_type, "", "", "")[4]
+    (vgs_forward, _), (vds_forward, _), (vgs_reverse, _), (vds_reverse, _) = _TEMPLATE_VOLTAGES
+    text = _mos_level1_current_from_terminals(vgs_forward, vds_forward, vgs_reverse, vds_reverse, sign, beta, vth, lambda_)
+    text = text.replace("%", "%%")
+    for placeholder, key in _TEMPLATE_VOLTAGES:
+        text = text.replace(placeholder, key)
+    return text
+
+
+def _mos_level1_parameters(value: str | None, value2: str | None, value3: str | None) -> tuple[float, float, float]:
+    beta = parse_value(value or "1m")
+    vth = abs(parse_value(value2 or "0.4"))
+    lambda_ = parse_value(value3 or "0")
+    return beta, vth, lambda_
+
+
+def _mos_level1_terminals(
+    mos_type_name: str, drain_expr: str, gate_expr: str, source_expr: str
+) -> tuple[str, str, str, str, str]:
+    """``(vgs_forward, vds_forward, vgs_reverse, vds_reverse, sign)`` of the symmetric Level-1 model."""
+
+    mos_type = mos_type_name.upper()
 
     if mos_type == "PMOS":
         d = f"(-({drain_expr}))"
@@ -98,7 +158,38 @@ def mos_level1_current_expression(component: ComponentRecord, drain_expr: str, g
     vds_forward = f"(({d}) - ({s}))"
     vgs_reverse = f"(({g}) - ({d}))"
     vds_reverse = f"(({s}) - ({d}))"
+    return vgs_forward, vds_forward, vgs_reverse, vds_reverse, sign
+
+
+def _mos_level1_current_from_terminals(
+    vgs_forward: str,
+    vds_forward: str,
+    vgs_reverse: str,
+    vds_reverse: str,
+    sign: str,
+    beta: float,
+    vth: float,
+    lambda_: float,
+) -> str:
     forward = _nmos_forward_level1(vgs_forward, vds_forward, beta, vth, lambda_)
     reverse = _nmos_forward_level1(vgs_reverse, vds_reverse, beta, vth, lambda_)
     current = f"Piecewise(({forward}, ({vds_forward}) >= 0), (-({reverse}), True))"
     return f"({sign}({current}))" if sign else f"({current})"
+
+
+def _mos_level1_current_text(
+    value: str | None,
+    value2: str | None,
+    value3: str | None,
+    mos_type_name: str,
+    drain_expr: str,
+    gate_expr: str,
+    source_expr: str,
+) -> str:
+    """The uncached expression text (parameters parsed first, then the type, as before)."""
+
+    beta, vth, lambda_ = _mos_level1_parameters(value, value2, value3)
+    vgs_forward, vds_forward, vgs_reverse, vds_reverse, sign = _mos_level1_terminals(
+        mos_type_name, drain_expr, gate_expr, source_expr
+    )
+    return _mos_level1_current_from_terminals(vgs_forward, vds_forward, vgs_reverse, vds_reverse, sign, beta, vth, lambda_)
