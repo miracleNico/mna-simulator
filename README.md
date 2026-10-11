@@ -36,7 +36,8 @@ The project includes:
 - `app/server/`: FastAPI app exposing `/health`, `/api/simulate`, and dynamic simulation websocket routes.
 - `app/web/`: React + TypeScript schematic editor and demo UI.
 - `tests/`: parser, builder, service, harmonic-balance, transistor, and hierarchy regression tests.
-- `benchmarks/`: lightweight benchmark entry points.
+- `benchmarks/`: benchmark entry points, workload netlists, and performance research prototypes.
+- `PERFORMANCE_PLAN.md`: measured performance review, multithreading plan, and C++ migration research.
 - `legacy/`: older simulator snapshots kept for comparison.
 - `USER_GUIDE.md`: user-facing web-app guide mirrored by the in-app Help dialog.
 - `DESIGN_AUDIT.md`: front end design audit, changes made, and LTspice feature comparison.
@@ -162,8 +163,12 @@ npm run build
 ## Benchmark
 
 ```bash
-python benchmarks/benchmark_basic.py
+python benchmarks/benchmark_basic.py        # tiny RC transient
+python benchmarks/benchmark_workloads.py    # SRAM, RLC mesh, BJT amplifier, and HB workloads (add --profile for hot spots)
+python benchmarks/blas_contention.py        # concurrent runs vs OPENBLAS_NUM_THREADS
 ```
+
+Run benchmarks with nothing else competing for the CPU. Multithreaded OpenBLAS calls degrade sharply when several simulations overlap; `PERFORMANCE_PLAN.md` documents the measurements and the planned fixes.
 
 ## Legacy Entry Points
 
