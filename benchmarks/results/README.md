@@ -40,8 +40,16 @@ platform): download the artifact, check its `host` block (commit, versions,
 load), rename it to `baseline-<platform>.json`, and commit it together with
 any change to the floors in `tests/perf/test_perf_gate.py` that the new numbers
 justify. Never commit a baseline from a developer machine that was doing other
-work. None is committed yet: baselines start with the first release that ships
-a migrated unit.
+work; the one exception is the interim baseline below.
+
+Committed now (shared machine, interim): `baseline-shared-machine.json` and
+`baseline-shared-machine.md`, a full run (`--threads 1,4`, 7 repetitions) at
+commit `04c46a3` (after P5 and P6a, before P3b) on a 4-CPU Linux VM that another
+worker was using (load average 4-5, recorded in `host.load_warning`). It exists
+so the documentation (`PERFORMANCE_PLAN.md` section 10, `CPP_MIGRATION_PLAN.md`
+status) can quote measured speedups; every number taken from it is labelled
+"shared machine, interim". Replace it with idle-machine `baseline-linux.json` /
+`baseline-windows.json` and delete it then.
 
 ## Measure on an idle machine
 
