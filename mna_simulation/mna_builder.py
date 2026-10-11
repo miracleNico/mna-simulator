@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
-from scipy.sparse import dok_matrix
+from scipy.sparse import csr_matrix
 
 from .api.contracts import CircuitIR, ComponentRecord, IndexMap, MnaProblem
 from .device_models import diode_current_expression, mos_level1_current_expression, source_expression
-from .errors import error_handler
+from .errors import CircuitSimulatorError, error_handler
 from .utils import format_voltage_labels, parse_value
 
 
@@ -97,8 +98,110 @@ def _build_index_map(components: list[ComponentRecord]) -> IndexMap:
     )
 
 
+class _Triplets:
+    """COO triplet list in stamping order."""
+
+    __slots__ = ("rows", "cols", "values")
+
+    def __init__(self) -> None:
+        self.rows: list[int] = []
+        self.cols: list[int] = []
+        self.values: list[float] = []
+
+    def add(self, row: int, col: int, value: float) -> None:
+        self.rows.append(row)
+        self.cols.append(col)
+        self.values.append(value)
+
+    def arrays(self, mask: np.ndarray | None = None) -> dict[str, np.ndarray]:
+        rows = np.asarray(self.rows, dtype=np.int64)
+        cols = np.asarray(self.cols, dtype=np.int64)
+        values = np.asarray(self.values, dtype=np.float64)
+        if mask is not None:
+            rows, cols, values = rows[mask], cols[mask], values[mask]
+        return {"rows": rows, "cols": cols, "values": values}
+
+
+def _summed_csr(triplets: _Triplets, size: int) -> csr_matrix:
+    """CSR matrix of the triplets with duplicates summed in stamping order.
+
+    ``np.bincount`` accumulates its weights sequentially from 0.0, exactly as the
+    former dense ``G[r, c] += v`` (and the dok ``s[r, c] = s[r, c] + v``) did, so
+    the values are bit-identical to the reference builder. Entries whose sum is
+    exactly 0 are dropped, as the dok matrix dropped them.
+    """
+
+    if not triplets.rows or size == 0:
+        return csr_matrix((size, size), dtype=float)
+    rows = np.asarray(triplets.rows, dtype=np.int64)
+    cols = np.asarray(triplets.cols, dtype=np.int64)
+    keys, inverse = np.unique(rows * size + cols, return_inverse=True)
+    sums = np.bincount(inverse.reshape(-1), weights=np.asarray(triplets.values, dtype=np.float64), minlength=keys.size)
+    keep = sums != 0.0
+    keys = keys[keep]
+    return csr_matrix((sums[keep], (keys // size, keys % size)), shape=(size, size), dtype=float)
+
+
+def _compile_native(
+    size: int,
+    gmin: float,
+    g_triplets: _Triplets,
+    g_is_gmin: list[bool],
+    c_triplets: _Triplets,
+    gmin_triplets: _Triplets,
+    diode_devices: list[dict[str, Any]],
+    behavioral_devices: list[dict[str, Any]],
+    level1_mos_devices: list[dict[str, Any]],
+    level1_bjt_devices: list[dict[str, Any]],
+) -> Any | None:
+    """Compile the native circuit; ``None`` when a behavioral expression cannot be compiled.
+
+    The native ``G`` excludes the gmin stamps (they go to the unit gmin table)
+    so one compiled circuit serves every gmin step.
+    """
+
+    from .native.circuit import behavioral_table, bjt_table, build_circuit, diode_table, mos_table
+    from .native.expressions import compile_expression
+
+    try:
+        programs = [
+            compile_expression(str(device["expression"]), time_dependent=False, n_unknowns=size)
+            for device in behavioral_devices
+        ]
+    except (CircuitSimulatorError, TypeError):
+        # Same timing as the reference core: the error surfaces when an analysis
+        # evaluates the expression (solvers.compile_nl_functions), not at build time.
+        return None
+    static_g = ~np.asarray(g_is_gmin, dtype=bool) if g_is_gmin else None
+    return build_circuit(
+        size,
+        gmin=gmin,
+        G=g_triplets.arrays(static_g),
+        C=c_triplets.arrays(),
+        gmin_stamps=gmin_triplets.arrays(),
+        diodes=diode_table(
+            [d["anode"] for d in diode_devices], [d["cathode"] for d in diode_devices], [d["is"] for d in diode_devices]
+        )
+        if diode_devices
+        else None,
+        mos=mos_table(level1_mos_devices) if level1_mos_devices else None,
+        bjt=bjt_table(level1_bjt_devices) if level1_bjt_devices else None,
+        behavioral=behavioral_table(
+            [d["node_p"] for d in behavioral_devices], [d["node_n"] for d in behavioral_devices], programs
+        )
+        if behavioral_devices
+        else None,
+    )
+
+
 def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
-    """Construct the MNA matrices and symbolic source/nonlinear vectors."""
+    """Construct the MNA matrices and symbolic source/nonlinear vectors.
+
+    Linear elements are stamped into COO triplet lists (G, C and a unit-valued
+    list of every gmin stamp); ``G_sparse``/``C_sparse`` sum them in stamping
+    order, the dense ``G``/``C`` are materialized lazily from them, and the
+    native compiled circuit is stored in ``problem.native``.
+    """
 
     # Pre-process components: drop GND symbols (used only to flag ground nodes)
     # and rewrite their referenced node names to the canonical ground "0".
@@ -109,10 +212,10 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
     num_branches = len(index_map.branch_names)
     size = num_nodes + num_branches
 
-    G = np.zeros((size, size), dtype=float)
-    C = np.zeros((size, size), dtype=float)
-    G_sparse = dok_matrix((size, size), dtype=float)
-    C_sparse = dok_matrix((size, size), dtype=float)
+    G_triplets = _Triplets()
+    G_is_gmin: list[bool] = []
+    C_triplets = _Triplets()
+    gmin_triplets = _Triplets()
     f_str = np.full((size, 1), "0", dtype=object)
     solver_f_str = np.full((size, 1), "0", dtype=object)
     b_dc = np.zeros((size, 1), dtype=float)
@@ -121,6 +224,10 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
     controlling_branch_map: dict[str, int] = {}
     level1_mos_devices: list[dict[str, float | int | str]] = []
     level1_bjt_devices: list[dict[str, float | int | str]] = []
+    diode_devices: list[dict[str, float | int | str]] = []
+    behavioral_devices: list[dict[str, float | int | str]] = []
+    G = "G"
+    C = "C"
 
     def get_index(node_name: str | None) -> int:
         if node_name in {None, "0"}:
@@ -132,19 +239,32 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             error_handler(f"NETLIST_FATAL: Unknown controlling branch '{branch_name}'.")
         return index_map.branch_to_index[branch_name]
 
-    def add_entry(matrix: np.ndarray, row: int, col: int, value: float) -> None:
+    def add_entry(matrix: str, row: int, col: int, value: float) -> None:
         if row == -1 or col == -1 or value == 0.0:
             return
-        matrix[row, col] += value
-        sparse_matrix = G_sparse if matrix is G else C_sparse if matrix is C else None
-        if sparse_matrix is not None:
-            sparse_matrix[row, col] = sparse_matrix[row, col] + value
+        if matrix == "G":
+            G_triplets.add(row, col, value)
+            G_is_gmin.append(False)
+        else:
+            C_triplets.add(row, col, value)
 
-    def stamp(matrix: np.ndarray, node_j: int, node_k: int, value: float) -> None:
+    def stamp(matrix: str, node_j: int, node_k: int, value: float) -> None:
         add_entry(matrix, node_j, node_j, value)
         add_entry(matrix, node_k, node_k, value)
         add_entry(matrix, node_j, node_k, -value)
         add_entry(matrix, node_k, node_j, -value)
+
+    def stamp_gmin(node_j: int, node_k: int) -> None:
+        # The unit pattern is recorded at every gmin (0 included) so the native
+        # circuit can form G + gmin * pattern; G itself gets gmin only when > 0.
+        for row, col, sign in ((node_j, node_j, 1.0), (node_k, node_k, 1.0), (node_j, node_k, -1.0), (node_k, node_j, -1.0)):
+            if row != -1 and col != -1:
+                gmin_triplets.add(row, col, sign)
+        if gmin > 0.0:
+            for row, col, value in ((node_j, node_j, gmin), (node_k, node_k, gmin), (node_j, node_k, -gmin), (node_k, node_j, -gmin)):
+                if row != -1 and col != -1 and value != 0.0:
+                    G_triplets.add(row, col, value)
+                    G_is_gmin.append(True)
 
     def stamp_symbolic_rhs(vector: np.ndarray, index: int, expression: str, positive: bool = True) -> None:
         if index == -1:
@@ -170,7 +290,7 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
         add_entry(G, k, kv, -1.0)
         add_entry(G, kv, k, -1.0)
 
-    def stamp_vccs_matrix(matrix: np.ndarray, out_p: int, out_n: int, ctrl_p: int, ctrl_n: int, gain: float) -> None:
+    def stamp_vccs_matrix(matrix: str, out_p: int, out_n: int, ctrl_p: int, ctrl_n: int, gain: float) -> None:
         if gain == 0.0:
             return
         add_entry(matrix, out_p, ctrl_p, gain)
@@ -187,8 +307,7 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             stamp(G, j, k, 1.0 / parse_value(component.value or "0"))
         elif comp_type == "C":
             stamp(C, j, k, parse_value(component.value or "0"))
-            if gmin > 0.0:
-                stamp(G, j, k, gmin)
+            stamp_gmin(j, k)
         elif comp_type == "L":
             branch_idx = get_branch_index(component.name)
             stamp_voltage_source(branch_idx, j, k)
@@ -268,8 +387,10 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             diode_expr = diode_current_expression(component, j_expr, k_expr)
             stamp_nonlinear_current(f_str, j, k, diode_expr)
             stamp_nonlinear_current(solver_f_str, j, k, diode_expr)
-            if gmin > 0.0:
-                stamp(G, j, k, gmin)
+            diode_devices.append(
+                {"name": component.name, "anode": j, "cathode": k, "is": parse_value(component.value or "1e-15")}
+            )
+            stamp_gmin(j, k)
         elif comp_type in {"QNPN", "QPNP"}:
             base = get_index(component.ctrl_node1)
             emitter = k
@@ -297,9 +418,8 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
                     stamp(C, base, emitter, cje)
                 if cjc > 0.0:
                     stamp(C, base, collector, cjc)
-                if gmin > 0.0:
-                    stamp(G, base, emitter, gmin)
-                    stamp(G, base, collector, gmin)
+                stamp_gmin(base, emitter)
+                stamp_gmin(base, collector)
                 continue
             gm = parse_value(component.value or "40m")
             r_pi = parse_value(component.value2 or "2.5k")
@@ -348,8 +468,7 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
                     stamp(C, gate, source, c_gs)
                 if c_gd > 0.0:
                     stamp(C, gate, drain, c_gd)
-                if gmin > 0.0:
-                    stamp(G, drain, source, gmin)
+                stamp_gmin(drain, source)
                 continue
             gm = parse_value(component.value or "5m")
             r_o = parse_value(component.value2 or "50k")
@@ -376,12 +495,13 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             expression = component.value or "0"
             stamp_nonlinear_current(f_str, j, k, expression)
             stamp_nonlinear_current(solver_f_str, j, k, expression)
+            behavioral_devices.append({"name": component.name, "node_p": j, "node_n": k, "expression": expression})
         else:
             error_handler(f"NETLIST_FATAL: Unsupported device type '{comp_type}'.")
 
     labels = format_voltage_labels(index_map.node_names, index_map.branch_names)
-    G_csr = G_sparse.tocsr()
-    C_csr = C_sparse.tocsr()
+    G_csr = _summed_csr(G_triplets, size)
+    C_csr = _summed_csr(C_triplets, size)
     metadata = {
         "num_nodes": num_nodes,
         "num_branches": num_branches,
@@ -393,10 +513,22 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
         "nonlinear_mos_devices": len(level1_mos_devices),
         "nonlinear_bjt_devices": len(level1_bjt_devices),
     }
+    native = _compile_native(
+        size,
+        gmin,
+        G_triplets,
+        G_is_gmin,
+        C_triplets,
+        gmin_triplets,
+        diode_devices,
+        behavioral_devices,
+        level1_mos_devices,
+        level1_bjt_devices,
+    )
 
     return MnaProblem(
-        G=G,
-        C=C,
+        G=None,
+        C=None,
         G_sparse=G_csr,
         C_sparse=C_csr,
         f_str=f_str,
@@ -410,4 +542,7 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
         level1_bjt_devices=level1_bjt_devices,
         gmin=gmin,
         metadata=metadata,
+        diode_devices=diode_devices,
+        behavioral_devices=behavioral_devices,
+        native=native,
     )

@@ -101,10 +101,25 @@ class IndexMap:
 
 @dataclass(slots=True)
 class MnaProblem:
-    """Matrix-form circuit problem consumed by solver backends."""
+    """Matrix-form circuit problem consumed by solver backends.
 
-    G: np.ndarray
-    C: np.ndarray
+    ``G`` and ``C`` are dense views materialized lazily: pass ``None`` together
+    with ``G_sparse``/``C_sparse`` and the dense array is built from the CSR
+    matrix on first access (then cached); passing an array keeps it as given.
+    ``native`` is the compiled ``mna_simulation._core.Circuit`` handle (``None``
+    when the circuit could not be compiled, e.g. an expression the native VM
+    does not support; the solver facades then report the error when they
+    evaluate it). ``diode_devices`` (``name, anode, cathode, is``) and
+    ``behavioral_devices`` (``name, node_p, node_n, expression``) list the
+    expression-based nonlinear devices next to the Level-1 transistor dicts.
+    """
+
+    # Dense caches behind the G / C properties (declared first so the generated
+    # __init__ resets them before the G / C setters run).
+    _G_dense: np.ndarray | None = field(default=None, init=False, repr=False, compare=False)
+    _C_dense: np.ndarray | None = field(default=None, init=False, repr=False, compare=False)
+    G: np.ndarray | None
+    C: np.ndarray | None
     G_sparse: Any | None
     C_sparse: Any | None
     f_str: np.ndarray
@@ -118,6 +133,38 @@ class MnaProblem:
     level1_bjt_devices: list[dict[str, Any]] = field(default_factory=list)
     gmin: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
+    diode_devices: list[dict[str, Any]] = field(default_factory=list)
+    behavioral_devices: list[dict[str, Any]] = field(default_factory=list)
+    native: Any | None = None
+
+
+def _lazy_dense_matrix(name: str, sparse_attr: str, cache_attr: str) -> property:
+    def getter(self: MnaProblem) -> np.ndarray:
+        dense = getattr(self, cache_attr)
+        if dense is None:
+            sparse = getattr(self, sparse_attr)
+            if sparse is not None:
+                dense = np.asarray(sparse.toarray(), dtype=float)
+            elif self.native is not None:
+                dense = self.native.to_dense(name)
+                if name == "G" and self.gmin:
+                    dense = dense + self.gmin * self.native.to_dense("gmin")
+            else:
+                size = len(self.index_map.node_names) + len(self.index_map.branch_names)
+                dense = np.zeros((size, size), dtype=float)
+            setattr(self, cache_attr, dense)
+        return dense
+
+    def setter(self: MnaProblem, value: np.ndarray | None) -> None:
+        setattr(self, cache_attr, value)
+
+    return property(getter, setter, doc=f"Dense {name} (n x n), materialized from {sparse_attr} on first access.")
+
+
+# Replace the dataclass slots of G and C by lazily materializing properties; the
+# constructor, dataclasses.replace and attribute assignment keep working.
+MnaProblem.G = _lazy_dense_matrix("G", "G_sparse", "_G_dense")  # type: ignore[assignment]
+MnaProblem.C = _lazy_dense_matrix("C", "C_sparse", "_C_dense")  # type: ignore[assignment]
 
 
 @dataclass(slots=True)

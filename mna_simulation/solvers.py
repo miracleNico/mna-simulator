@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import re
 import time
 from collections.abc import Callable
 
 import numpy as np
-import sympy as sp
 from numpy.linalg import norm
 
 from .api.contracts import MnaProblem, SpectrumResult, WaveformResult
@@ -642,55 +640,22 @@ def backward_substitution(U: np.ndarray, y: np.ndarray) -> np.ndarray:
     return x
 
 
-def _sympy_locals(t_symbol: sp.Symbol | None = None) -> dict[str, object]:
-    """Symbols/functions allowed in generated nonlinear and time expressions."""
-
-    locals_map: dict[str, object] = {
-        "sp": sp,
-        "np": sp,
-        "sin": sp.sin,
-        "cos": sp.cos,
-        "exp": sp.exp,
-        "sqrt": sp.sqrt,
-        "Heaviside": sp.Heaviside,
-        "heaviside": sp.Heaviside,
-        "Piecewise": sp.Piecewise,
-        "Mod": sp.Mod,
-        "mod": sp.Mod,
-        "Min": sp.Min,
-        "Max": sp.Max,
-        "pi": sp.pi,
-        "True": True,
-        "False": False,
-    }
-    if t_symbol is not None:
-        locals_map["t"] = t_symbol
-    return locals_map
+# The expression normalization helpers live in native/expressions.py (the
+# expression compiler of the native core); re-exported here for importers.
+from .native.expressions import _prepare_sympy_expression, _sympy_locals  # noqa: E402,F401
 
 
-def _prepare_sympy_expression(expr: str) -> str:
-    """Normalize numpy-style generated expressions for SymPy parsing."""
+def _native_core():
+    core = _NATIVE_CORE.get("core")
+    if core is None:
+        from .native import require_core
 
-    prepared = str(expr)
-    replacements = (
-        ("np.heaviside", "Heaviside"),
-        ("np.Heaviside", "Heaviside"),
-        ("np.mod", "Mod"),
-        ("np.Mod", "Mod"),
-        ("np.minimum", "Min"),
-        ("np.maximum", "Max"),
-        ("sp.heaviside", "Heaviside"),
-        ("sp.Heaviside", "Heaviside"),
-        ("sp.mod", "Mod"),
-        ("sp.Mod", "Mod"),
-        ("sp.minimum", "Min"),
-        ("sp.maximum", "Max"),
-    )
-    for old, new in replacements:
-        prepared = prepared.replace(old, new)
-    prepared = prepared.replace("np.", "").replace("sp.", "")
-    prepared = re.sub(r"\b(Min|Max)\(\[(.*?)\]\)", r"\1(\2)", prepared)
-    return prepared
+        core = require_core()
+        _NATIVE_CORE["core"] = core
+    return core
+
+
+_NATIVE_CORE: dict[str, object] = {}
 
 
 def _nmos_level1_forward(
@@ -726,14 +691,9 @@ def _nmos_level1_current_and_derivatives(
     vth: float,
     lambda_: float,
 ) -> tuple[float, float, float, float]:
-    """Return drain-to-source current and derivatives for a symmetric NMOS."""
+    """Return drain-to-source current and derivatives for a symmetric NMOS (native kernel)."""
 
-    if vd >= vs:
-        current, d_vgs, d_vds = _nmos_level1_forward(vg - vs, vd - vs, beta, vth, lambda_)
-        return current, d_vds, d_vgs, -d_vgs - d_vds
-
-    reverse_current, d_vgs, d_vds = _nmos_level1_forward(vg - vd, vs - vd, beta, vth, lambda_)
-    return -reverse_current, d_vgs + d_vds, -d_vgs, -d_vds
+    return _native_core().eval_mos_level1(1, float(beta), float(vth), float(lambda_), float(vd), float(vg), float(vs))
 
 
 def _level1_mos_current_and_derivatives(
@@ -742,13 +702,36 @@ def _level1_mos_current_and_derivatives(
     vg: float,
     vs: float,
 ) -> tuple[float, float, float, float]:
-    beta = float(device["beta"])
-    vth = float(device["vth"])
-    lambda_ = float(device["lambda"])
-    if str(device["type"]).upper() == "PMOS":
-        current, d_d, d_g, d_s = _nmos_level1_current_and_derivatives(-vd, -vg, -vs, beta, vth, lambda_)
-        return -current, d_d, d_g, d_s
-    return _nmos_level1_current_and_derivatives(vd, vg, vs, beta, vth, lambda_)
+    """(ids, dIds/dVd, dIds/dVg, dIds/dVs) of a Level-1 MOS dict (native kernel, PMOS mirrored)."""
+
+    sign = -1 if str(device["type"]).upper() == "PMOS" else 1
+    return _native_core().eval_mos_level1(
+        sign,
+        float(device["beta"]),
+        float(device["vth"]),
+        float(device["lambda"]),
+        float(vd),
+        float(vg),
+        float(vs),
+    )
+
+
+def _evaluate_device_dicts(
+    size: int,
+    x_values: np.ndarray,
+    mos_devices: list[dict[str, object]] | None = None,
+    bjt_devices: list[dict[str, object]] | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    from .native.circuit import bjt_table, build_circuit, mos_table
+
+    circuit = build_circuit(
+        size,
+        mos=mos_table(mos_devices) if mos_devices else None,
+        bjt=bjt_table(bjt_devices) if bjt_devices else None,
+    )
+    x = np.ascontiguousarray(np.asarray(x_values, dtype=float).reshape(-1)[:size])
+    f, jacobian = _native_core().device_f_jacobian_dense(circuit, x, 0.0)
+    return f, jacobian
 
 
 def _evaluate_level1_mos_devices(
@@ -756,39 +739,9 @@ def _evaluate_level1_mos_devices(
     size: int,
     x_values: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    f = np.zeros((size, 1), dtype=float)
-    jacobian = np.zeros((size, size), dtype=float)
+    """(f (size, 1), dense J (size, size)) of a Level-1 MOS dict list (native kernels)."""
 
-    def voltage(index: int) -> float:
-        return 0.0 if index == -1 else float(x_values[index])
-
-    def stamp(row: int, current_sign: float, terminals: tuple[int, int, int], derivatives: tuple[float, float, float]) -> None:
-        if row == -1:
-            return
-        for col, derivative in zip(terminals, derivatives):
-            if col != -1 and derivative != 0.0:
-                jacobian[row, col] += current_sign * derivative
-
-    for device in devices:
-        drain = int(device["drain"])
-        gate = int(device["gate"])
-        source = int(device["source"])
-        current, d_drain, d_gate, d_source = _level1_mos_current_and_derivatives(
-            device,
-            voltage(drain),
-            voltage(gate),
-            voltage(source),
-        )
-        terminals = (drain, gate, source)
-        derivatives = (d_drain, d_gate, d_source)
-        if drain != -1:
-            f[drain, 0] += current
-        if source != -1:
-            f[source, 0] -= current
-        stamp(drain, 1.0, terminals, derivatives)
-        stamp(source, -1.0, terminals, derivatives)
-
-    return f, jacobian
+    return _evaluate_device_dicts(size, x_values, mos_devices=devices)
 
 
 def _bjt_level1_npn_currents_and_derivatives(
@@ -801,58 +754,16 @@ def _bjt_level1_npn_currents_and_derivatives(
     vaf: float,
     var: float,
 ) -> tuple[tuple[float, float, float], tuple[tuple[float, float, float], ...]]:
-    """Return NPN terminal currents and dI/d(Vc,Vb,Ve).
+    """Return NPN terminal currents and dI/d(Vc,Vb,Ve) (native kernel).
 
     Currents are positive when leaving the external terminal into the compact
     device. This Ebers-Moll-lite model is intentionally small: transport
     currents, finite forward/reverse beta, and simple Early modulation.
     """
 
-    vt = 0.02585
-    alpha_f = bf / (bf + 1.0) if bf > 0.0 else 0.0
-    alpha_r = br / (br + 1.0) if br > 0.0 else 0.0
-    vbe = vb - ve
-    vbc = vb - vc
-    vce = vc - ve
-    vec = ve - vc
-
-    exp_be = np.exp(np.clip(vbe / vt, -80.0, 80.0))
-    exp_bc = np.exp(np.clip(vbc / vt, -80.0, 80.0))
-    ibe = is_ * (exp_be - 1.0)
-    ibc = is_ * (exp_bc - 1.0)
-    gbe = is_ * exp_be / vt
-    gbc = is_ * exp_bc / vt
-
-    fwd_mod = 1.0 + vce / vaf if vaf > 0.0 else 1.0
-    rev_mod = 1.0 + vec / var if var > 0.0 else 1.0
-    df_dvc = 1.0 / vaf if vaf > 0.0 else 0.0
-    df_dve = -df_dvc
-    dr_dvc = -1.0 / var if var > 0.0 else 0.0
-    dr_dve = -dr_dvc
-
-    ic = alpha_f * ibe * fwd_mod - ibc * rev_mod
-    ib = (1.0 - alpha_f) * ibe + (1.0 - alpha_r) * ibc * rev_mod
-    ie = -(ic + ib)
-
-    dic_dvc = alpha_f * ibe * df_dvc + gbc * rev_mod - ibc * dr_dvc
-    dic_dvb = alpha_f * gbe * fwd_mod - gbc * rev_mod
-    dic_dve = alpha_f * (-gbe * fwd_mod + ibe * df_dve) - ibc * dr_dve
-
-    dib_dvc = (1.0 - alpha_r) * (-gbc * rev_mod + ibc * dr_dvc)
-    dib_dvb = (1.0 - alpha_f) * gbe + (1.0 - alpha_r) * gbc * rev_mod
-    dib_dve = -(1.0 - alpha_f) * gbe + (1.0 - alpha_r) * ibc * dr_dve
-
-    die_dvc = -(dic_dvc + dib_dvc)
-    die_dvb = -(dic_dvb + dib_dvb)
-    die_dve = -(dic_dve + dib_dve)
-
-    currents = (ic, ib, ie)
-    derivatives = (
-        (dic_dvc, dic_dvb, dic_dve),
-        (dib_dvc, dib_dvb, dib_dve),
-        (die_dvc, die_dvb, die_dve),
+    return _native_core().eval_bjt_level1(
+        1, float(is_), float(bf), float(br), float(vaf), float(var), float(vc), float(vb), float(ve)
     )
-    return currents, derivatives
 
 
 def _level1_bjt_currents_and_derivatives(
@@ -861,15 +772,20 @@ def _level1_bjt_currents_and_derivatives(
     vb: float,
     ve: float,
 ) -> tuple[tuple[float, float, float], tuple[tuple[float, float, float], ...]]:
-    is_ = float(device["is"])
-    bf = float(device["bf"])
-    br = float(device["br"])
-    vaf = float(device["vaf"])
-    var = float(device["var"])
-    if str(device["type"]).upper() == "QPNP":
-        currents, derivatives = _bjt_level1_npn_currents_and_derivatives(-vc, -vb, -ve, is_, bf, br, vaf, var)
-        return tuple(-current for current in currents), derivatives
-    return _bjt_level1_npn_currents_and_derivatives(vc, vb, ve, is_, bf, br, vaf, var)
+    """Terminal currents and derivatives of a Level-1 BJT dict (native kernel, PNP mirrored)."""
+
+    sign = -1 if str(device["type"]).upper() == "QPNP" else 1
+    return _native_core().eval_bjt_level1(
+        sign,
+        float(device["is"]),
+        float(device["bf"]),
+        float(device["br"]),
+        float(device["vaf"]),
+        float(device["var"]),
+        float(vc),
+        float(vb),
+        float(ve),
+    )
 
 
 def _evaluate_level1_bjt_devices(
@@ -877,35 +793,9 @@ def _evaluate_level1_bjt_devices(
     size: int,
     x_values: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
-    f = np.zeros((size, 1), dtype=float)
-    jacobian = np.zeros((size, size), dtype=float)
+    """(f (size, 1), dense J (size, size)) of a Level-1 BJT dict list (native kernels)."""
 
-    def voltage(index: int) -> float:
-        return 0.0 if index == -1 else float(x_values[index])
-
-    def add_row(row: int, current: float, terminals: tuple[int, int, int], derivatives: tuple[float, float, float]) -> None:
-        if row == -1:
-            return
-        f[row, 0] += current
-        for col, derivative in zip(terminals, derivatives):
-            if col != -1 and derivative != 0.0:
-                jacobian[row, col] += derivative
-
-    for device in devices:
-        collector = int(device["collector"])
-        base = int(device["base"])
-        emitter = int(device["emitter"])
-        currents, derivatives = _level1_bjt_currents_and_derivatives(
-            device,
-            voltage(collector),
-            voltage(base),
-            voltage(emitter),
-        )
-        terminals = (collector, base, emitter)
-        for row, current, row_derivatives in zip(terminals, currents, derivatives):
-            add_row(row, current, terminals, row_derivatives)
-
-    return f, jacobian
+    return _evaluate_device_dicts(size, x_values, bjt_devices=devices)
 
 
 def compile_nl_functions(
@@ -914,71 +804,43 @@ def compile_nl_functions(
     level1_mos_devices: list[dict[str, object]] | None = None,
     level1_bjt_devices: list[dict[str, object]] | None = None,
 ):
-    """Compile nonlinear current expressions and their Jacobian."""
+    """Compile nonlinear current expressions and their Jacobian.
 
-    mos_devices = list(level1_mos_devices or [])
-    bjt_devices = list(level1_bjt_devices or [])
-    has_symbolic = any(expr != "0" for expr in f_str_vector.flatten())
-    symbolic_f_func = None
-    symbolic_j_func = None
+    Returns ``f_func(*x) -> (size, 1)`` and ``j_func(*x) -> (size, size)``
+    evaluated by the native core: every non-"0" row of ``f_str_vector`` becomes
+    a behavioral program (forward-mode derivatives) injected at that row, and
+    the Level-1 MOS/BJT dictionaries become native devices.
+    """
 
-    if has_symbolic:
-        x_vars = sp.symbols(f"x_0:{size}")
-        expressions: list[sp.Expr] = []
+    from .native.circuit import compile_device_functions
 
-        for expr_str in f_str_vector.flatten():
-            expression = str(expr_str)
-            for i in range(size):
-                expression = expression.replace(f"x[{i}]", f"x_{i}")
-            expressions.append(sp.sympify(_prepare_sympy_expression(expression), locals=_sympy_locals()))
-
-        f_sym = sp.Matrix(expressions)
-        J_sym = f_sym.jacobian(x_vars)
-        symbolic_f_func = sp.lambdify(x_vars, f_sym, "numpy")
-        symbolic_j_func = sp.lambdify(x_vars, J_sym, "numpy")
-
-    def f_func(*args):
-        if symbolic_f_func is None:
-            f = np.zeros((size, 1), dtype=float)
-        else:
-            f = np.asarray(symbolic_f_func(*args), dtype=float).reshape(size, 1)
-        x_values = np.asarray(args, dtype=float)
-        if mos_devices:
-            f += _evaluate_level1_mos_devices(mos_devices, size, x_values)[0]
-        if bjt_devices:
-            f += _evaluate_level1_bjt_devices(bjt_devices, size, x_values)[0]
-        return f
-
-    def j_func(*args):
-        if symbolic_j_func is None:
-            jacobian = np.zeros((size, size), dtype=float)
-        else:
-            jacobian = np.asarray(symbolic_j_func(*args), dtype=float).reshape(size, size)
-        x_values = np.asarray(args, dtype=float)
-        if mos_devices:
-            jacobian += _evaluate_level1_mos_devices(mos_devices, size, x_values)[1]
-        if bjt_devices:
-            jacobian += _evaluate_level1_bjt_devices(bjt_devices, size, x_values)[1]
-        return jacobian
-
-    return f_func, j_func
+    return compile_device_functions(f_str_vector, size, level1_mos_devices, level1_bjt_devices)
 
 
 def compile_time_source_func(b_time_str_vector: np.ndarray):
-    """Compile time-domain source expressions into a callable."""
+    """Compile time-domain source expressions into a callable ``evaluate(t) -> (n, 1)``."""
+
+    from .native.expressions import compile_expression
 
     size = b_time_str_vector.shape[0]
-    t = sp.symbols("t")
-    expressions: list[sp.Expr] = []
-
-    for expr_str in b_time_str_vector.flatten():
-        expr = _prepare_sympy_expression(str(expr_str))
-        expressions.append(sp.sympify(expr, locals=_sympy_locals(t)))
-
-    compiled = sp.lambdify(t, sp.Matrix(expressions), "numpy")
+    rows: list[int] = []
+    handles: list[object] = []
+    for row, expr_str in enumerate(b_time_str_vector.flatten()):
+        text = str(expr_str)
+        if text == "0":
+            continue
+        rows.append(row)
+        handles.append(compile_expression(text, time_dependent=True, n_unknowns=0).handle)
+    evaluate_program = _native_core().evaluate_program
+    no_unknowns = np.zeros(0)
+    entries = list(zip(rows, handles))
 
     def evaluate(t_value: float) -> np.ndarray:
-        return np.asarray(compiled(t_value), dtype=float).reshape(size, 1)
+        t = float(t_value)
+        values = np.zeros((size, 1), dtype=float)
+        for row, handle in entries:
+            values[row, 0] = evaluate_program(handle, no_unknowns, t)
+        return values
 
     return evaluate
 
