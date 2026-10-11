@@ -214,69 +214,6 @@ Program::Program(const std::int32_t* opcodes, const std::int32_t* args, std::siz
     }
 }
 
-double evaluate(const Program& program, const double* x, double t) {
-    constexpr std::size_t kLocal = 64;
-    double local[kLocal];
-    double* stack = local;
-    if (program.max_depth() > kLocal) {
-        std::vector<double>& big = scratch().values;
-        if (big.size() < program.max_depth()) {
-            big.resize(program.max_depth());
-        }
-        stack = big.data();
-    }
-    const double* consts = program.consts().data();
-    std::size_t sp = 0;
-    for (const Instruction& in : program.code()) {
-        switch (in.op) {
-            case Op::Const: stack[sp++] = consts[in.arg]; break;
-            case Op::LoadX: stack[sp++] = x[in.arg]; break;
-            case Op::LoadT: stack[sp++] = t; break;
-            case Op::Add: --sp; stack[sp - 1] = stack[sp - 1] + stack[sp]; break;
-            case Op::Sub: --sp; stack[sp - 1] = stack[sp - 1] - stack[sp]; break;
-            case Op::Mul: --sp; stack[sp - 1] = stack[sp - 1] * stack[sp]; break;
-            case Op::Div: --sp; stack[sp - 1] = stack[sp - 1] / stack[sp]; break;
-            case Op::Pow: --sp; stack[sp - 1] = std::pow(stack[sp - 1], stack[sp]); break;
-            case Op::Heaviside: --sp; stack[sp - 1] = np_heaviside(stack[sp - 1], stack[sp]); break;
-            case Op::PyMod: --sp; stack[sp - 1] = py_mod(stack[sp - 1], stack[sp]); break;
-            case Op::Min: --sp; stack[sp - 1] = np_minimum(stack[sp - 1], stack[sp]); break;
-            case Op::Max: --sp; stack[sp - 1] = np_maximum(stack[sp - 1], stack[sp]); break;
-            case Op::Lt: --sp; stack[sp - 1] = boolean(stack[sp - 1] < stack[sp]); break;
-            case Op::Le: --sp; stack[sp - 1] = boolean(stack[sp - 1] <= stack[sp]); break;
-            case Op::Gt: --sp; stack[sp - 1] = boolean(stack[sp - 1] > stack[sp]); break;
-            case Op::Ge: --sp; stack[sp - 1] = boolean(stack[sp - 1] >= stack[sp]); break;
-            case Op::Eq: --sp; stack[sp - 1] = boolean(stack[sp - 1] == stack[sp]); break;
-            case Op::Ne: --sp; stack[sp - 1] = boolean(stack[sp - 1] != stack[sp]); break;
-            case Op::And: --sp; stack[sp - 1] = boolean(truthy(stack[sp - 1]) && truthy(stack[sp])); break;
-            case Op::Or: --sp; stack[sp - 1] = boolean(truthy(stack[sp - 1]) || truthy(stack[sp])); break;
-            case Op::Neg: stack[sp - 1] = -stack[sp - 1]; break;
-            case Op::Sqrt: stack[sp - 1] = std::sqrt(stack[sp - 1]); break;
-            case Op::Exp: stack[sp - 1] = std::exp(stack[sp - 1]); break;
-            case Op::Log: stack[sp - 1] = std::log(stack[sp - 1]); break;
-            case Op::Sin: stack[sp - 1] = std::sin(stack[sp - 1]); break;
-            case Op::Cos: stack[sp - 1] = std::cos(stack[sp - 1]); break;
-            case Op::Tan: stack[sp - 1] = std::tan(stack[sp - 1]); break;
-            case Op::Abs: stack[sp - 1] = std::fabs(stack[sp - 1]); break;
-            case Op::Not: stack[sp - 1] = boolean(!truthy(stack[sp - 1])); break;
-            case Op::Select: {
-                const std::size_t pairs = static_cast<std::size_t>(in.arg);
-                const std::size_t base = sp - 2 * pairs;
-                double result = kNaN;
-                for (std::size_t i = 0; i < pairs; ++i) {
-                    if (truthy(stack[base + 2 * i + 1])) {
-                        result = stack[base + 2 * i];
-                        break;
-                    }
-                }
-                sp = base;
-                stack[sp++] = result;
-                break;
-            }
-        }
-    }
-    return stack[0];
-}
-
 void evaluate_many(const Program& program, const double* t_array, std::size_t count, double* out) {
     if (!program.unknowns().empty()) {
         throw Error(ErrorCode::NetlistFatal, "evaluate_many: the program reads unknowns; pass x to evaluate()");
@@ -528,7 +465,7 @@ void evaluate_dual(const Program& program, const double* x, double t, const std:
                     const std::size_t src = base + 2 * chosen;
                     v[base] = v[src];
                     h[base] = h[src];
-                    if (h[src] != 0) {
+                    if (h[src] != 0 && k != 0) {
                         std::memcpy(G(base), G(src), k * sizeof(double));
                     }
                 }
@@ -538,6 +475,9 @@ void evaluate_dual(const Program& program, const double* x, double t, const std:
         }
     }
     *value = v[0];
+    if (k == 0) {
+        return;
+    }
     if (h[0] != 0) {
         std::memcpy(grad, G(0), k * sizeof(double));
     } else {
@@ -546,6 +486,16 @@ void evaluate_dual(const Program& program, const double* x, double t, const std:
 }
 
 }  // namespace
+
+double evaluate(const Program& program, const double* x, double t) {
+    // The same code path as the gradient evaluation, with zero derivative directions: the
+    // value of a program must not depend on whether its gradient is requested, and two
+    // separate implementations can round differently once a compiler treats them
+    // differently (seen with sin/cos pairs fused into sincos() on one toolchain only).
+    double value = 0.0;
+    evaluate_dual(program, x, t, program.load_positions().data(), 0, &value, nullptr);
+    return value;
+}
 
 void evaluate_gradient_unknowns(const Program& program, const double* x, double t, double* value, double* grad) {
     evaluate_dual(program, x, t, program.load_positions().data(), program.unknowns().size(), value, grad);
