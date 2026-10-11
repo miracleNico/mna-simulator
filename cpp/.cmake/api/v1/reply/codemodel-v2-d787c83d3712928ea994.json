@@ -1,0 +1,88 @@
+{
+	"configurations" : 
+	[
+		{
+			"directories" : 
+			[
+				{
+					"build" : ".",
+					"hasInstallRule" : true,
+					"jsonFile" : "directory-.-Release-4cbb043192b986094751.json",
+					"minimumCMakeVersion" : 
+					{
+						"string" : "3.26"
+					},
+					"projectIndex" : 0,
+					"source" : ".",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"name" : "Release",
+			"projects" : 
+			[
+				{
+					"directoryIndexes" : 
+					[
+						0
+					],
+					"name" : "mna_core",
+					"targetIndexes" : 
+					[
+						0,
+						1,
+						2,
+						3
+					]
+				}
+			],
+			"targets" : 
+			[
+				{
+					"directoryIndex" : 0,
+					"id" : "_core::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-_core-Release-8f37df6dc3c777ce24f1.json",
+					"name" : "_core",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "klu_vendored::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-klu_vendored-Release-c7f676df560283a14391.json",
+					"name" : "klu_vendored",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "mna_core::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-mna_core-Release-dd86cd16e5152aecd734.json",
+					"name" : "mna_core",
+					"projectIndex" : 0
+				},
+				{
+					"directoryIndex" : 0,
+					"id" : "nanobind-static-abi3::@6890427a1f51a3e7e1df",
+					"jsonFile" : "target-nanobind-static-abi3-Release-db912c8d8d378ef6b75c.json",
+					"name" : "nanobind-static-abi3",
+					"projectIndex" : 0
+				}
+			]
+		}
+	],
+	"kind" : "codemodel",
+	"paths" : 
+	{
+		"build" : "/home/user/mna-simulator/cpp",
+		"source" : "/home/user/mna-simulator/cpp"
+	},
+	"version" : 
+	{
+		"major" : 2,
+		"minor" : 6
+	}
+}

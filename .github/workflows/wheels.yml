@@ -1,0 +1,34 @@
+name: Wheels
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  wheels:
+    name: Wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      # pypa/cibuildwheel publishes no floating "v3" tag; pin a release.
+      - uses: pypa/cibuildwheel@v3.4.1
+        env:
+          # One abi3 wheel (stable ABI, Python >= 3.12) per platform.
+          CIBW_BUILD: "cp312-*"
+          CIBW_ARCHS: "auto64"
+          CIBW_SKIP: "*-musllinux_*"
+          CIBW_TEST_COMMAND: python -c "import mna_simulation._core as c; print(c.version())"
+          # Bundle msvcp140.dll & co.: Python itself ships only vcruntime140*.dll.
+          CIBW_BEFORE_BUILD_WINDOWS: pip install delvewheel
+          CIBW_REPAIR_WHEEL_COMMAND_WINDOWS: delvewheel repair -w {dest_dir} {wheel}
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: wheels-${{ matrix.os }}
+          path: ./wheelhouse/*.whl
