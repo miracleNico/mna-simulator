@@ -232,66 +232,271 @@ def is_nonlinear(f_str_vector: np.ndarray) -> bool:
     return any(expr != "0" for expr in f_str_vector.flatten())
 
 
+def _raise_core_error(exc: Exception) -> None:
+    """Re-raise a ``_core.CoreError`` as the simulator exception of its code."""
+
+    code = getattr(exc, "code", None) or "UNKNOWN"
+    message = getattr(exc, "message", None) or str(exc)
+    error_handler(f"{code}: {message}")
+
+
+def _thread_count(num_threads: object) -> int:
+    """Worker threads for a native call: a positive int, anything else (None, "auto") is 1."""
+
+    if isinstance(num_threads, (int, np.integer)) and not isinstance(num_threads, bool) and int(num_threads) > 0:
+        return int(num_threads)
+    return 1
+
+
 def _transient_time_points(t_stop: float, t_step: float) -> np.ndarray:
-    """Return monotonic transient sample points ending exactly at ``t_stop``."""
+    """Return monotonic transient sample points ending exactly at ``t_stop`` (native, bitwise port).
 
-    if t_stop < 0:
-        error_handler("TRAN_ERROR: t_stop must be non-negative.")
-    if t_step <= 0:
-        error_handler("TRAN_ERROR: t_step must be positive.")
-    if t_stop == 0:
-        return np.array([0.0], dtype=float)
+    ``TRAN_ERROR`` (a ``NetlistError``) for ``t_stop < 0``, ``t_step <= 0`` or a non-finite value.
+    """
 
-    tolerance = max(abs(t_stop), abs(t_step), np.finfo(float).eps) * 1e-9
-    points = [0.0]
-    current = 0.0
-    while current < t_stop - tolerance:
-        next_time = current + t_step
-        current = t_stop if next_time >= t_stop - tolerance else next_time
-        if current <= points[-1]:
-            error_handler("TRAN_ERROR: transient time grid failed to advance.")
-        points.append(float(current))
-    if points[-1] != t_stop:
-        points[-1] = float(t_stop)
-    return np.asarray(points, dtype=float)
+    core = _native_core()
+    try:
+        return core.transient_time_points(float(t_stop), float(t_step))
+    except core.CoreError as exc:
+        _raise_core_error(exc)
+        raise
 
 
-def _finite_vector_norm(vector: np.ndarray) -> float:
-    if not np.all(np.isfinite(vector)):
-        return np.inf
-    return float(np.linalg.norm(vector))
+# ---------------------------------------------------------------------------
+# Native .op / .tran drivers (CPP_MIGRATION_PLAN.md phase P3)
+# ---------------------------------------------------------------------------
+
+_INIT_CONDITION_KEYS = frozenset({"DEFAULT", "RANDOM"})
 
 
-def _damped_newton_step(
-    x: np.ndarray,
-    delta_x: np.ndarray,
-    current_norm: float,
-    residual_at: Callable[[np.ndarray], np.ndarray],
-    max_trials: int = 28,
-) -> tuple[np.ndarray, float, float]:
-    """Pick a finite damped Newton step without committing the full step first."""
+def newton_start(
+    init_cond: np.ndarray | str | None,
+    size: int,
+    nonlinear: bool,
+    diagnostics: list[str] | None = None,
+) -> np.ndarray | None:
+    """Starting point of a Newton solve from an ``init_condition`` (2.4.1 ruling).
 
-    best_x = x
-    best_norm = current_norm
-    best_scale = 0.0
-    scale = 1.0
-    for _ in range(max_trials):
-        trial = x + delta_x * scale
-        try:
-            trial_norm = _finite_vector_norm(residual_at(trial))
-        except (FloatingPointError, OverflowError, ValueError):
-            trial_norm = np.inf
-        if np.isfinite(trial_norm) and trial_norm < best_norm:
-            best_x = trial
-            best_norm = trial_norm
-            best_scale = scale
-        if np.isfinite(trial_norm) and trial_norm <= current_norm:
-            return trial, trial_norm, scale
-        scale *= 0.5
+    * nonlinear circuit: ``None``/``"DEFAULT"`` start at zeros, ``"RANDOM"``
+      draws ``np.random.uniform(-1, 1, (size, 1))`` from NumPy's global RNG
+      (the same draw as the reference), both case-insensitive; an array is
+      used as given; any other string is ``NETLIST_FATAL``;
+    * linear circuit: the operating point does not depend on a starting point,
+      so the value is ignored (``None`` returned) with a diagnostic;
+    * arrays must hold one value per unknown on every path (``NETLIST_FATAL``).
+    """
 
-    if best_scale > 0.0:
-        return best_x, best_norm, best_scale
-    return x, current_norm, 0.0
+    if init_cond is not None and not isinstance(init_cond, str):
+        start = np.asarray(init_cond, dtype=float).reshape(-1)
+        if start.shape[0] != size:
+            error_handler(
+                f"NETLIST_FATAL: init_condition has {start.shape[0]} values, expected {size} (one per unknown)."
+            )
+        if not nonlinear:
+            if diagnostics is not None:
+                diagnostics.append("init_condition ignored: the circuit is linear, its operating point needs no starting point.")
+            return None
+        return np.array(start, dtype=float)
+    if not nonlinear:
+        if init_cond is not None and diagnostics is not None:
+            diagnostics.append(
+                f"init_condition '{init_cond}' ignored: the circuit is linear, its operating point needs no starting point."
+            )
+        return None
+    key = "DEFAULT" if init_cond is None else init_cond.strip().upper()
+    if key not in _INIT_CONDITION_KEYS:
+        error_handler(f"NETLIST_FATAL: Unsupported init condition '{init_cond}'.")
+    if key == "RANDOM":
+        return np.random.uniform(-1.0, 1.0, size=(size, 1)).reshape(-1)
+    return np.zeros(size, dtype=float)
+
+
+def _validated_state(init_cond: object, size: int) -> np.ndarray:
+    """An initial transient state: one float per unknown (``NETLIST_FATAL`` otherwise)."""
+
+    state = np.asarray(init_cond, dtype=float).reshape(-1)
+    if state.shape[0] != size:
+        error_handler(f"NETLIST_FATAL: init_condition has {state.shape[0]} values, expected {size} (one per unknown).")
+    return np.ascontiguousarray(state, dtype=float).copy()
+
+
+def _matrix_triplets(matrix: object, size: int) -> dict[str, np.ndarray] | None:
+    """COO triplets of a dense or SciPy sparse square matrix (``None`` for no matrix)."""
+
+    from scipy import sparse as _sparse
+
+    from .native.circuit import triplets
+
+    if matrix is None:
+        return None
+    if _sparse.issparse(matrix):
+        coo = matrix.tocoo()
+        rows, cols, values = coo.row, coo.col, np.asarray(coo.data, dtype=float)
+    else:
+        dense = np.asarray(matrix, dtype=float)
+        if dense.shape != (size, size):
+            raise ValueError(f"expected a {size}x{size} matrix, got shape {dense.shape}")
+        rows, cols = np.nonzero(dense)
+        values = dense[rows, cols]
+    return triplets(rows, cols, values)
+
+
+def _compile_temporary_circuit(
+    size: int,
+    G: object,
+    C: object = None,
+    f_str_vector: np.ndarray | None = None,
+    level1_mos_devices: list[dict[str, object]] | None = None,
+    level1_bjt_devices: list[dict[str, object]] | None = None,
+):
+    """A native circuit from plain matrices and nonlinear rows (the ``compile_nl_functions`` pattern).
+
+    Used when no compiled ``MnaProblem.native`` is available (``solve_dc_nr`` called
+    with a matrix, or a problem whose build deferred an expression error): every
+    non-"0" row of ``f_str_vector`` becomes a behavioral program injected at that
+    row, the Level-1 dictionaries become native devices, ``G`` already contains any
+    gmin (the circuit's own gmin is 0).
+    """
+
+    from .native.circuit import behavioral_table, bjt_table, build_circuit, mos_table
+    from .native.expressions import compile_expression
+
+    rows: list[int] = []
+    programs = []
+    if f_str_vector is not None:
+        for row, expr in enumerate(np.asarray(f_str_vector, dtype=object).reshape(-1)):
+            text = str(expr)
+            if text == "0":
+                continue
+            rows.append(row)
+            programs.append(compile_expression(text, time_dependent=False, n_unknowns=size))
+    mos_devices = list(level1_mos_devices or [])
+    bjt_devices = list(level1_bjt_devices or [])
+    return build_circuit(
+        size,
+        G=_matrix_triplets(G, size),
+        C=_matrix_triplets(C, size),
+        mos=mos_table(mos_devices) if mos_devices else None,
+        bjt=bjt_table(bjt_devices) if bjt_devices else None,
+        behavioral=behavioral_table(rows, [-1] * len(rows), programs) if programs else None,
+    )
+
+
+def _problem_is_nonlinear(problem: MnaProblem) -> bool:
+    solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
+    return is_nonlinear(solver_f_str) or bool(problem.level1_mos_devices) or bool(problem.level1_bjt_devices)
+
+
+def _problem_circuit(problem: MnaProblem, nonlinear: bool):
+    """``(circuit, gmin)`` for a problem: its compiled ``native`` handle (``G + gmin * stamps``).
+
+    Falls back to a temporary circuit from the problem's matrices when the handle is
+    missing (compiling ``solver_f_str`` then raises the deferred expression error, as
+    the reference did when it evaluated the expression) or when the reference would
+    treat the circuit as linear although the handle holds devices (a B source whose
+    expression is the constant ``0``).
+    """
+
+    native = problem.native
+    if native is not None and bool(native.has_nonlinear) == bool(nonlinear):
+        return native, float(problem.gmin)
+    size = len(problem.index_map.node_names) + len(problem.index_map.branch_names)
+    G = problem.G_sparse if problem.G_sparse is not None else problem.G
+    C = problem.C_sparse if problem.C_sparse is not None else problem.C
+    solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
+    circuit = _compile_temporary_circuit(
+        size,
+        G,
+        C,
+        solver_f_str if nonlinear else None,
+        problem.level1_mos_devices if nonlinear else None,
+        problem.level1_bjt_devices if nonlinear else None,
+    )
+    return circuit, 0.0
+
+
+def _time_sources(b_time_str_vector: np.ndarray) -> tuple[np.ndarray, list[object]]:
+    """``(rows, programs)``: one compiled time program per non-"0" row (as ``compile_time_source_func``)."""
+
+    from .native.expressions import compile_expression
+
+    rows: list[int] = []
+    programs: list[object] = []
+    for row, expr in enumerate(np.asarray(b_time_str_vector, dtype=object).reshape(-1)):
+        text = str(expr)
+        if text == "0":
+            continue
+        rows.append(row)
+        programs.append(compile_expression(text, time_dependent=True, n_unknowns=0).handle)
+    return np.asarray(rows, dtype=np.int64), programs
+
+
+def _krylov_arguments(
+    size: int,
+    use_krylov: bool,
+    krylov_tol: float,
+    krylov_max_iter: int,
+    krylov_restart: int,
+    krylov_rank: int | str | None,
+    krylov_method: str,
+) -> dict[str, object]:
+    """Keyword arguments of the native solves; the rank is resolved like ``krylov_solve_linear``."""
+
+    if use_krylov:
+        rank, rank_mode = resolve_krylov_rank(size, krylov_restart if krylov_rank is None else krylov_rank, krylov_restart)
+    else:
+        rank, rank_mode = 1, "manual"
+    return {
+        "use_krylov": bool(use_krylov),
+        "krylov_method": str(krylov_method),
+        "krylov_tol": float(krylov_tol),
+        "krylov_max_iter": int(krylov_max_iter),
+        "krylov_rank": int(rank),
+        "krylov_rank_mode": rank_mode,
+    }
+
+
+def _native_op(
+    circuit: object,
+    gmin: float,
+    b: np.ndarray,
+    x0: np.ndarray | None,
+    *,
+    max_iter: int,
+    v_tol: float,
+    f_tol: float,
+    use_krylov: bool,
+    krylov_tol: float,
+    krylov_max_iter: int,
+    krylov_restart: int,
+    krylov_rank: int | str | None,
+    krylov_method: str,
+    krylov_stats: list[dict[str, object]] | None,
+    num_threads: object,
+) -> np.ndarray:
+    core = _native_core()
+    size = int(circuit.n)
+    rhs = np.ascontiguousarray(np.asarray(b, dtype=float).reshape(-1))
+    start = None if x0 is None else np.ascontiguousarray(np.asarray(x0, dtype=float).reshape(-1))
+    kwargs = _krylov_arguments(size, use_krylov, krylov_tol, krylov_max_iter, krylov_restart, krylov_rank, krylov_method)
+    try:
+        x, info = core.solve_op(
+            circuit,
+            rhs,
+            start,
+            float(gmin),
+            int(max_iter),
+            float(v_tol),
+            float(f_tol),
+            _thread_count(num_threads),
+            **kwargs,
+        )
+    except core.CoreError as exc:
+        _raise_core_error(exc)
+        raise
+    if krylov_stats is not None:
+        krylov_stats.extend(info["krylov_stats"])
+    return x.reshape(size, 1)
 
 
 def solve_dc_nr(
@@ -311,87 +516,88 @@ def solve_dc_nr(
     krylov_stats: list[dict[str, object]] | None = None,
     level1_mos_devices: list[dict[str, object]] | None = None,
     level1_bjt_devices: list[dict[str, object]] | None = None,
+    *,
+    num_threads: object = 1,
+    diagnostics: list[str] | None = None,
 ) -> np.ndarray:
-    """Solve the DC operating point using linear solve or Newton-Raphson."""
+    """Solve the DC operating point of ``G x + f(x) = b`` (native linear solve or damped Newton).
 
-    size = G.shape[0]
-    if not is_nonlinear(f_str_vector) and not level1_mos_devices and not level1_bjt_devices:
-        try:
-            return solve_linear(
-                G,
-                b,
-                use_krylov=use_krylov,
-                krylov_tol=krylov_tol,
-                krylov_max_iter=krylov_max_iter,
-                krylov_restart=krylov_restart,
-                krylov_rank=krylov_rank,
-                krylov_method=krylov_method,
-                krylov_stats=krylov_stats,
-            )
-        except np.linalg.LinAlgError as exc:
-            error_handler(f"NR_CONVERGENCE: Linear system is singular (G matrix): {exc}")
-            raise
+    ``G`` is a dense or SciPy sparse matrix; the nonlinear rows of ``f_str_vector`` and the
+    Level-1 dictionaries are compiled into a temporary native circuit. ``init_cond`` follows
+    :func:`newton_start`. Errors keep the reference codes and texts (``NR_CONVERGENCE``,
+    ``JACOBIAN_SINGULAR``); a non-finite solution is ``NR_CONVERGENCE`` (2.4.1).
+    """
 
-    f_func, Jf_func = compile_nl_functions(
-        f_str_vector,
+    size = int(G.shape[0])
+    nonlinear = is_nonlinear(f_str_vector) or bool(level1_mos_devices) or bool(level1_bjt_devices)
+    circuit = _compile_temporary_circuit(
         size,
-        level1_mos_devices=level1_mos_devices,
-        level1_bjt_devices=level1_bjt_devices,
+        G,
+        None,
+        f_str_vector if nonlinear else None,
+        level1_mos_devices if nonlinear else None,
+        level1_bjt_devices if nonlinear else None,
     )
-    if isinstance(init_cond, str):
-        if init_cond == "DEFAULT":
-            x = np.zeros((size, 1))
-        elif init_cond == "RANDOM":
-            x = np.random.uniform(-1.0, 1.0, size=(size, 1))
-        else:
-            error_handler(f"NETLIST_FATAL: Unsupported init condition '{init_cond}'.")
-    else:
-        x = init_cond.copy()
+    x0 = newton_start(init_cond, size, nonlinear, diagnostics)
+    return _native_op(
+        circuit,
+        0.0,
+        b,
+        x0,
+        max_iter=max_iter,
+        v_tol=v_tol,
+        f_tol=f_tol,
+        use_krylov=use_krylov,
+        krylov_tol=krylov_tol,
+        krylov_max_iter=krylov_max_iter,
+        krylov_restart=krylov_restart,
+        krylov_rank=krylov_rank,
+        krylov_method=krylov_method,
+        krylov_stats=krylov_stats,
+        num_threads=num_threads,
+    )
 
-    for iteration in range(max_iter):
-        x_flat = x.flatten()
-        f_k = np.asarray(f_func(*x_flat), dtype=float).reshape(size, 1)
-        F_k = (G @ x) + f_k - b
 
-        norm_F_now = _finite_vector_norm(F_k)
-        if norm_F_now < f_tol:
-            return x
+def solve_operating_point(
+    problem: MnaProblem,
+    b: np.ndarray,
+    max_iter: int = 10000,
+    v_tol: float = 1e-9,
+    f_tol: float = 1e-9,
+    init_cond: np.ndarray | str | None = None,
+    use_krylov: bool = False,
+    krylov_tol: float = 1e-9,
+    krylov_max_iter: int = 2000,
+    krylov_restart: int = 80,
+    krylov_rank: int | str | None = "auto",
+    krylov_method: str = "auto",
+    krylov_stats: list[dict[str, object]] | None = None,
+    *,
+    num_threads: object = 1,
+    diagnostics: list[str] | None = None,
+) -> np.ndarray:
+    """``solve_dc_nr`` on a built problem: runs on ``problem.native`` with ``G + problem.gmin * stamps``."""
 
-        Jf_k = np.asarray(Jf_func(*x_flat), dtype=float)
-        J_k = G + Jf_k
-
-        try:
-            delta_x = solve_linear(
-                J_k,
-                -F_k,
-                use_krylov=use_krylov,
-                krylov_tol=krylov_tol,
-                krylov_max_iter=krylov_max_iter,
-                krylov_restart=krylov_restart,
-                krylov_rank=krylov_rank,
-                krylov_method=krylov_method,
-                krylov_stats=krylov_stats,
-            )
-        except np.linalg.LinAlgError as exc:
-            error_handler(f"JACOBIAN_SINGULAR: Jacobian is singular at iteration {iteration}.")
-            raise exc
-
-        def residual_at(trial: np.ndarray) -> np.ndarray:
-            trial_flat = trial.flatten()
-            f_trial = np.asarray(f_func(*trial_flat), dtype=float).reshape(size, 1)
-            return (G @ trial) + f_trial - b
-
-        x_next, next_norm, step_scale = _damped_newton_step(x, delta_x, norm_F_now, residual_at)
-        accepted_delta = x_next - x
-        x = x_next
-        if next_norm < f_tol:
-            return x
-        if step_scale == 0.0:
-            error_handler(f"NR_CONVERGENCE: Newton step could not reduce residual at iteration {iteration}.")
-        if np.linalg.norm(accepted_delta) < v_tol:
-            return x
-
-    error_handler(f"NR_CONVERGENCE: Solver did not converge after {max_iter} iterations.")
+    nonlinear = _problem_is_nonlinear(problem)
+    circuit, gmin = _problem_circuit(problem, nonlinear)
+    x0 = newton_start(init_cond, int(circuit.n), nonlinear, diagnostics)
+    return _native_op(
+        circuit,
+        gmin,
+        b,
+        x0,
+        max_iter=max_iter,
+        v_tol=v_tol,
+        f_tol=f_tol,
+        use_krylov=use_krylov,
+        krylov_tol=krylov_tol,
+        krylov_max_iter=krylov_max_iter,
+        krylov_restart=krylov_restart,
+        krylov_rank=krylov_rank,
+        krylov_method=krylov_method,
+        krylov_stats=krylov_stats,
+        num_threads=num_threads,
+    )
 
 
 def solve_transient(
@@ -401,7 +607,7 @@ def solve_transient(
     max_iter: int = 10000,
     v_tol: float = 1e-9,
     f_tol: float = 1e-9,
-    init_cond: np.ndarray | None = None,
+    init_cond: np.ndarray | str | None = None,
     use_krylov: bool = False,
     krylov_tol: float = 1e-9,
     krylov_max_iter: int = 2000,
@@ -409,164 +615,83 @@ def solve_transient(
     krylov_rank: int | str | None = "auto",
     krylov_method: str = "auto",
     krylov_stats: list[dict[str, object]] | None = None,
+    *,
+    num_threads: object = 1,
+    progress: Callable[[int, float, np.ndarray], object] | None = None,
+    progress_every: int = 0,
+    diagnostics: list[str] | None = None,
 ) -> WaveformResult:
-    """Solve transient response with backward Euler."""
+    """Solve the transient response with Backward Euler in the native core.
 
-    size = problem.G.shape[0]
-    solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
-    level1_devices = problem.level1_mos_devices
-    level1_bjt_devices = problem.level1_bjt_devices
-    has_nonlinear_terms = is_nonlinear(solver_f_str) or bool(level1_devices) or bool(level1_bjt_devices)
-    if has_nonlinear_terms:
-        f_func, Jf_func = compile_nl_functions(
-            solver_f_str,
-            size,
-            level1_mos_devices=level1_devices,
-            level1_bjt_devices=level1_bjt_devices,
-        )
-    else:
-        f_func = lambda *args: np.zeros((size, 1))  # noqa: E731
-        Jf_func = lambda *args: np.zeros((size, size))  # noqa: E731
+    ``init_cond``: an array is the state at ``t = 0`` (one value per unknown); ``None`` or
+    ``"DEFAULT"``/``"RANDOM"`` compute the initial operating point with ``b_dc + b_time(0)``
+    from that Newton starting point (:func:`newton_start`). The whole stepping loop runs in
+    ``_core.solve_transient`` without the GIL; ``progress(step, t, x)`` (optional) is called
+    every ``progress_every`` steps and after the last one.
+    """
 
-    b_time_func = compile_time_source_func(problem.b_time_str)
+    size = len(problem.index_map.node_names) + len(problem.index_map.branch_names)
+    nonlinear = _problem_is_nonlinear(problem)
+    circuit, gmin = _problem_circuit(problem, nonlinear)
+    rows, programs = _time_sources(problem.b_time_str)
+    b_dc = np.ascontiguousarray(np.asarray(problem.b_dc, dtype=float).reshape(-1))
+    linear_kwargs = {
+        "use_krylov": use_krylov,
+        "krylov_tol": krylov_tol,
+        "krylov_max_iter": krylov_max_iter,
+        "krylov_restart": krylov_restart,
+        "krylov_rank": krylov_rank,
+        "krylov_method": krylov_method,
+    }
+    core = _native_core()
 
-    if init_cond is None:
-        b_t0 = problem.b_dc + b_time_func(0.0)
-        x_prev = solve_dc_nr(
-            problem.G,
-            solver_f_str,
+    if init_cond is None or isinstance(init_cond, str):
+        x0 = newton_start(init_cond, size, nonlinear, diagnostics)
+        try:
+            b_t0 = core.time_source_vector(circuit, b_dc, rows, programs, 0.0)
+        except core.CoreError as exc:
+            _raise_core_error(exc)
+            raise
+        x_prev = _native_op(
+            circuit,
+            gmin,
             b_t0,
+            x0,
             max_iter=max_iter,
             v_tol=v_tol,
             f_tol=f_tol,
-            use_krylov=use_krylov,
-            krylov_tol=krylov_tol,
-            krylov_max_iter=krylov_max_iter,
-            krylov_restart=krylov_restart,
-            krylov_rank=krylov_rank,
-            krylov_method=krylov_method,
             krylov_stats=krylov_stats,
-            level1_mos_devices=level1_devices,
-            level1_bjt_devices=level1_bjt_devices,
-        )
+            num_threads=num_threads,
+            **linear_kwargs,
+        ).reshape(-1)
     else:
-        x_prev = init_cond.copy()
+        x_prev = _validated_state(init_cond, size)
 
     t_points = _transient_time_points(t_stop, t_step)
-    values = np.zeros((size, len(t_points)))
-    values[:, 0] = x_prev.flatten()
-    sparse_linear_krylov = (
-        use_krylov
-        and not has_nonlinear_terms
-        and problem.G_sparse is not None
-        and problem.C_sparse is not None
-    )
-    cached_step_size: float | None = None
-    cached_C_h_sparse = None
-    cached_G_be_sparse = None
-
-    for step in range(1, len(t_points)):
-        step_size = float(t_points[step] - t_points[step - 1])
-        x_k = x_prev.copy()
-        b_now = problem.b_dc + b_time_func(float(t_points[step]))
-
-        if sparse_linear_krylov:
-            if cached_step_size != step_size:
-                cached_step_size = step_size
-                cached_C_h_sparse = problem.C_sparse / step_size
-                cached_G_be_sparse = problem.G_sparse + cached_C_h_sparse
-            b_be = (cached_C_h_sparse @ x_prev) + b_now
-            x_next = solve_linear(
-                cached_G_be_sparse,
-                b_be,
-                use_krylov=use_krylov,
-                krylov_tol=krylov_tol,
-                krylov_max_iter=krylov_max_iter,
-                krylov_restart=krylov_restart,
-                krylov_rank=krylov_rank,
-                krylov_method=krylov_method,
-                krylov_stats=krylov_stats,
-                x0=x_prev,
-            )
-            values[:, step] = x_next.flatten()
-            x_prev = x_next
-            continue
-
-        C_h = problem.C / step_size
-        G_be = problem.G + C_h
-        b_be = (C_h @ x_prev) + b_now
-
-        if not has_nonlinear_terms:
-            x_next = solve_linear(
-                G_be,
-                b_be,
-                use_krylov=use_krylov,
-                krylov_tol=krylov_tol,
-                krylov_max_iter=krylov_max_iter,
-                krylov_restart=krylov_restart,
-                krylov_rank=krylov_rank,
-                krylov_method=krylov_method,
-                krylov_stats=krylov_stats,
-                x0=x_prev,
-            )
-            values[:, step] = x_next.flatten()
-            x_prev = x_next
-            continue
-
-        converged = False
-
-        for iteration in range(max_iter):
-            x_flat = x_k.flatten()
-            f_k = np.asarray(f_func(*x_flat), dtype=float).reshape(size, 1)
-            F_k = (G_be @ x_k) + f_k - b_be
-
-            norm_F = _finite_vector_norm(F_k)
-            if norm_F < f_tol:
-                converged = True
-                break
-
-            Jf_k = np.asarray(Jf_func(*x_flat), dtype=float)
-            J_k = G_be + Jf_k
-
-            try:
-                delta_x = solve_linear(
-                    J_k,
-                    -F_k,
-                    use_krylov=use_krylov,
-                    krylov_tol=krylov_tol,
-                    krylov_max_iter=krylov_max_iter,
-                    krylov_restart=krylov_restart,
-                    krylov_rank=krylov_rank,
-                    krylov_method=krylov_method,
-                    krylov_stats=krylov_stats,
-                )
-            except np.linalg.LinAlgError as exc:
-                error_handler(f"JACOBIAN_SINGULAR: Jacobian singular at t={t_points[step]:.2e}, iter={iteration}")
-                raise exc
-
-            def residual_at(trial: np.ndarray) -> np.ndarray:
-                trial_flat = trial.flatten()
-                f_trial = np.asarray(f_func(*trial_flat), dtype=float).reshape(size, 1)
-                return (G_be @ trial) + f_trial - b_be
-
-            x_next, next_norm, step_scale = _damped_newton_step(x_k, delta_x, norm_F, residual_at)
-            accepted_delta = x_next - x_k
-            x_k = x_next
-            if next_norm < f_tol:
-                converged = True
-                break
-            if step_scale == 0.0:
-                error_handler(f"NR_CONVERGENCE: Newton step could not reduce residual at t={t_points[step]:.2e}, iter={iteration}")
-            if np.linalg.norm(accepted_delta) < v_tol:
-                converged = True
-                break
-
-        if not converged:
-            error_handler(f"NR_CONVERGENCE: NR failed to converge at t={t_points[step]:.2e} s")
-
-        values[:, step] = x_k.flatten()
-        x_prev = x_k
-
+    kwargs = _krylov_arguments(size, use_krylov, krylov_tol, krylov_max_iter, krylov_restart, krylov_rank, krylov_method)
+    try:
+        values, info = core.solve_transient(
+            circuit,
+            np.ascontiguousarray(x_prev, dtype=float),
+            t_points,
+            b_dc,
+            rows,
+            programs,
+            float(gmin),
+            int(max_iter),
+            float(v_tol),
+            float(f_tol),
+            _thread_count(num_threads),
+            krylov_csr_operator=problem.G_sparse is not None and problem.C_sparse is not None,
+            progress=progress,
+            progress_every=int(progress_every),
+            **kwargs,
+        )
+    except core.CoreError as exc:
+        _raise_core_error(exc)
+        raise
+    if krylov_stats is not None:
+        krylov_stats.extend(info["krylov_stats"])
     return WaveformResult(time=t_points, values=values, labels=problem.metadata["labels"])
 
 

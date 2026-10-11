@@ -17,6 +17,15 @@ from ..netlist import parse_netlist_file, parse_netlist_text, select_analysis
 from ..native.threads import coerce_num_threads
 from ..utils import DEFAULT_GMIN_STEPS, parse_value
 
+# Compile-once gmin stepping (PythonBackend.run).
+from dataclasses import replace  # noqa: E402
+from scipy.sparse import csc_matrix  # noqa: E402
+from ..api.contracts import MnaProblem  # noqa: E402
+from ..core_advanced import run_advanced_analysis  # noqa: E402
+from ..core_basic import run_basic_analysis  # noqa: E402
+from ..errors import SolverConvergenceError  # noqa: E402
+from ..mna_builder import build_mna_problem  # noqa: E402
+
 
 # Strict request-option coercion (CPP_MIGRATION_PLAN.md section 2.4.1). Every failure is a
 # plain ValueError: the service tags it with a PEP 678 note and the HTTP layer answers 400.
@@ -298,20 +307,87 @@ class PythonBackend:
         )
 
     def run(self, circuit: CircuitIR, options: AnalysisOptions) -> SimulationResult:
-        """Execute a simulation with Gmin stepping."""
+        """Execute a simulation with Gmin stepping.
 
+        The circuit is compiled once (at gmin 0: the native circuit keeps the gmin
+        stamps as a separate unit pattern) and every step runs on a view of that
+        problem with ``G + gmin * stamps`` (CPP_MIGRATION_PLAN.md 2.4). Only numerical
+        failures move on to the next gmin (:func:`is_numerical_failure`); structural
+        errors (``NETLIST_FATAL``, ``TRAN_ERROR``, ``MOR_CONFIG``, a zero resistor, ...)
+        are raised at once. After the last step the last numerical error is raised, as
+        before; ``metadata["gmin"]`` reports the step that succeeded.
+        """
+
+        base: MnaProblem | None = None
         last_error: Exception | None = None
         for gmin in options.gmin_steps:
             try:
+                if base is None:
+                    base = build_mna_problem(circuit, gmin=0.0)
+                problem = problem_at_gmin(base, circuit, gmin)
                 if options.mode == AnalysisMode.HB:
-                    result = build_and_run_advanced(circuit, options, gmin=gmin)
+                    result = run_advanced_analysis(problem, options)
                 else:
-                    result = build_and_run_basic(circuit, options, gmin=gmin)
+                    result = run_basic_analysis(problem, options)
                 result.metadata = dict(result.metadata)
                 result.metadata["gmin"] = gmin
                 return result
             except Exception as exc:  # noqa: BLE001
+                if not is_numerical_failure(exc):
+                    raise
                 last_error = exc
         if last_error is not None:
             raise last_error
         raise RuntimeError("Simulation failed without producing a result.")
+
+
+# Error codes a different gmin can cure (CPP_MIGRATION_PLAN.md 2.4 / 2.4.1). SOLVER_RETRY is
+# the default code of a SolverConvergenceError raised without one.
+NUMERICAL_ERROR_CODES = frozenset({"NR_CONVERGENCE", "JACOBIAN_SINGULAR", "AC_ERROR", "LU_CONVERGENCE", "SOLVER_RETRY"})
+# HB_ERROR is numerical for a failed or singular HB Newton solve; "No sinusoidal sources found.",
+# "Could not determine HB base frequency." and size limits are structural.
+_NUMERICAL_HB_MARKERS = ("converge", "singular", "solve failed", "non-finite")
+
+
+def is_numerical_failure(exc: BaseException) -> bool:
+    """True for failures that gmin stepping may cure (the gmin loop retries only these).
+
+    Coded ``SolverConvergenceError``s with a numerical code, numerical ``HB_ERROR``s, and
+    the uncoded numerical exceptions ``numpy.linalg.LinAlgError`` / ``FloatingPointError``
+    (a singular system that a gmin shunt can regularize, e.g. inside model-order reduction).
+    """
+
+    if isinstance(exc, (np.linalg.LinAlgError, FloatingPointError)):
+        return True
+    if not isinstance(exc, SolverConvergenceError):
+        return False
+    code = getattr(exc, "code", None)
+    if code in NUMERICAL_ERROR_CODES:
+        return True
+    if code == "HB_ERROR":
+        text = str(exc).lower()
+        return any(marker in text for marker in _NUMERICAL_HB_MARKERS)
+    return False
+
+
+def problem_at_gmin(base: MnaProblem, circuit: CircuitIR, gmin: float) -> MnaProblem:
+    """``base`` (built at gmin 0) with ``G + gmin * gmin_stamps`` and ``gmin`` set.
+
+    Shares the compiled native circuit, ``C``, the source vectors and every device table;
+    only ``G_sparse`` (and its lazy dense view and ``G_nnz``) changes. A problem whose
+    native circuit could not be compiled (a deferred expression error) is rebuilt at
+    ``gmin`` as before.
+    """
+
+    if gmin == base.gmin:
+        return base
+    native = base.native
+    if native is None or base.G_sparse is None:
+        return build_mna_problem(circuit, gmin=gmin)
+    size = int(native.n)
+    col_ptr, row_idx = native.pattern()
+    stamps = csc_matrix((native.values("gmin"), row_idx, col_ptr), shape=(size, size)).tocsr()
+    G_sparse = (base.G_sparse + stamps * float(gmin)).tocsr()
+    metadata = dict(base.metadata)
+    metadata["G_nnz"] = int(G_sparse.nnz)
+    return replace(base, G=None, C=None, G_sparse=G_sparse, gmin=float(gmin), metadata=metadata)

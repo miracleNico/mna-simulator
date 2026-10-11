@@ -241,21 +241,31 @@ def test_negative_capacitor_and_inductor_are_accepted_in_transient() -> None:
     )
     # With L = -1 mH and h = 1 us the Backward-Euler matrix G + C/h is exactly singular
     # (det 0 in exact arithmetic). The Python oracle returned values from a 1e-16 LAPACK
-    # pivot; the native KLU solve reports the singularity (decided: CPP_MIGRATION_PLAN.md
-    # 2.4.1, "singular linear transient step"; becomes NR_CONVERGENCE in P3).
-    with pytest.raises(np.linalg.LinAlgError):
+    # pivot; the native KLU solve reports the singularity. Decided in CPP_MIGRATION_PLAN.md
+    # 2.4.1 ("singular linear transient step"): NR_CONVERGENCE with the step time (was a raw
+    # LinAlgError). Which step hits the exact zero pivot depends on the rounding of C/h.
+    with pytest.raises(SolverConvergenceError) as exc:
         _basic("V1 a 0 DC 1\nR1 a b 1k\nL1 b 0 -1m\n", AnalysisMode.TRAN, tran_stop=3e-6, tran_step=1e-6)
+    assert exc.value.code == "NR_CONVERGENCE"
+    assert str(exc.value).startswith("Linear system is singular at t=")
+    assert str(exc.value).endswith(" s (G + C/h matrix): Singular matrix")
 
 
-def test_singular_linear_transient_step_raises_raw_numpy_linalg_error() -> None:
-    # G + C/h is exactly singular for R=1k, C=-1u, h=1m. Unlike the DC/AC/HB
-    # paths, the linear transient loop does not wrap LinAlgError.
+def test_singular_linear_transient_step_raises_nr_convergence_with_the_step_time() -> None:
+    # G + C/h is exactly singular for R=1k, C=-1u, h=1m. Decided in CPP_MIGRATION_PLAN.md
+    # 2.4.1: NR_CONVERGENCE naming the step time (was: a raw numpy LinAlgError "Singular
+    # matrix", the only unwrapped linear solve).
     netlist = "V1 a 0 DC 1\nR1 a b 1k\nC1 b 0 -1u\n"
-    with pytest.raises(np.linalg.LinAlgError) as exc:
+    with pytest.raises(SolverConvergenceError) as exc:
         _basic(netlist, AnalysisMode.TRAN, tran_stop=5e-3, tran_step=1e-3)
-    assert type(exc.value) is np.linalg.LinAlgError
-    assert str(exc.value) == "Singular matrix"
-    # The service retries on *any* exception, and gmin=1e-12 across C1 makes the step regular.
+    _assert_error(
+        exc,
+        SolverConvergenceError,
+        "NR_CONVERGENCE",
+        "Linear system is singular at t=1.00e-03 s (G + C/h matrix): Singular matrix",
+    )
+    # NR_CONVERGENCE is numerical, so gmin stepping still applies: gmin=1e-12 across C1
+    # makes the step regular.
     assert _svc(netlist, "tran", t_stop=5e-3, t_step=1e-3).metadata["gmin"] == 1e-12
 
 
@@ -360,20 +370,31 @@ def test_overflowing_literals_parse_to_infinity() -> None:
     # 1e999 matches the number pattern and float() turns it into inf.
     open_resistor = _svc("V1 a 0 DC 1\nR1 a b 1k\nR2 b 0 1e999\n", "op")
     assert open_resistor.dc_solution == pytest.approx([1.0, 1.0, 0.0], **LIN)
-    infinite_source = _svc("V1 a 0 DC 1e999\nR1 a 0 1k\n", "op")
-    assert infinite_source.status == "ok"
-    # Decided (CPP_MIGRATION_PLAN.md 2.4.1): non-finite solutions become NR_CONVERGENCE in P3.
-    # Until then the exact NaN/Inf pattern is implementation-defined (LAPACK gave [nan, -inf],
-    # KLU propagates the infinity differently); only "not finite" is pinned.
-    assert not np.all(np.isfinite(infinite_source.dc_solution))
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: a non-finite solution is NR_CONVERGENCE (was:
+    # status "ok" with [nan, -inf]). The code is numerical, so every gmin step is tried first.
+    with pytest.raises(SolverConvergenceError) as exc:
+        _svc("V1 a 0 DC 1e999\nR1 a 0 1k\n", "op")
+    _assert_error(exc, SolverConvergenceError, "NR_CONVERGENCE", "non-finite solution")
     with pytest.raises(TypeError):
         _svc("V1 a 0 SIN 1 1e999\nR1 a 0 1k\n", "tran", t_stop=2e-3, t_step=1e-3)
 
 
-def test_func_expression_nan_produces_an_ok_all_nan_waveform() -> None:
-    response = _svc("V1 a 0 FUNC 0 nan\nR1 a 0 1k\n", "tran", t_stop=2e-3, t_step=1e-3)
-    assert response.status == "ok"
-    assert np.isnan(np.asarray(response.waveform["values"], dtype=float)).all()
+def test_func_expression_nan_raises_non_finite_solution() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: NR_CONVERGENCE (was: status "ok" with an
+    # all-NaN waveform). The initial operating point with b_dc + b_time(0) is already NaN.
+    with pytest.raises(SolverConvergenceError) as exc:
+        _svc("V1 a 0 FUNC 0 nan\nR1 a 0 1k\n", "tran", t_stop=2e-3, t_step=1e-3)
+    _assert_error(exc, SolverConvergenceError, "NR_CONVERGENCE", "non-finite solution")
+    # From a given finite state the first step is the first non-finite solution.
+    with pytest.raises(SolverConvergenceError) as step_exc:
+        _basic(
+            "V1 a 0 FUNC 0 nan\nR1 a 0 1k\n",
+            AnalysisMode.TRAN,
+            tran_stop=2e-3,
+            tran_step=1e-3,
+            init_condition=np.zeros((2, 1)),
+        )
+    _assert_error(step_exc, SolverConvergenceError, "NR_CONVERGENCE", "non-finite solution at t=1.00e-03 s")
 
 
 # ---------------------------------------------------------------------------
@@ -633,14 +654,24 @@ def test_time_grid_snapping_tolerance_is_1e_minus_9_relative() -> None:
     assert len(_transient_time_points(1e-3 - 1e-11, 1e-4)) == 11
 
 
-def test_core_basic_replaces_falsy_tran_stop_and_tran_step_with_defaults() -> None:
-    # ``options.tran_stop or 0.1`` / ``options.tran_step or 1e-5``: 0 behaves like "unset".
+def test_core_basic_treats_only_none_as_unset_tran_stop_and_tran_step() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: only None means "unset" (was: ``options.tran_stop
+    # or 0.1`` / ``options.tran_step or 1e-5``, so 0 ran to 0.1 s and t_step=0 used 1e-5).
     zero_stop = _basic(RC, AnalysisMode.TRAN, tran_stop=0.0, tran_step=0.01)
-    assert len(zero_stop.waveform.time) == 11 and zero_stop.waveform.time[-1] == 0.1
+    assert zero_stop.waveform.time.tolist() == [0.0]
+    assert np.asarray(zero_stop.waveform.values).tolist() == [[1.0], [1.0], [0.0]]  # the initial operating point
     unset_stop = _basic(RC, AnalysisMode.TRAN, tran_step=0.05)
     assert len(unset_stop.waveform.time) == 3 and unset_stop.waveform.time[-1] == 0.1
-    zero_step = _basic(RC, AnalysisMode.TRAN, tran_stop=1e-4, tran_step=0.0)
-    assert len(zero_step.waveform.time) == 11  # t_step became 1e-5
+    unset_step = _basic(RC, AnalysisMode.TRAN, tran_stop=1e-4)
+    assert len(unset_step.waveform.time) == 11  # t_step defaults to 1e-5
+    with pytest.raises(NetlistError) as exc:
+        _basic(RC, AnalysisMode.TRAN, tran_stop=1e-4, tran_step=0.0)
+    _assert_error(exc, NetlistError, "TRAN_ERROR", "t_step must be positive.")
+    # TRAN_ERROR is structural: the service raises it at once (no gmin retries).
+    with pytest.raises(NetlistError) as svc_exc:
+        _svc(RC, "tran", t_stop=1e-4, t_step=0.0)
+    _assert_error(svc_exc, NetlistError, "TRAN_ERROR", "t_step must be positive.")
+    assert _svc(RC, "tran", t_stop=0.0, t_step=1e-5).waveform["time"] == [0.0]
 
 
 def test_tran_directive_defaults() -> None:
@@ -747,19 +778,42 @@ def test_init_condition_default_random_and_array_reach_the_same_point() -> None:
     np.testing.assert_array_equal(start, [[5.0], [0.7], [-0.004]])  # not modified in place
 
 
-@pytest.mark.parametrize("value", ["garbage", "default", "random"])
+@pytest.mark.parametrize("value", ["garbage", "", "DEFAULTS"])
 def test_init_condition_unknown_string_raises_on_nonlinear_op(value: str) -> None:
     with pytest.raises(NetlistError) as exc:
         _basic(DIODE, AnalysisMode.OP, init_condition=value)
     _assert_error(exc, NetlistError, "NETLIST_FATAL", f"Unsupported init condition '{value}'.")
 
 
-def test_init_condition_strings_are_ignored_on_linear_op_and_on_tran() -> None:
-    assert _dc(_basic("V1 a 0 DC 5\nR1 a 0 1k\n", AnalysisMode.OP, init_condition="garbage")) == pytest.approx(
-        [5.0, -5e-3], **LIN
+@pytest.mark.parametrize("value", ["default", " Default ", "random", "RANDOM"])
+def test_init_condition_strings_are_case_insensitive(value: str) -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1 (was: NETLIST_FATAL for "default" / "random").
+    np.random.seed(7)
+    assert _dc(_basic(DIODE, AnalysisMode.OP, init_condition=value)) == pytest.approx(
+        [5.0, 0.6698509496871571, -0.004330149050312843], **NL
     )
-    tran = _basic(DIODE + "C1 b 0 1n\n", AnalysisMode.TRAN, tran_stop=1e-6, tran_step=2e-7, init_condition="garbage")
-    assert len(tran.waveform.time) == 6
+
+
+def test_init_condition_strings_on_linear_and_nonlinear_paths() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: strings set the Newton starting point of every
+    # nonlinear .op/.tran (the initial operating point of .tran) and are ignored with a
+    # diagnostic on linear paths. Was: ignored silently on linear .op and on every .tran.
+    linear = _basic("V1 a 0 DC 5\nR1 a 0 1k\n", AnalysisMode.OP, init_condition="garbage")
+    assert _dc(linear) == pytest.approx([5.0, -5e-3], **LIN)
+    assert linear.diagnostics == [
+        "init_condition 'garbage' ignored: the circuit is linear, its operating point needs no starting point."
+    ]
+    assert _basic("V1 a 0 DC 5\nR1 a 0 1k\n", AnalysisMode.OP).diagnostics == []
+    linear_tran = _basic(RC, AnalysisMode.TRAN, tran_stop=2e-3, tran_step=1e-3, init_condition="RANDOM")
+    assert len(linear_tran.diagnostics) == 1 and "ignored" in linear_tran.diagnostics[0]
+    with pytest.raises(NetlistError) as exc:
+        _basic(DIODE + "C1 b 0 1n\n", AnalysisMode.TRAN, tran_stop=1e-6, tran_step=2e-7, init_condition="garbage")
+    _assert_error(exc, NetlistError, "NETLIST_FATAL", "Unsupported init condition 'garbage'.")
+    default = _basic(DIODE + "C1 b 0 1n\n", AnalysisMode.TRAN, tran_stop=1e-6, tran_step=2e-7, init_condition="DEFAULT")
+    np.random.seed(3)
+    random = _basic(DIODE + "C1 b 0 1n\n", AnalysisMode.TRAN, tran_stop=1e-6, tran_step=2e-7, init_condition="random")
+    assert len(default.waveform.time) == 6 and default.diagnostics == []
+    np.testing.assert_allclose(random.waveform.values, default.waveform.values, rtol=1e-6, atol=1e-12)
 
 
 def test_init_condition_array_sets_the_transient_initial_state() -> None:
@@ -772,9 +826,18 @@ def test_init_condition_array_sets_the_transient_initial_state() -> None:
     )
 
 
-def test_init_condition_with_wrong_length_raises_type_error() -> None:
-    with pytest.raises(TypeError):
-        _basic(DIODE, AnalysisMode.OP, init_condition=np.array([1.0, 2.0]))
+def test_init_condition_with_wrong_length_raises_netlist_fatal() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1 (was: TypeError from the lambdified function on
+    # nonlinear .op, ignored on linear .op).
+    message = "init_condition has 2 values, expected 3 (one per unknown)."
+    for netlist, mode, options in (
+        (DIODE, AnalysisMode.OP, {}),
+        ("V1 a 0 DC 5\nR1 a b 1k\nR2 b 0 1k\n", AnalysisMode.OP, {}),
+        (RC, AnalysisMode.TRAN, {"tran_stop": 2e-3, "tran_step": 1e-3}),
+    ):
+        with pytest.raises(NetlistError) as exc:
+            _basic(netlist, mode, init_condition=np.array([1.0, 2.0]), **options)
+        _assert_error(exc, NetlistError, "NETLIST_FATAL", message)
 
 
 def test_init_condition_json_list_through_the_service() -> None:
@@ -790,9 +853,11 @@ def test_init_condition_json_list_through_the_service() -> None:
     linear = _svc("V1 a 0 DC 5\nR1 a 0 1k\n", "op", init_condition=[123.0, 456.0])
     assert linear.dc_solution == pytest.approx([5.0, -5e-3], **LIN)
     assert _svc(DIODE, "op", init_condition=" default ").dc_solution == pytest.approx(reference, **NL)
-    # Length validation is still the solvers' job (P3 ruling): a short list fails inside the solve.
-    with pytest.raises(TypeError):
+    # Length validation (P3 ruling, decided): NETLIST_FATAL, raised at once (was: TypeError
+    # after every gmin step).
+    with pytest.raises(NetlistError) as length_exc:
         _svc(DIODE, "op", init_condition=[1.0, 2.0])
+    _assert_error(length_exc, NetlistError, "NETLIST_FATAL", "init_condition has 2 values, expected 3 (one per unknown).")
     with pytest.raises(ValueError) as exc:
         _svc("V1 a 0 DC 5\nR1 a 0 1k\n", "op", init_condition="garbage")
     assert type(exc.value) is ValueError

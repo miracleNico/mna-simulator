@@ -20,7 +20,11 @@ decision:
 
 Notation: *basic* = `core_basic.build_and_run_basic` at gmin=0. *service* =
 `SimulationService.run_request`, which retries over `DEFAULT_GMIN_STEPS = [0, 1e-12, ..., 1e-5]`
-on **any** exception and reports the gmin that worked in `metadata["gmin"]`.
+and reports the gmin that worked in `metadata["gmin"]`. Since P3 the circuit is compiled once
+and only numerical failures are retried (`NR_CONVERGENCE`, `JACOBIAN_SINGULAR`, `AC_ERROR`,
+`LU_CONVERGENCE`, numerical `HB_ERROR`, raw `LinAlgError`); structural errors (`NETLIST_FATAL`,
+`TRAN_ERROR`, `MOR_CONFIG`, `ZeroDivisionError`, ...) are raised at once. The error after the last
+step is unchanged (decided: 2.4 / 2.4.1). Was: retried on **any** exception, rebuilding everything.
 `SCE` = `SolverConvergenceError`, `CSE` = `CircuitSimulatorError` (base class).
 Test ids are functions in `tests/test_edge_cases.py`.
 
@@ -29,9 +33,10 @@ Test ids are functions in `tests/test_edge_cases.py`.
 1. **Falsy option values are replaced by defaults.** `options.x or default` turns 0 into
    "unset": `tran_stop=0` runs to 0.1 s, `tran_step=0` uses 1e-5, `.ac` `f_start=0` uses 1 Hz,
    `f_stop=0` uses 1 MHz, `points=0` uses 100, HB `harmonics=0` uses 8.
-   **Decided (2.4.1), applied for `.ac`:** only `None` means unset; `f_start=0` / `f_stop=0`
-   are DC points and `points <= 0` raises `AC_ERROR` (full and MOR sweeps). The `.tran` and
-   HB parts land with their own P3/P4 cut-overs.
+   **Decided (2.4.1), applied for `.ac` and `.tran`:** only `None` means unset; `f_start=0` /
+   `f_stop=0` are DC points and `points <= 0` raises `AC_ERROR` (full and MOR sweeps);
+   `tran_stop=0` returns the single initial sample and `tran_step <= 0` is `TRAN_ERROR`. The HB
+   part lands with the P4 cut-over.
 2. **A diode clamped by an ideal voltage source never converges** (5 V or 20 V, even with
    10 000 iterations). Damped Newton creeps about Vt per iteration. With 1 Ω in series it
    converges even at 1000 V.
@@ -51,16 +56,24 @@ Test ids are functions in `tests/test_edge_cases.py`.
    strings with metric suffixes (`"1m"` is 1e-3), coerces integral `points` (`"3"`, `3.0`),
    rejects non-integral ones with a plain `ValueError` (HTTP 400), and turns a numeric list
    `init_condition` into a float column array. R=0 and the singular transient step are
-   P2/P3 items.
+   P2/P3 items. **Decided (2.4.1), applied for the transient step (P3):** a singular linear
+   transient step is `NR_CONVERGENCE` naming the step time; gmin stepping still applies.
 6. **Non-finite results come back as `status="ok"`.** `V1 a 0 DC 1e999` returns
    `[nan, -inf]`, and `FUNC 0 nan` returns an all-NaN waveform.
+   **Decided (2.4.1), applied for `.op` and `.tran` (P3):** `NR_CONVERGENCE` "non-finite solution"
+   (`.tran` steps add " at t=... s").
 7. **`init_condition` is handled inconsistently.** Strings are ignored on linear `.op` and on
    every `.tran`. They are validated only on nonlinear `.op` (case-sensitive). A wrong-length
    array raises `TypeError` from the lambdified function.
    **Decided (2.4.1), applied at the request level:** `build_options` upper-cases
    `DEFAULT`/`RANDOM` and rejects any other string with a plain `ValueError`, so requests no
    longer reach the core with an ignored or case-mismatched string. The core-level handling
-   and the length check are P3 items.
+   and the length check are P3 items. **Decided (2.4.1), applied in the core (P3):**
+   `DEFAULT`/`RANDOM` (any case) set the Newton starting point of every nonlinear `.op` and of
+   the initial operating point of every nonlinear `.tran` (`RANDOM` draws from NumPy's global RNG
+   in Python; the core receives `x0`), other strings are `NETLIST_FATAL` there; on linear paths
+   strings and arrays are ignored with a diagnostic in `SimulationResult.diagnostics`; arrays of
+   the wrong length are `NETLIST_FATAL` everywhere.
 8. **Options are not type-checked.** `use_krylov="false"` (or `krylov="no"`) turns Krylov ON
    because `bool("false")` is true, and `krylov_rank=2.7` is silently truncated to 2.
    **Decided (2.4.1), applied:** strict booleans (`true/false/yes/no/on/off/1/0`, any case)
@@ -99,8 +112,8 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | C = 0 | Silently skipped (`add_entry` drops 0.0). A node reached only through C=0 floats, giving singular `NR_CONVERGENCE` | `test_zero_capacitor_is_silently_skipped` | unclear |
 | L = 0 | Branch row and `I(L1)` label kept, C entry dropped, so it acts as a 0 V source (a short) | `test_zero_inductor_keeps_its_branch_and_acts_as_a_short` | yes |
 | Negative R | Accepted: divider 1k/-2k gives V(b) = 2 V | `test_negative_resistor_is_accepted` | unclear (no validation) |
-| Negative C / L in `.tran` | Negative C: accepted and integrated (pinned values). Negative L with L/h making G + C/h exactly singular: native KLU raises `LinAlgError` (the oracle returned garbage from a 1e-16 LAPACK pivot) | `test_negative_capacitor_and_inductor_are_accepted_in_transient` | decided: KLU singularity report kept; NR_CONVERGENCE wrapper in P3 (2.4.1) |
-| Linear `.tran` step with G + C/h exactly singular (R=1k, C=-1u, h=1m) | *basic*: raw `numpy.linalg.LinAlgError` "Singular matrix" (only the linear transient loop is unwrapped). *service*: hidden, succeeds at gmin=1e-12 | `test_singular_linear_transient_step_raises_raw_numpy_linalg_error` | no |
+| Negative C / L in `.tran` | Negative C: accepted and integrated (pinned values). Negative L with L/h making G + C/h exactly singular: native KLU reports the zero pivot as `SCE` `NR_CONVERGENCE` "Linear system is singular at t=... s (G + C/h matrix): Singular matrix" (the oracle returned garbage from a 1e-16 LAPACK pivot). Was: raw `LinAlgError` from the KLU facade | `test_negative_capacitor_and_inductor_are_accepted_in_transient` | decided: KLU singularity report kept, NR_CONVERGENCE wrapper (2.4.1) |
+| Linear `.tran` step with G + C/h exactly singular (R=1k, C=-1u, h=1m) | *basic*: `SCE` `NR_CONVERGENCE` "Linear system is singular at t=1.00e-03 s (G + C/h matrix): Singular matrix". *service*: succeeds at gmin=1e-12 (the code is numerical). Was: raw `numpy.linalg.LinAlgError` "Singular matrix" (only the linear transient loop was unwrapped) | `test_singular_linear_transient_step_raises_nr_convergence_with_the_step_time` (was `test_singular_linear_transient_step_raises_raw_numpy_linalg_error`) | decided: NR_CONVERGENCE with the step time (2.4.1) |
 
 ### Parser conflicts, duplicates, ground aliases, NaN/Inf
 
@@ -112,8 +125,8 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Duplicate non-branch names (R1 twice, C1 twice) | Silently accepted, both stamped (C doubles). Names are case-sensitive (`R1` and `r1` are distinct) | `test_duplicate_non_branch_component_names_are_silently_accepted` | unclear |
 | GND aliases: several aliases, alias declared after use, lowercase `gnd`, alias used as a control node, `GND 0`, wrong arity | All aliases map to "0" in any order. `GND`/`GND a b` give `COMPONENT_ERROR` "'GND' GND statement expects '<node>' (got N arg(s))." | `test_gnd_aliases` | yes |
 | `nan`, `NaN`, `inf` literals | Rejected by the value regex: `NETLIST_FATAL` "'R2' has invalid value format 'nan'." / "'V1' has invalid value 'nan'." | `test_nan_and_inf_literals_are_rejected_by_the_value_pattern` | yes |
-| `1e999` literal | Parses to `inf`. As R: an open circuit. As a V source: `status="ok"` with a non-finite solution (the exact NaN/Inf pattern differs between LAPACK and KLU). As a SIN frequency: `TypeError` from the expression compiler | `test_overflowing_literals_parse_to_infinity` | decided: NR_CONVERGENCE for non-finite solutions in P3 (2.4.1) |
-| `FUNC 0 nan` | `status="ok"`, all-NaN waveform | `test_func_expression_nan_produces_an_ok_all_nan_waveform` | no |
+| `1e999` literal | Parses to `inf`. As R: an open circuit. As a V source: `SCE` `NR_CONVERGENCE` "non-finite solution" after every gmin step. As a SIN frequency: `TypeError` from the expression compiler. Was: `status="ok"` with a non-finite solution (`[nan, -inf]` with LAPACK) | `test_overflowing_literals_parse_to_infinity` | decided: NR_CONVERGENCE for non-finite solutions (2.4.1) |
+| `FUNC 0 nan` | `SCE` `NR_CONVERGENCE` "non-finite solution" (the initial operating point is NaN; from a given state the first step fails with "non-finite solution at t=1.00e-03 s"). Was: `status="ok"`, all-NaN waveform | `test_func_expression_nan_raises_non_finite_solution` (was `test_func_expression_nan_produces_an_ok_all_nan_waveform`) | decided: NR_CONVERGENCE for non-finite solutions (2.4.1) |
 
 ### Conditioning and device models
 
@@ -138,13 +151,13 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | --- | --- | --- | --- |
 | `_transient_time_points(0, h)` | `[0.0]` | `test_transient_time_points_with_zero_t_stop` | yes |
 | `solve_transient(t_stop=0)` directly | One sample: the DC operating point | `test_solve_transient_with_zero_t_stop_returns_only_the_initial_point` | yes |
-| Negative `t_stop`, `t_step <= 0` (direct) | `NetlistError` with code `TRAN_ERROR` ("t_stop must be non-negative." / "t_step must be positive."). Was: base `CSE`, because `error_handler` had no mapping for `TRAN_ERROR` | `test_transient_time_points_reject_bad_arguments_with_tran_error` | decided: NetlistError (2.4.1) |
-| Negative `t_stop` via *basic* / *service* | Same `NetlistError` `TRAN_ERROR` (the service re-raises it after trying every gmin; HTTP 400 with the code). Was: base `CSE` | `test_negative_t_stop_through_core_and_service_raises_tran_error` | decided: NetlistError (2.4.1) |
+| Negative `t_stop`, `t_step <= 0` (direct) | `NetlistError` with code `TRAN_ERROR` ("t_stop must be non-negative." / "t_step must be positive."); since P3 also for a non-finite value ("t_stop must be finite." / "t_step must be finite.", the oracle produced `[nan]` or looped forever). Was: base `CSE`, because `error_handler` had no mapping for `TRAN_ERROR` | `test_transient_time_points_reject_bad_arguments_with_tran_error` | decided: NetlistError (2.4.1) |
+| Negative `t_stop` via *basic* / *service* | Same `NetlistError` `TRAN_ERROR` (the service raises it at once since P3: structural, no gmin retries; HTTP 400 with the code). Was: base `CSE`, re-raised after trying every gmin | `test_negative_t_stop_through_core_and_service_raises_tran_error` | decided: NetlistError (2.4.1) |
 | `t_step > t_stop` | `[0, t_stop]` (one shortened step) | `test_t_step_larger_than_t_stop_gives_a_single_step` | yes |
 | `t_step` not dividing `t_stop` | Grid ends exactly at `t_stop` with a shorter last step: `(1e-3, 3e-4)` gives 5 points | `test_t_step_not_dividing_t_stop_ends_exactly_at_t_stop` | yes |
 | Grid construction | Repeated addition, not `i*h`: `(1.0, 0.1)` gives `0.30000000000000004`, `0.7999999999999999`, ... A bit-exact port must accumulate the same way | `test_time_grid_is_built_by_repeated_addition` | unclear |
 | Snapping tolerance `max(|t_stop|, |t_step|, eps) * 1e-9` | Overshoot inside it snaps (11 points). Just outside it, an extra ~1e-11 s step is appended (12 points; a tiny BE step makes C/h huge). Undershoot shortens the last step | `test_time_grid_snapping_tolerance_is_1e_minus_9_relative` | unclear |
-| `tran_stop=0` / unset / `tran_step=0` via *basic* | `or` substitution: `t_stop` becomes 0.1 s, `t_step` becomes 1e-5 (so `.tran 0` would run 10 001 steps) | `test_core_basic_replaces_falsy_tran_stop_and_tran_step_with_defaults` | no |
+| `tran_stop=0` / unset / `tran_step=0` via *basic* | Only `None` is unset (0.1 s / 1e-5). `tran_stop=0` returns the single initial sample (the operating point), `tran_step=0` is `NetlistError` `TRAN_ERROR` "t_step must be positive." (raised at once by the service). Was: `or` substitution, `t_stop` became 0.1 s and `t_step` 1e-5 (so `.tran 0` ran 10 001 steps) | `test_core_basic_treats_only_none_as_unset_tran_stop_and_tran_step` (was `test_core_basic_replaces_falsy_tran_stop_and_tran_step_with_defaults`) | decided: only None is unset (2.4.1) |
 | `.tran 0`, `.tran 1m`, bare `.tran` | `{t_stop: 0, t_step: 1e-5}`, `{1e-3, 1e-5}`, `NETLIST_FATAL` "Use .tran <time> (<step_time>)." | `test_tran_directive_defaults` | yes |
 | Service options `t_stop="1m"` | Parsed by `build_options` with `parse_value`, like `.tran` (`"1m"` is 1e-3; also `t_step`, `f_start`, `f_stop`, `time_window`, `krylov_tol`, `v_tol`, `f_tol`). An unparsable string is a plain `ValueError` "t_stop must be a number (metric suffixes allowed)". Was: not parsed, `TypeError` ("'<' not supported ...") | `test_service_parses_string_time_options` (was `test_service_does_not_parse_string_time_options`) | decided: coerce (2.4.1) |
 
@@ -163,11 +176,11 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
 | `"DEFAULT"`, `"RANDOM"` (global NumPy RNG), ndarray start | Same operating point. The array is copied, not mutated | `test_init_condition_default_random_and_array_reach_the_same_point` | yes |
-| Unknown string, or lowercase `"default"` / `"random"`, on nonlinear `.op` | `NetlistError` `NETLIST_FATAL` "Unsupported init condition 'x'." (core level). Through the service, `build_options` now upper-cases `default`/`random` and rejects other strings first (row "JSON list" below) | `test_init_condition_unknown_string_raises_on_nonlinear_op` | yes |
-| Any string on linear `.op`, or on any `.tran` | Silently ignored (core level; the P3 ruling changes it). Through the service an unknown string no longer gets here: `build_options` raises a plain `ValueError` | `test_init_condition_strings_are_ignored_on_linear_op_and_on_tran` | no (core part: P3) |
+| Unknown string on nonlinear `.op` / nonlinear `.tran` | `NetlistError` `NETLIST_FATAL` "Unsupported init condition 'x'." (core level). `default`/`random` in any case (trimmed) are accepted since P3. Through the service, `build_options` upper-cases `default`/`random` and rejects other strings first (row "JSON list" below). Was: lowercase `default`/`random` also rejected; nonlinear `.tran` ignored every string | `test_init_condition_unknown_string_raises_on_nonlinear_op`, `test_init_condition_strings_are_case_insensitive` | decided: case-insensitive (2.4.1) |
+| Strings on linear paths, `DEFAULT`/`RANDOM` on nonlinear `.tran` | Linear `.op`/`.tran`: ignored with a diagnostic ("init_condition 'x' ignored: the circuit is linear, ...") in `SimulationResult.diagnostics`. Nonlinear `.tran`: the Newton starting point of the initial operating point (`op_used` unchanged). Was: silently ignored on linear `.op` and on every `.tran` | `test_init_condition_strings_on_linear_and_nonlinear_paths` (was `test_init_condition_strings_are_ignored_on_linear_op_and_on_tran`) | decided: strings start every nonlinear Newton solve (2.4.1) |
 | ndarray on `.tran` | Used as the t=0 state. No OP is computed (`op_used=False`) | `test_init_condition_array_sets_the_transient_initial_state` | yes |
-| ndarray of the wrong length | `TypeError` from the lambdified function | `test_init_condition_with_wrong_length_raises_type_error` | no |
-| JSON list through the service | `build_options` converts a numeric list/tuple to a float column array, so nonlinear `.op` and `.tran` use it like an ndarray; linear `.op` ignores it. Other strings than `DEFAULT`/`RANDOM` (any case) and non-numeric lists are a plain `ValueError` "init_condition must be 'DEFAULT', 'RANDOM', or a numeric array". A wrong-length list still fails inside the solve (`TypeError`; length validation is P3). Was: `AttributeError` "'list' object has no attribute 'flatten'" after every gmin | `test_init_condition_json_list_through_the_service` | decided: lists accepted (2.4.1) |
+| ndarray of the wrong length | `NetlistError` `NETLIST_FATAL` "init_condition has k values, expected n (one per unknown)." on every `.op` (linear too) and `.tran`. Was: `TypeError` from the lambdified function on nonlinear `.op`, ignored on linear `.op` | `test_init_condition_with_wrong_length_raises_netlist_fatal` (was `test_init_condition_with_wrong_length_raises_type_error`) | decided: length validated (2.4.1) |
+| JSON list through the service | `build_options` converts a numeric list/tuple to a float column array, so nonlinear `.op` and `.tran` use it like an ndarray; linear `.op` ignores it. Other strings than `DEFAULT`/`RANDOM` (any case) and non-numeric lists are a plain `ValueError` "init_condition must be 'DEFAULT', 'RANDOM', or a numeric array". A wrong-length list is `NetlistError` `NETLIST_FATAL` (P3 length check, raised at once). Was: `AttributeError` "'list' object has no attribute 'flatten'" after every gmin; then (option coercion applied) `TypeError` inside the solve | `test_init_condition_json_list_through_the_service` | decided: lists accepted, length validated (2.4.1) |
 
 ### `probe_nodes`, output decimation
 

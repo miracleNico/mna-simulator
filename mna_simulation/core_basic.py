@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import functools
+
 import numpy as np
 
 from .api.contracts import ComponentRecord
@@ -18,7 +20,13 @@ from .solvers import (
     solve_dc_nr,
     solve_transient,
 )
+from .solvers import solve_operating_point
 from .utils import parse_value
+
+# The device operating points of .op / .tran results parse each device's values; with
+# hundreds of identical devices (SRAM) the regex parse dominated a native .op. Values
+# repeat, so cache them (parse_value is pure; errors are not cached).
+parse_value = functools.lru_cache(maxsize=8192)(parse_value)
 
 
 def _linear_solver_kwargs(options: AnalysisOptions, stats: list[dict[str, object]] | None = None) -> dict[str, object]:
@@ -83,7 +91,7 @@ def _terminal_voltage(problem: MnaProblem, solution: np.ndarray, node: str | Non
     index = problem.index_map.node_to_index.get(node)
     if index is None:
         return 0.0
-    return float(np.asarray(solution).flatten()[index])
+    return float(np.asarray(solution).reshape(-1)[index])
 
 
 def _bjt_operating_point(component: ComponentRecord, problem: MnaProblem, solution: np.ndarray) -> dict[str, object]:
@@ -335,17 +343,19 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
         )
 
     if options.mode == AnalysisMode.OP:
-        init_cond = options.init_condition if options.init_condition is not None else "DEFAULT"
-        solution = solve_dc_nr(
-            problem.G,
-            solver_f_str,
+        # Native .op on problem.native with G + gmin * stamps. init_condition (2.4.1):
+        # DEFAULT/RANDOM/array start the Newton solve of a nonlinear circuit and are
+        # ignored with a diagnostic on a linear one; arrays are length-checked.
+        diagnostics: list[str] = []
+        solution = solve_operating_point(
+            problem,
             problem.b_dc,
             max_iter=options.max_iter,
             v_tol=options.v_tol,
             f_tol=options.f_tol,
-            init_cond=init_cond,
-            level1_mos_devices=problem.level1_mos_devices,
-            level1_bjt_devices=problem.level1_bjt_devices,
+            init_cond=options.init_condition,
+            num_threads=options.num_threads,
+            diagnostics=diagnostics,
             **linear_kwargs,
         )
         metadata = _result_metadata(problem, options, krylov_stats)
@@ -369,10 +379,15 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
                 "b_time_str": problem.b_time_str,
             },
             labels=labels,
+            diagnostics=diagnostics,
             metadata=metadata,
         )
 
     if options.mode == AnalysisMode.TRAN:
+        # Only None means "unset" (2.4.1): t_stop = 0 returns the initial sample and
+        # t_step <= 0 is TRAN_ERROR (was: 0 replaced by the defaults).
+        t_stop = options.tran_stop if options.tran_stop is not None else 0.1
+        t_step = options.tran_step if options.tran_step is not None else 1e-5
         if options.use_mor:
             if _has_nonlinear_terms(problem):
                 if options.mor_method == "linear_krylov":
@@ -381,8 +396,8 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
 
                 waveform, mor_metadata = solve_transient_tpwl(
                     problem,
-                    t_stop=options.tran_stop or 0.1,
-                    t_step=options.tran_step or 1e-5,
+                    t_stop=t_stop,
+                    t_step=t_step,
                     mor_output_nodes=options.mor_output_nodes,
                     mor_order=options.mor_order,
                     requested_method=options.mor_method,
@@ -406,8 +421,8 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
             init_cond = options.init_condition if not isinstance(options.init_condition, str) else None
             waveform, mor_metadata = solve_transient_mor(
                 problem,
-                t_stop=options.tran_stop or 0.1,
-                t_step=options.tran_step or 1e-5,
+                t_stop=t_stop,
+                t_step=t_step,
                 mor_output_nodes=options.mor_output_nodes,
                 mor_order=options.mor_order,
                 requested_method=options.mor_method,
@@ -432,33 +447,42 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
                 metadata=metadata,
             )
 
-        init_cond = options.init_condition if not isinstance(options.init_condition, str) else None
+        # init_condition (2.4.1): an array is the t = 0 state (length-checked, no operating
+        # point); DEFAULT/RANDOM (or None) start the Newton solve of the initial operating
+        # point of a nonlinear circuit and are ignored with a diagnostic on a linear one.
+        # op_used / operating_point keep the reference semantics: only Level-1 circuits
+        # without an initial state report their initial operating point (b_dc + b_time(0)).
+        diagnostics: list[str] = []
+        init_option = options.init_condition
+        initial_state = None if init_option is None or isinstance(init_option, str) else init_option
         op_used = False
         op_solution: np.ndarray | None = None
-        if init_cond is None and has_level1_devices:
+        if initial_state is None and has_level1_devices:
             b_time_func = compile_time_source_func(problem.b_time_str)
-            op_solution = solve_dc_nr(
-                problem.G,
-                solver_f_str,
+            op_solution = solve_operating_point(
+                problem,
                 problem.b_dc + b_time_func(0.0),
                 max_iter=options.max_iter,
                 v_tol=options.v_tol,
                 f_tol=options.f_tol,
-                init_cond="DEFAULT",
-                level1_mos_devices=problem.level1_mos_devices,
-                level1_bjt_devices=problem.level1_bjt_devices,
+                init_cond=init_option,
+                num_threads=options.num_threads,
                 **linear_kwargs,
             )
-            init_cond = op_solution
+            transient_start: np.ndarray | str | None = op_solution
             op_used = True
+        else:
+            transient_start = init_option
         waveform = solve_transient(
             problem,
-            t_stop=options.tran_stop or 0.1,
-            t_step=options.tran_step or 1e-5,
+            t_stop=t_stop,
+            t_step=t_step,
             max_iter=options.max_iter,
             v_tol=options.v_tol,
             f_tol=options.f_tol,
-            init_cond=init_cond,
+            init_cond=transient_start,
+            num_threads=options.num_threads,
+            diagnostics=diagnostics,
             **linear_kwargs,
         )
         metadata = _result_metadata(problem, options, krylov_stats)
@@ -474,6 +498,7 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
             status="ok",
             waveform=waveform,
             labels=waveform.labels,
+            diagnostics=diagnostics,
             metadata=metadata,
         )
 
