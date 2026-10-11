@@ -20,8 +20,8 @@
 //   G + C * (1 / h), the arithmetic of SciPy's sparse division, and the Krylov
 //   stats report a CSR operator; otherwise C / h and a dense operator.
 // * Nonlinear circuits run the damped Newton driver from x_{k-1} on every
-//   step; the direct solver refactors with the pivot order of the previous
-//   iteration or step.
+//   step (with its junction strategy, newton.hpp); the direct solver
+//   refactors with the pivot order of the previous iteration or step.
 // * An optional progress callback runs after every `progress_every`-th step
 //   and after the last one, with the step index, its time and the state.
 //
@@ -66,6 +66,9 @@ using ProgressFn = std::function<void(std::int64_t step, double t, const double*
 struct TranResult {
     std::vector<double> values;  ///< n x T, row-major: values[i * T + k] = x_i(t_k)
     std::int64_t newton_iterations = 0;
+    std::int64_t junction_switches = 0;     ///< Newton solves that switched to the junction strategy
+    std::int64_t limited_steps = 0;         ///< Newton iterations changed by the junction limiter
+    std::int64_t monotonicity_accepts = 0;  ///< damping trials accepted by the monotonicity test
     std::int64_t factorizations = 0;
     std::int64_t progress_calls = 0;
     std::vector<KrylovStat> krylov_stats;

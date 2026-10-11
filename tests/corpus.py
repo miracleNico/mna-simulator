@@ -27,6 +27,12 @@ most ~60 steps, AC at most 40 points, HB at most 8 harmonics (the GHz mixer
 is the only exception: its two tones force H=205), and nonlinear runs use
 ``max_iter=200``.
 
+Deliberate behaviour changes (``CPP_MIGRATION_PLAN.md`` 2.4.1 rulings that make
+the live package differ from the oracle) are recorded per analysis mode as a
+:class:`Deviation`: the oracle must still behave as recorded on the case
+netlist, and the live result is checked against the oracle's result on an
+equivalent netlist (the change made explicit) or against an analytic answer.
+
 Tolerance classes (see ``tests/differential/compare.py``): ``linear``,
 ``nonlinear``, ``hb``, ``mor``. A case declares its default class;
 :meth:`Case.tolerance_for` upgrades a single analysis to ``mor`` when it
@@ -38,6 +44,7 @@ Krylov tolerance, not to direct-solve precision).
 from __future__ import annotations
 
 import copy
+import math
 import random
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
@@ -48,6 +55,35 @@ _TOLERANCE_RANK = {"linear": 0, "nonlinear": 1, "hb": 2, "mor": 3}
 VALID_MODES = ("show_matrix", "op", "tran", "ac", "hb")
 
 NL_MAX_ITER = 200
+
+
+@dataclass(frozen=True)
+class Deviation:
+    """A deliberate behaviour change of the live package for one analysis mode (a 2.4.1 ruling).
+
+    The oracle still runs the case netlist and must end as recorded: ``reference_error`` is
+    the exception class name it raises (None: it succeeds). The live package must succeed
+    (the P3b changes only make circuits converge or change a gmin-defined answer), report
+    ``gmin`` in its metadata when given, and match:
+
+    * ``equivalent_netlist`` run through the oracle: the same circuit with the change made
+      explicit (for example the gmin shunts written as resistors), compared like a normal
+      parity run except for ``metadata["gmin"]`` (and ``matrices`` unless
+      ``compare_matrices``);
+    * ``expected_dc``: an analytic operating point;
+    * nothing more when neither is given (only success is required).
+
+    ``tolerance`` overrides the case's class with a class name or an ``(rtol, atol)`` pair;
+    ``ruling`` names the decision (``CPP_MIGRATION_PLAN.md`` 2.4.1) and the reason.
+    """
+
+    ruling: str
+    reference_error: str | None = None
+    equivalent_netlist: str | None = None
+    gmin: float | None = None
+    expected_dc: tuple[float, ...] | None = None
+    tolerance: str | tuple[float, float] | None = None
+    compare_matrices: bool = True
 
 
 @dataclass(frozen=True)
@@ -68,6 +104,8 @@ class Case:
     expects_error: str | None = None
     tags: tuple[str, ...] = ()
     current_error: tuple[str, str | None] | None = None
+    #: (mode, Deviation) pairs: analyses whose live result deliberately differs from the oracle.
+    deviations: tuple[tuple[str, Deviation], ...] = ()
 
     def __post_init__(self) -> None:
         if self.tolerance not in TOLERANCE_CLASSES:
@@ -79,6 +117,18 @@ class Case:
                 raise ValueError(f"{self.name}: unknown analysis mode {mode!r}")
             if not isinstance(options, dict):
                 raise TypeError(f"{self.name}: analysis options must be a dict")
+        modes = {mode for mode, _ in self.analyses}
+        for mode, deviation in self.deviations:
+            if mode not in modes or not isinstance(deviation, Deviation):
+                raise ValueError(f"{self.name}: deviation for {mode!r} does not match an analysis")
+
+    def deviation_for(self, mode: str) -> Deviation | None:
+        """The recorded deliberate change of ``mode``, if any."""
+
+        for deviation_mode, deviation in self.deviations:
+            if deviation_mode == mode:
+                return deviation
+        return None
 
     def tolerance_for(self, mode: str, options: dict[str, Any]) -> str:
         """Return the tolerance class for one analysis of this case."""
@@ -1421,12 +1471,29 @@ def random_diode_net(seed: int) -> Case:
         ]
     lines.append(".end")
     t_stop = 2.0 / freq
-    analyses = [op_nl(), tran_nl(t_stop, t_stop / 50), ac_nl(freq / 10, freq * 100, 25)]
-    if variant != 2:
-        # The HB Newton loop is undamped and starts from x=0; it cannot climb the
-        # two-diode DC string of variant 2 (HB_ERROR "Singular HB Jacobian").
-        analyses.append(hb_nl(6))
-    return Case(f"rand_diode_s{seed}", "\n".join(lines), analyses, tolerance="nonlinear", tags=("random", "diode"))
+    analyses = [op_nl(), tran_nl(t_stop, t_stop / 50), ac_nl(freq / 10, freq * 100, 25), hb_nl(6)]
+    deviations: tuple[tuple[str, Deviation], ...] = ()
+    if variant == 2:
+        # The oracle's HB Newton is undamped and starts from x=0; it cannot climb the two-diode
+        # DC string (HB_ERROR "Singular HB Jacobian."). The live HB restarts with the damped
+        # Newton after that breakdown and converges (P3b, CPP_MIGRATION_PLAN.md 2.4.1 / 2.6).
+        deviations = (
+            (
+                "hb",
+                Deviation(
+                    ruling="P3b damped HB Newton: restart with backtracking and junction limiting after a breakdown",
+                    reference_error="SolverConvergenceError",
+                ),
+            ),
+        )
+    return Case(
+        f"rand_diode_s{seed}",
+        "\n".join(lines),
+        analyses,
+        tolerance="nonlinear",
+        tags=("random", "diode"),
+        deviations=deviations,
+    )
 
 
 RANDOM_GENERATORS = {
@@ -1486,12 +1553,26 @@ def _error_and_gmin_cases() -> list[Case]:
             tags=X + ("error",),
             current_error=("NetlistError", "NETLIST_FATAL"),
         ),
+        # The oracle fails at every gmin step (gmin is stamped only across C, D and transistor
+        # terminals). P3b node-to-ground gmin regularizes the island at the first gmin step; the
+        # equivalent netlist writes those 1e-12 S shunts (a, x, y) as resistors.
         Case(
             "floating_resistor_island",
             "V1 a 0 DC 1\nR1 a 0 1k\nR2 x y 1k\n.op\n",
             [op()],
             expects_error="SolverConvergenceError",
-            tags=X + ("error", "singular"),
+            tags=X + ("error", "singular", "gmin"),
+            deviations=(
+                (
+                    "op",
+                    Deviation(
+                        ruling="P3b node-to-ground gmin during gmin stepping",
+                        reference_error="SolverConvergenceError",
+                        equivalent_netlist="V1 a 0 DC 1\nR1 a 0 1k\nR2 x y 1k\nRGA a 0 1e12\nRGX x 0 1e12\nRGY y 0 1e12\n.op\n",
+                        gmin=1e-12,
+                    ),
+                ),
+            ),
         ),
         Case(
             "unknown_controlling_branch",
@@ -1509,11 +1590,89 @@ def _error_and_gmin_cases() -> list[Case]:
             tags=X + ("error", "diode"),
         ),
         # Capacitor-only node: singular at gmin=0, solved once gmin stepping stamps gmin across C.
+        # Its DC voltage is defined by gmin alone: the oracle's 1e-12 S across each capacitor make
+        # V(c) = V(b) / 2; P3b adds 1e-12 S from every node to ground, so V(c) = V(b) / 3. The
+        # equivalent netlist writes all of the live gmin conductances as resistors.
         Case(
             "capacitor_only_node_gmin",
             "V1 a 0 DC 1\nR1 a b 1k\nC1 b c 1u\nC2 c 0 1u\n.op\n",
             [op(), tran(1e-3, 50e-6)],
             tags=X + ("dc", "gmin"),
+            deviations=tuple(
+                (
+                    mode,
+                    Deviation(
+                        ruling="P3b node-to-ground gmin: a gmin-defined operating point moves",
+                        equivalent_netlist=(
+                            "V1 a 0 DC 1\nR1 a b 1k\nC1 b c 1u\nC2 c 0 1u\nRC1 b c 1e12\nRC2 c 0 1e12\n"
+                            "RNA a 0 1e12\nRNB b 0 1e12\nRNC c 0 1e12\n.op\n"
+                        ),
+                        gmin=1e-12,
+                    ),
+                )
+                for mode in ("op", "tran")
+            ),
+        ),
+        # A diode across an ideal source: the oracle's damped Newton creeps ~vt per iteration
+        # and never converges; the P3b junction strategy (pnjlim + natural monotonicity test)
+        # does, at gmin 0, to the exact answer.
+        Case(
+            "diode_ideal_source",
+            "V1 a 0 DC 1\nD1 a 0 1e-14\n.op\n",
+            [op_nl()],
+            tolerance="nonlinear",
+            expects_error="SolverConvergenceError",
+            tags=X + ("dc", "diode", "convergence"),
+            deviations=(
+                (
+                    "op",
+                    Deviation(
+                        ruling="P3b junction voltage-step limiting",
+                        reference_error="SolverConvergenceError",
+                        expected_dc=(1.0, -1e-14 * math.expm1(1.0 / 0.025)),
+                        gmin=0.0,
+                    ),
+                ),
+            ),
+        ),
+        # Six Level-1 CMOS inverters without keepers: the oracle fails at every gmin step; the
+        # P3b gmin continuation converges at gmin 0. The keeper version (which the oracle solves)
+        # has the same operating point: the keepers carry no current at the rails. The keeperless
+        # solve stops at ||F|| < f_tol = 1e-9 A, which leaves up to ~5e-7 V on the rails (MOS
+        # on-conductance ~1e-3 S), hence 1e-6 absolute (volts, and the device vds/vgs) + 1e-6 relative.
+        Case(
+            "cmos_chain6_no_keepers",
+            "VDD vdd 0 DC 1.2\nVIN in 0 DC 0\n"
+            + "".join(
+                f"MP{k} o{k} {'in' if k == 1 else f'o{k - 1}'} vdd PMOS LEVEL1 0.7m 0.4 0.02 2f 1f\n"
+                f"MN{k} o{k} {'in' if k == 1 else f'o{k - 1}'} 0 NMOS LEVEL1 1.8m 0.4 0.02 2f 1f\n"
+                for k in range(1, 7)
+            )
+            + ".op\n",
+            [op_nl()],
+            tolerance="nonlinear",
+            expects_error="SolverConvergenceError",
+            tags=X + ("dc", "mos", "convergence"),
+            deviations=(
+                (
+                    "op",
+                    Deviation(
+                        ruling="P3b gmin continuation inside .op",
+                        reference_error="SolverConvergenceError",
+                        equivalent_netlist="VDD vdd 0 DC 1.2\nVIN in 0 DC 0\n"
+                        + "".join(
+                            f"MP{k} o{k} {'in' if k == 1 else f'o{k - 1}'} vdd PMOS LEVEL1 0.7m 0.4 0.02 2f 1f\n"
+                            f"MN{k} o{k} {'in' if k == 1 else f'o{k - 1}'} 0 NMOS LEVEL1 1.8m 0.4 0.02 2f 1f\n"
+                            f"RK{k} o{k} {'vdd' if k % 2 else '0'} 10Meg\n"
+                            for k in range(1, 7)
+                        )
+                        + ".op\n",
+                        gmin=0.0,
+                        tolerance=(1e-6, 1e-6),
+                        compare_matrices=False,
+                    ),
+                ),
+            ),
         ),
     ]
 

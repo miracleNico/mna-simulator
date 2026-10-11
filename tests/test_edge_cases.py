@@ -135,11 +135,16 @@ def test_floating_island_is_singular_at_gmin0() -> None:
     _assert_error(exc, SolverConvergenceError, "NR_CONVERGENCE", SINGULAR_MESSAGE)
 
 
-def test_floating_island_fails_every_gmin_step_in_the_service() -> None:
-    # gmin is only stamped across C, D and Level-1 BJT/MOS terminals, never on bare nodes.
-    with pytest.raises(SolverConvergenceError) as exc:
-        _svc(FLOATING_ISLAND, "op")
-    _assert_error(exc, SolverConvergenceError, "NR_CONVERGENCE", SINGULAR_MESSAGE)
+def test_floating_island_converges_at_the_first_gmin_step_in_the_service() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1 (P3b): during gmin stepping gmin is also stamped from
+    # every node to ground, so the island is regularized at the first step (its nodes sit at 0 V).
+    # Was: gmin only across C, D and Level-1 BJT/MOS terminals, every gmin step singular.
+    response = _svc(FLOATING_ISLAND, "op")
+    assert response.metadata["gmin"] == 1e-12
+    assert response.labels == ["V(a)", "V(x)", "V(y)", "I(V1)"]
+    v_a, v_x, v_y, i_v1 = response.dc_solution
+    assert [v_a, v_x, v_y] == [1.0, 0.0, 0.0]
+    assert i_v1 == pytest.approx(-(1e-3 + 1e-12), rel=1e-12)
 
 
 def test_capacitor_only_node_is_singular_at_gmin0() -> None:
@@ -153,9 +158,11 @@ def test_capacitor_only_node_is_solved_by_gmin_stepping_in_the_service() -> None
     assert response.metadata["gmin"] == 1e-12
     assert response.labels == ["V(a)", "V(b)", "V(c)", "I(V1)"]
     v_a, v_b, v_c, i_v1 = response.dc_solution
-    # gmin=1e-12 S across each capacitor: a 1k + 1T + 1T divider.
-    assert [v_a, v_b, v_c] == pytest.approx([1.0, 0.9999999995, 0.49999999975], rel=1e-12)
-    assert i_v1 == pytest.approx(-5e-13, rel=1e-6)  # ill-conditioned: only ~7 digits agree with the analytic value
+    # gmin=1e-12 S across each capacitor and, since P3b (CPP_MIGRATION_PLAN.md 2.4.1), from every
+    # node to ground: V(c) = V(b) / 3 and V(b) = 1k-divider of 1T across C1 and 1T + 1T at c.
+    # Was: the 1k + 1T + 1T divider [1.0, 0.9999999995, 0.49999999975], I(V1) ~ -5e-13.
+    assert [v_a, v_b, v_c] == pytest.approx([1.0, 0.9999999983333334, 0.3333333327777778], rel=1e-12)
+    assert i_v1 == pytest.approx(-2.6666666e-12, rel=1e-6)  # ill-conditioned: ~7 digits
     tran = _svc(CAP_ONLY_NODE, "tran", t_stop=1e-3, t_step=1e-4)
     assert tran.metadata["gmin"] == 1e-12
 
@@ -438,13 +445,25 @@ def test_magnitude_spread_1e_minus15_to_1e9_in_one_circuit() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("volts", ["5", "20"])
-def test_diode_clamped_by_an_ideal_source_never_converges(volts: str) -> None:
-    # 5 V: exp(200) is finite; 20 V: exp(800) overflows to inf. Damped Newton
-    # rejects non-finite trial residuals and creeps ~Vt per iteration either way.
+@pytest.mark.parametrize("volts", ["1", "5"])
+def test_diode_clamped_by_an_ideal_source_converges_with_junction_limiting(volts: str) -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1 (P3b): when the damped Newton stalls (it creeps ~Vt
+    # per iteration), the junction strategy (pnjlim + natural monotonicity test) takes over and
+    # converges at gmin 0 to V = 5 V, I = -Is (exp(200) - 1) = -7.2e72 A (exp(200) is finite).
+    # Was: "Solver did not converge after 200 iterations." (also at the default 10 000).
+    result = _basic(f"V1 a 0 DC {volts}\nD1 a 0 1e-14\n", AnalysisMode.OP, max_iter=200)
+    v_a, i_v1 = _dc(result)
+    assert v_a == float(volts)
+    assert i_v1 == pytest.approx(-1e-14 * math.expm1(float(volts) / 0.025), rel=1e-12)
+
+
+def test_diode_clamped_by_an_ideal_source_at_20v_still_fails() -> None:
+    # exp(800) overflows to inf: no strategy can converge. Was: "Solver did not converge after 200
+    # iterations."; the junction strategy now stops when no damping trial is accepted.
     with pytest.raises(SolverConvergenceError) as exc:
-        _basic(f"V1 a 0 DC {volts}\nD1 a 0 1e-14\n", AnalysisMode.OP, max_iter=200)
-    _assert_error(exc, SolverConvergenceError, "NR_CONVERGENCE", "Solver did not converge after 200 iterations.")
+        _basic("V1 a 0 DC 20\nD1 a 0 1e-14\n", AnalysisMode.OP, max_iter=200)
+    assert exc.value.code == "NR_CONVERGENCE"
+    assert str(exc.value).startswith("Newton step could not reduce residual at iteration ")
 
 
 def test_diode_expression_overflows_to_inf() -> None:
@@ -473,22 +492,23 @@ BJT = {"type": "QNPN", "is": 1e-15, "bf": 150, "br": 3, "vaf": 100, "var": 25}
 VT_BJT = 0.02585
 
 
-def test_level1_bjt_exponent_is_clipped_at_80_vt() -> None:
+def test_level1_bjt_exponent_continues_linearly_beyond_80_vt() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1 (P3b): beyond |vbe/vt| = 80 the exponential continues
+    # linearly, exp(80) * (1 + x - 80), so the current keeps growing with the clip-point slope and
+    # the reported derivative is that slope (consistent, nonsingular). Was: the exponent clipped,
+    # flat currents beyond 2.068 V but dIc/dVb kept at its clip value.
     at_clip, d_clip = _level1_bjt_currents_and_derivatives(BJT, 5.0, 80 * VT_BJT, 0.0)
+    assert float(at_clip[0]) == pytest.approx(5.779125996966741e19, rel=1e-12)
+    assert float(d_clip[0][1]) == pytest.approx(2.2356386835461277e21, rel=1e-12)
     for vb in (5.0, 6.0):
         currents, derivatives = _level1_bjt_currents_and_derivatives(BJT, 5.0, vb, 0.0)
-        assert [float(c) for c in currents] == pytest.approx([float(c) for c in at_clip], rel=1e-12)
         assert float(derivatives[0][1]) == pytest.approx(float(d_clip[0][1]), rel=1e-12)
-    ic = float(at_clip[0])
-    assert ic == pytest.approx(5.779125996966741e19, rel=1e-12)
-    # The current is flat beyond the clip but the reported dIc/dVb is not zero. Kept for now
-    # (CPP_MIGRATION_PLAN.md 2.4.1): a zero slope made the HB Newton Jacobian singular when an
-    # iterate crossed the clip; P3 replaces the hard clip by junction limiting with linear
-    # extrapolation, which is consistent and nonsingular.
-    assert float(d_clip[0][1]) == pytest.approx(2.2356386835461277e21, rel=1e-12)
-    flat_a, _ = _level1_bjt_currents_and_derivatives(BJT, 5.0, 5.0, 0.0)
-    flat_b, _ = _level1_bjt_currents_and_derivatives(BJT, 5.0, 5.001, 0.0)
-    assert float(flat_a[0]) == float(flat_b[0])
+        assert float(currents[0]) == pytest.approx(
+            float(at_clip[0]) + float(d_clip[0][1]) * (vb - 80 * VT_BJT), rel=1e-9
+        )
+    lin_a, _ = _level1_bjt_currents_and_derivatives(BJT, 5.0, 5.0, 0.0)
+    lin_b, _ = _level1_bjt_currents_and_derivatives(BJT, 5.0, 5.001, 0.0)
+    assert float(lin_b[0]) - float(lin_a[0]) == pytest.approx(float(d_clip[0][1]) * 0.001, rel=1e-6)
 
 
 def test_level1_bjt_negative_clip_gives_reverse_saturation_currents() -> None:
@@ -578,19 +598,21 @@ def _inverter_chain(stages: int, keepers: bool = False) -> str:
     return "\n".join(lines) + "\n"
 
 
-def test_cmos_inverter_chain_dc_convergence_depends_on_depth() -> None:
+def test_cmos_inverter_chain_dc_converges_at_gmin_0_at_any_depth() -> None:
     three = _svc(_inverter_chain(3), "op", max_iter=200)
     assert three.metadata["gmin"] == 0.0
     assert three.dc_solution[:5] == pytest.approx([0.0, 1.2, 0.0, 1.2, 1.2], abs=1e-8)  # stops at ~2e-9 V error
-    # Four stages only converge at gmin=1e-5, and the gmin shunt visibly moves the rails.
-    four = _svc(_inverter_chain(4), "op", max_iter=200)
-    assert four.metadata["gmin"] == 1e-5
-    assert four.dc_solution[1:5] == pytest.approx([1.179054, 0.008481, 1.178832, 0.008484], abs=1e-6)
-    # Six stages fail at every gmin step.
-    with pytest.raises(SolverConvergenceError) as exc:
-        _svc(_inverter_chain(6), "op", max_iter=200)
-    _assert_error(exc, SolverConvergenceError, "NR_CONVERGENCE", "Newton step could not reduce residual at iteration 1.")
-    # 10 Meg keepers toward the logic levels make the same chain converge at gmin=0.
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1 (P3b): when Newton fails, .op retries inside the core
+    # with gmin continuation (node-to-ground + device gmin from 1e-2 down to the requested gmin),
+    # so 4 and 6 stages converge at gmin 0 with the rails in place (up to the f_tol stop, ~5e-7 V).
+    # Was: 4 stages only at gmin=1e-5 (rails 1.179 V / 8.5 mV), 6 stages failed at every gmin
+    # with "Newton step could not reduce residual at iteration 1.".
+    for stages in (4, 6):
+        response = _svc(_inverter_chain(stages), "op", max_iter=200)
+        assert response.metadata["gmin"] == 0.0
+        levels = [1.2 if k % 2 else 0.0 for k in range(1, stages + 1)]
+        assert response.dc_solution[1 : stages + 1] == pytest.approx(levels, abs=1e-6)
+    # 10 Meg keepers toward the logic levels converge at gmin=0 without the continuation.
     kept = _svc(_inverter_chain(6, keepers=True), "op", max_iter=200)
     assert kept.metadata["gmin"] == 0.0
 
@@ -738,9 +760,15 @@ def test_jacobian_singular_is_reachable(netlist: str) -> None:
     with pytest.raises(SolverConvergenceError) as exc:
         _basic(netlist, AnalysisMode.OP)
     _assert_error(exc, SolverConvergenceError, "JACOBIAN_SINGULAR", "Jacobian is singular at iteration 0.")
-    with pytest.raises(SolverConvergenceError) as svc_exc:
-        _svc(netlist, "op")
-    _assert_error(svc_exc, SolverConvergenceError, "JACOBIAN_SINGULAR", "Jacobian is singular at iteration 0.")
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1 (P3b): the service's first gmin step shunts every node
+    # to ground, which regularizes the floating island / the floating gate (pulled to 0 V). Was:
+    # JACOBIAN_SINGULAR at every gmin step.
+    response = _svc(netlist, "op")
+    assert response.metadata["gmin"] == 1e-12
+    floating = [label for label in response.labels if label in ("V(x)", "V(y)", "V(g)")]
+    assert floating
+    for label in floating:
+        assert response.dc_solution[response.labels.index(label)] == pytest.approx(0.0, abs=1e-12)
 
 
 def test_transient_newton_failure_reports_the_time_point() -> None:

@@ -1,6 +1,7 @@
 """Corpus-wide parity: live ``mna_simulation`` must reproduce the frozen oracle.
 
-One test per ``(corpus case, analysis)``. Ids read ``<case>-<mode>[-flags]``,
+One test per ``(corpus case, analysis)``; analyses with a recorded deliberate
+change (``corpus.Deviation``) are checked with ``check_deviation``. Ids read ``<case>-<mode>[-flags]``,
 e.g. ``rc_ladder_ac_mor-ac-mor`` or ``workload_rlc_mesh_23x23-tran-krylov``.
 Run only this harness with ``pytest -m differential``; deselect the large
 circuits with ``-m "differential and not slow"``.
@@ -16,6 +17,7 @@ from corpus import Case, iter_analyses
 from differential.compare import (
     assert_mor_matches_full_order,
     assert_outcomes_match,
+    check_deviation,
     full_order_options,
     run_request,
 )
@@ -73,6 +75,21 @@ def test_reference_parity(
     case: Case, mode: str, options: dict[str, Any], reference_pkg, current_pkg, request: pytest.FixtureRequest
 ) -> None:
     tolerance = case.tolerance_for(mode, options)
+    deviation = case.deviation_for(mode)
+    if deviation is not None:
+        # A recorded deliberate change (CPP_MIGRATION_PLAN.md 2.4.1): the oracle still behaves as
+        # recorded, the live result matches the oracle on the equivalent netlist.
+        check_deviation(
+            reference_pkg,
+            current_pkg,
+            case.netlist_text,
+            mode,
+            options,
+            deviation,
+            tolerance=tolerance,
+            context=f"{case.name} {mode} {options} [{tolerance}] deviation: {deviation.ruling}",
+        )
+        return
     ref = run_request(reference_pkg, case.netlist_text, mode, options)
     cur = run_request(current_pkg, case.netlist_text, mode, options)
     context = f"{case.name} {mode} {options} [{tolerance}]"

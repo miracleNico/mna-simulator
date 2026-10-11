@@ -1,22 +1,52 @@
-// Level-1 (Ebers-Moll-lite) BJT, ported verbatim from the Python core
+// Level-1 (Ebers-Moll-lite) BJT, ported from the Python core
 // (solvers._bjt_level1_npn_currents_and_derivatives,
 // _level1_bjt_currents_and_derivatives): transport currents, finite forward /
-// reverse beta, simple Early modulation, vt = 0.02585 and the exponent
-// argument clipped to [-80, 80] (the derivative keeps its clipped value).
+// reverse beta, simple Early modulation, vt = 0.02585.
 //
-// The arithmetic is identical to the Python code; results differ from it only
-// where NumPy's exp (SIMD implementation) and the C library exp disagree in
-// the last bit.
+// Exponent beyond +-80 (CPP_MIGRATION_PLAN.md 2.4.1, P3b): the junction
+// exponential continues linearly past |v / vt| = 80 with the slope it has at
+// the clip point, exp(80) * (1 + x - 80) above and exp(-80) * (1 + x + 80)
+// below (bjt_exp), so current and Jacobian stay consistent and the Newton
+// matrix stays nonsingular. Was (the reference): the argument clipped to
+// [-80, 80], flat currents beyond the clip but the derivative kept its clip
+// value. A zero slope was rejected: it made the HB Newton Jacobian singular
+// when an iterate crossed the clip.
+//
+// Inside the clip the arithmetic is identical to the Python code; results
+// differ from it only where NumPy's exp (SIMD implementation) and the C
+// library exp disagree in the last bit.
 #pragma once
 
 #include "mna/devices/fp_contract.hpp"
 
-#include <algorithm>
 #include <cmath>
 
 namespace mna::devices {
 
 inline constexpr double kBjtVt = 0.02585;
+/// |v / vt| beyond which the junction exponential is extrapolated linearly.
+inline constexpr double kBjtExpClip = 80.0;
+
+/// exp(x) and its derivative d exp(x) / dx, continued linearly beyond
+/// |x| > kBjtExpClip (value and slope continuous at the clip points).
+struct BjtExp {
+    double value;
+    double slope;
+};
+
+inline BjtExp bjt_exp(double x) noexcept {
+    MNA_NO_FP_CONTRACT
+    if (x > kBjtExpClip) {
+        const double e = std::exp(kBjtExpClip);
+        return {e * (1.0 + (x - kBjtExpClip)), e};
+    }
+    if (x < -kBjtExpClip) {
+        const double e = std::exp(-kBjtExpClip);
+        return {e * (1.0 + (x + kBjtExpClip)), e};
+    }
+    const double e = std::exp(x);
+    return {e, e};
+}
 
 /// Terminal currents (positive into the device) and d I_row / d V_col with
 /// rows and columns ordered collector, base, emitter.
@@ -36,12 +66,12 @@ inline BjtEval npn_level1(double vc, double vb, double ve, double is, double bf,
     const double vce = vc - ve;
     const double vec = ve - vc;
 
-    const double exp_be = std::exp(std::clamp(vbe / vt, -80.0, 80.0));
-    const double exp_bc = std::exp(std::clamp(vbc / vt, -80.0, 80.0));
-    const double ibe = is * (exp_be - 1.0);
-    const double ibc = is * (exp_bc - 1.0);
-    const double gbe = is * exp_be / vt;
-    const double gbc = is * exp_bc / vt;
+    const BjtExp exp_be = bjt_exp(vbe / vt);
+    const BjtExp exp_bc = bjt_exp(vbc / vt);
+    const double ibe = is * (exp_be.value - 1.0);
+    const double ibc = is * (exp_bc.value - 1.0);
+    const double gbe = is * exp_be.slope / vt;
+    const double gbc = is * exp_bc.slope / vt;
 
     const double fwd_mod = vaf > 0.0 ? 1.0 + vce / vaf : 1.0;
     const double rev_mod = var > 0.0 ? 1.0 + vec / var : 1.0;

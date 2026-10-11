@@ -26,6 +26,36 @@
 // After max_iter iterations -> MaxIterations. Callers turn the status into
 // the reference error text of their analysis.
 //
+// Junction strategy (CPP_MIGRATION_PLAN.md 2.4.1, P3b: "improve, not
+// parity"; circuits with exponential junctions and
+// NewtonOptions::junction_limiting set). Every solve starts with the
+// reference iteration above, so every run it solves without stalling comes
+// out bit for bit as before. It switches to the junction strategy for the rest of the solve
+// (same iterate, same iteration budget) when the reference iteration fails
+// (no damping trial accepted: the same iteration is retried with the
+// strategy) or stalls (kStallIterations consecutive iterations accepted only
+// at a damping scale <= kStallScale). In junction mode, per iteration:
+//   * the update is junction-limited (SPICE pnjlim,
+//     mna/analyses/limiting.hpp) before the damping loop; when the limiter
+//     changed it, the damping loop runs on the limited step first and falls
+//     back to the plain Newton step when no trial of the limited one is
+//     accepted;
+//   * a damping trial whose residual norm grew is still accepted when it
+//     passes the restricted natural monotonicity test (Deuflhard):
+//     ||J(x)^-1 F(x + s dx)|| <= (1 - s / 4) ||dx||, with the factorization
+//     of this iteration (direct solves only, not with Krylov). The residual
+//     norm mixes volts (KVL rows) and amperes (KCL rows); near a junction
+//     carrying a large current the exponential's linearization error swamps
+//     the KVL residual, so the residual test alone accepts only tiny steps
+//     (a diode across an ideal source crept ~vt per iteration and never
+//     converged).
+// Why not limit every iteration from the start: on converging circuits it
+// moves the point where the tolerances stop the iteration, by up to the
+// Newton tolerance; the differential corpus compares at 1e-6 and some
+// reference solutions are themselves only that close to the exact one
+// (rand_bjt_ce_s1's initial operating point steers a transient that is
+// 7e-7 V off a tightly converged one).
+//
 // Device evaluation runs on mna::assembly::evaluate with
 // device_eval_threads(circuit, num_threads) threads: one thread below
 // kParallelDeviceMinCount devices (thread start-up costs more than the work),
@@ -52,6 +82,12 @@ inline constexpr std::int64_t kParallelDeviceMinCount = 2048;
 
 /// Halvings tried by the damped Newton step.
 inline constexpr int kMaxDampingTrials = 28;
+/// Junction strategy trigger: this many consecutive reference iterations
+/// accepted at a damping scale <= kStallScale (on the corpus no operating
+/// point the reference solves takes more than 2 consecutive iterations at a
+/// scale <= 1/16, or any at <= 1/64; the clamped diode creeps at ~1/1000).
+inline constexpr int kStallIterations = 4;
+inline constexpr double kStallScale = 1.0 / 64.0;
 
 /// Thread count for device evaluation: 1 below kParallelDeviceMinCount
 /// devices, effective_threads(requested) otherwise.
@@ -84,6 +120,11 @@ struct NewtonOptions {
     double f_tol = 1e-9;
     int num_threads = 1;
     KrylovOptions krylov;
+    /// Junction strategy after a failed or stalled reference iteration
+    /// (pnjlim + natural monotonicity test, see above).
+    bool junction_limiting = true;
+    /// .op only: gmin continuation after a failed Newton solve (op.hpp).
+    bool gmin_continuation = true;
 };
 
 /// +inf when any entry is not finite, otherwise sqrt(sum v_i^2) (NumPy's
@@ -119,6 +160,15 @@ public:
     bool solve(const double* values, const double* rhs, double* x, const double* x0, bool csr_operator,
                FactorMode mode);
 
+    /// x <- A^-1 rhs with the numeric factorization of the last successful
+    /// direct solve (no refactorization). Returns false when there is none:
+    /// the last solve was answered by Krylov or found A singular.
+    bool resolve(const double* rhs, double* x);
+
+    /// Numeric factorization of `values` with the direct solver (Krylov is
+    /// not consulted); false when the matrix is singular.
+    bool factor_check(const double* values);
+
     /// The values changed: the next Cached solve factors again and the
     /// cached Krylov operator is rebuilt.
     void invalidate() noexcept;
@@ -137,6 +187,7 @@ private:
     linear::CscPattern pattern_;
     std::unique_ptr<linear::LinearSolver<double>> direct_;
     bool factor_valid_ = false;
+    bool numeric_valid_ = false;  ///< direct_ holds the factorization of the last solve
     std::int64_t factorizations_ = 0;
     // Krylov operator: the nonzero values only (the facade passed dense or
     // SciPy matrices, whose conversion drops zeros), its row view and kind.
@@ -153,6 +204,10 @@ struct NewtonOutcome {
     NewtonStatus status = NewtonStatus::Converged;
     std::int64_t iteration = 0;   ///< iteration index of a Singular / NoReduction failure
     std::int64_t iterations = 0;  ///< linear (Jacobian) solves performed
+    std::int64_t limited_steps = 0;     ///< iterations whose update the junction limiter changed
+    std::int64_t fallback_steps = 0;    ///< of those, iterations that fell back to the plain step
+    std::int64_t monotonicity_accepts = 0;  ///< trials accepted by the natural monotonicity test
+    std::int64_t junction_switch = -1;  ///< iteration at which the junction strategy took over (-1: never)
 };
 
 /// Reusable damped Newton solver for one circuit: the direct solver keeps its
@@ -166,13 +221,33 @@ public:
 
     /// Solves A x + f(x, t) = b starting from x (n entries, overwritten with
     /// the last iterate). `a_static` holds nnz values in pattern order.
-    NewtonOutcome solve(const double* a_static, const double* b, double t, std::vector<double>& x);
+    /// `max_iter` < 0 uses NewtonOptions::max_iter.
+    NewtonOutcome solve(const double* a_static, const double* b, double t, std::vector<double>& x,
+                        std::int64_t max_iter = -1);
 
     std::int64_t factorizations() const noexcept { return system_.factorizations(); }
+
+    /// True when the Newton matrix A + J(x, t) is singular for the direct solver.
+    bool jacobian_singular(const double* a_static, double t, const std::vector<double>& x);
 
 private:
     void evaluate_residual(const double* a_static, const double* b, double t, const double* x, double* f,
                            double* jvals, double* residual);
+
+    /// Result of the damping loop on one candidate step.
+    struct Damping {
+        bool accepted = false;
+        double next_norm = 0.0;
+        double step_scale = 0.0;
+        double best_norm = 0.0;
+        double best_scale = 0.0;
+        bool by_monotonicity = false;
+    };
+    /// The damping loop (step 3) on `step` from x; the accepted trial is left
+    /// in trial_ / trial_f_ / trial_jdev_ / trial_residual_, the best strictly
+    /// smaller one in best_.
+    Damping damp(const double* a_static, const double* b, double t, const std::vector<double>& x,
+                 const std::vector<double>& step, double norm_now, bool monotonicity);
 
     const circuit::Circuit& circuit_;
     NewtonOptions options_;
@@ -181,6 +256,7 @@ private:
     std::vector<double> f_, jdev_, residual_;
     std::vector<double> trial_, trial_f_, trial_jdev_, trial_residual_;
     std::vector<double> best_, jacobian_, rhs_, delta_, ax_;
+    std::vector<double> limited_, correction_;
 };
 
 }  // namespace mna::analyses

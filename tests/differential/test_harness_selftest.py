@@ -8,6 +8,7 @@ corpus keeps to its size budget. These tests check all three.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import math
 import re
@@ -22,6 +23,7 @@ from differential.compare import (
     assert_errors_match,
     assert_outcomes_match,
     assert_responses_match,
+    check_deviation,
     run_request,
 )
 
@@ -291,3 +293,51 @@ def test_iter_cases_filters_by_tags() -> None:
     assert no_slow and all("slow" not in case.tags for case in no_slow)
     assert len(list(corpus.iter_cases())) == len(corpus.CASES)
     assert corpus.get_case("hb_ghz_mixer").tolerance == "nonlinear"
+
+
+# ---------------------------------------------------------------------------
+# Deliberate changes (corpus.Deviation, CPP_MIGRATION_PLAN.md 2.4.1)
+# ---------------------------------------------------------------------------
+
+
+def test_deviations_name_existing_analyses_and_a_ruling() -> None:
+    with pytest.raises(ValueError, match="does not match an analysis"):
+        corpus.Case("x", "R1 a 0 1\n", [corpus.op()], tags=("extra",), deviations=(("tran", corpus.Deviation("r")),))
+    recorded = [(case.name, mode) for case in corpus.CASES for mode, _ in case.deviations]
+    assert recorded, "the P3b changes are recorded as deviations"
+    for case in corpus.CASES:
+        for mode, deviation in case.deviations:
+            assert deviation.ruling and case.deviation_for(mode) is deviation
+            assert mode in {analysis_mode for analysis_mode, _ in case.analyses}
+
+
+def test_deviation_check_requires_the_recorded_oracle_outcome_and_a_live_match(reference_pkg, current_pkg) -> None:
+    island = corpus.get_case("floating_resistor_island")
+    deviation = island.deviation_for("op")
+    assert deviation is not None
+    check_deviation(reference_pkg, current_pkg, island.netlist_text, "op", {}, deviation)
+    # A stale record: the oracle no longer fails as recorded.
+    with pytest.raises(AssertionError, match="expects the reference to raise SolverConvergenceError but it succeeded"):
+        check_deviation(reference_pkg, current_pkg, "V1 a 0 DC 1\nR1 a 0 1k\n.op\n", "op", {}, deviation)
+    # The live package must succeed (an inconsistent voltage-source loop is singular at every gmin).
+    with pytest.raises(AssertionError, match="expects the current package to succeed"):
+        check_deviation(
+            reference_pkg, current_pkg, "V1 a 0 DC 1\nV2 b 0 DC 2\nV3 a b DC 0.5\nR1 a 0 1k\n.op\n", "op", {}, deviation
+        )
+    with pytest.raises(AssertionError, match="metadata gmin"):
+        check_deviation(
+            reference_pkg, current_pkg, island.netlist_text, "op", {}, dataclasses.replace(deviation, gmin=1e-9)
+        )
+    # The live result must match the oracle on the equivalent netlist (here a 10x larger shunt at a).
+    wrong = deviation.equivalent_netlist.replace("RGA a 0 1e12", "RGA a 0 1e11")
+    with pytest.raises(AssertionError, match="vs equivalent netlist"):
+        check_deviation(
+            reference_pkg, current_pkg, island.netlist_text, "op", {}, dataclasses.replace(deviation, equivalent_netlist=wrong)
+        )
+    diode = corpus.get_case("diode_ideal_source")
+    diode_deviation = diode.deviation_for("op")
+    options = dict(diode.analyses[0][1])
+    check_deviation(reference_pkg, current_pkg, diode.netlist_text, "op", options, diode_deviation, tolerance="nonlinear")
+    off = dataclasses.replace(diode_deviation, expected_dc=(1.0, -2000.0))
+    with pytest.raises(AssertionError, match="expected operating point"):
+        check_deviation(reference_pkg, current_pkg, diode.netlist_text, "op", options, off, tolerance="nonlinear")

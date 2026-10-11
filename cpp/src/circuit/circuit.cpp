@@ -1,11 +1,14 @@
 #include "mna/circuit/circuit.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <initializer_list>
 #include <limits>
 #include <string>
 #include <utility>
 
+#include "mna/devices/bjt_level1.hpp"
+#include "mna/devices/diode.hpp"
 #include "mna/error.hpp"
 
 namespace mna::circuit {
@@ -53,6 +56,10 @@ void Circuit::build(const CircuitSpec& spec) {
     const std::int64_t n = spec.n;
     n_ = static_cast<std::int32_t>(n);
     gmin_ = spec.gmin;
+    if (spec.node_count < 0 || spec.node_count > n) {
+        bad_spec("node_count = " + std::to_string(spec.node_count) + " is outside [0, n = " + std::to_string(n) + "]");
+    }
+    node_count_ = static_cast<std::int32_t>(spec.node_count);
 
     check_triplets(spec.g, "G", n);
     check_triplets(spec.c, "C", n);
@@ -154,7 +161,8 @@ void Circuit::build(const CircuitSpec& spec) {
     std::vector<std::int32_t> entry_rows;
     std::vector<std::int32_t> entry_cols;
     const std::size_t expected = spec.g.rows.size() + spec.c.rows.size() + spec.gmin_stamps.rows.size() +
-                                 kDiodeJ * nd + kMosJ * nm + kBjtJ * nb + static_cast<std::size_t>(behavioral_.slot_ptr[nh]);
+                                 static_cast<std::size_t>(node_count_) + kDiodeJ * nd + kMosJ * nm + kBjtJ * nb +
+                                 static_cast<std::size_t>(behavioral_.slot_ptr[nh]);
     entry_rows.reserve(expected);
     entry_cols.reserve(expected);
     auto add_entry = [&entry_rows, &entry_cols](std::int64_t row, std::int64_t col) {
@@ -167,6 +175,9 @@ void Circuit::build(const CircuitSpec& spec) {
         for (std::size_t i = 0; i < t->rows.size(); ++i) {
             add_entry(t->rows[i], t->cols[i]);
         }
+    }
+    for (std::int32_t i = 0; i < node_count_; ++i) {  // node-to-ground gmin
+        add_entry(i, i);
     }
     for (std::size_t i = 0; i < nd; ++i) {
         const std::int32_t a = diodes_.anode[i];
@@ -248,6 +259,44 @@ void Circuit::build(const CircuitSpec& spec) {
     accumulate(spec.g, g_vals_);
     accumulate(spec.c, c_vals_);
     accumulate(spec.gmin_stamps, gmin_vals_);
+    // Node-to-ground gmin (P3b): one unit stamp per node unknown, after the builder's stamps.
+    for (std::int32_t i = 0; i < node_count_; ++i) {
+        gmin_vals_[static_cast<std::size_t>(slot(i, i))] += 1.0;
+    }
+
+    // ---- exponential junctions (pnjlim) ------------------------------------------
+    auto add_junction = [this](std::int32_t anode, std::int32_t cathode, double vt, double is) {
+        if (anode < 0 && cathode < 0) {
+            return;
+        }
+        if (!(is > 0.0) || !std::isfinite(is)) {
+            return;
+        }
+        const double vcrit = vt * std::log(vt / (std::sqrt(2.0) * is));
+        if (!std::isfinite(vcrit)) {
+            return;
+        }
+        junctions_.anode.push_back(anode);
+        junctions_.cathode.push_back(cathode);
+        junctions_.vt.push_back(vt);
+        junctions_.is.push_back(is);
+        junctions_.vcrit.push_back(vcrit);
+    };
+    for (std::size_t i = 0; i < nd; ++i) {
+        add_junction(diodes_.anode[i], diodes_.cathode[i], devices::kDiodeVt, diodes_.is[i]);
+    }
+    for (std::size_t i = 0; i < nb; ++i) {
+        const std::int32_t c = bjt_.collector[i];
+        const std::int32_t b = bjt_.base[i];
+        const std::int32_t e = bjt_.emitter[i];
+        if (bjt_.sign[i] < 0) {
+            add_junction(e, b, devices::kBjtVt, bjt_.is[i]);
+            add_junction(c, b, devices::kBjtVt, bjt_.is[i]);
+        } else {
+            add_junction(b, e, devices::kBjtVt, bjt_.is[i]);
+            add_junction(b, c, devices::kBjtVt, bjt_.is[i]);
+        }
+    }
 
     // ---- device slots ---------------------------------------------------------
     diodes_.slots.resize(kDiodeJ * nd);

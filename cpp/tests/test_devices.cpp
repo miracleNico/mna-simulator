@@ -2,6 +2,7 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 
 #include "mna/devices/bjt_level1.hpp"
@@ -133,24 +134,51 @@ TEST_CASE("BJT: regions, Kirchhoff sums and pinned reference values") {
     CHECK(bjt_level1_region(1, 0.0, 0.7, 5.0) == BjtRegion::ReverseActive);
 }
 
-TEST_CASE("BJT: exponent clipped at |v/vt| = 80, derivative keeps its clip value") {
-    const BjtEval at = npn(5.0, 80 * kBjtVt, 0.0);
+TEST_CASE("BJT: exponent continues linearly beyond |v/vt| = 80, consistent with its derivative (P3b)") {
+    // bjt_exp: value and slope are continuous at both clip points.
+    const double e80 = std::exp(80.0);
+    const double em80 = std::exp(-80.0);
+    CHECK(bjt_exp(80.0).value == e80);
+    CHECK(bjt_exp(80.0).slope == e80);
+    const BjtExp just_above = bjt_exp(std::nextafter(80.0, 200.0));
+    CHECK(just_above.value == doctest::Approx(e80).epsilon(1e-12));
+    CHECK(just_above.slope == e80);
+    CHECK(bjt_exp(100.0).value == e80 * (1.0 + 20.0));
+    CHECK(bjt_exp(100.0).slope == e80);
+    CHECK(bjt_exp(-80.0).value == em80);
+    const BjtExp just_below = bjt_exp(std::nextafter(-80.0, -200.0));
+    CHECK(just_below.value == doctest::Approx(em80).epsilon(1e-12));
+    CHECK(just_below.slope == em80);
+    CHECK(bjt_exp(-100.0).value == em80 * (1.0 - 20.0));
+    CHECK(std::isnan(bjt_exp(std::nan("")).value));
+
+    // At the clip point the device keeps the reference values; just beyond it currents and
+    // derivatives continue without a jump.
+    const double v_clip = 80 * kBjtVt;
+    const BjtEval at = npn(5.0, v_clip, 0.0);
     CHECK(at.i[0] == doctest::Approx(5.779125996966741e19).epsilon(1e-12));
     CHECK(at.d[0][1] == doctest::Approx(2.2356386835461277e21).epsilon(1e-12));
-    for (double vb : {5.0, 6.0}) {
-        const BjtEval r = npn(5.0, vb, 0.0);
-        for (int i = 0; i < 3; ++i) {
-            CHECK(r.i[i] == doctest::Approx(at.i[i]).epsilon(1e-12));
-        }
-        CHECK(r.d[0][1] == doctest::Approx(at.d[0][1]).epsilon(1e-12));
-    }
-    CHECK(npn(5.0, 5.0, 0.0).i[0] == npn(5.0, 5.001, 0.0).i[0]);
-    // Negative clip: identical currents for any vbe/vt < -80.
-    const BjtEval lo1 = npn(5.0, -3.0, 0.0);
-    const BjtEval lo2 = npn(5.0, -30.0, 0.0);
+    const BjtEval beyond = npn(5.0, std::nextafter(v_clip, 10.0), 0.0);
     for (int i = 0; i < 3; ++i) {
-        CHECK(lo1.i[i] == lo2.i[i]);
+        CHECK(beyond.i[i] == doctest::Approx(at.i[i]).epsilon(1e-12));
+        for (int j = 0; j < 3; ++j) {
+            CHECK(beyond.d[i][j] == doctest::Approx(at.d[i][j]).epsilon(1e-12));
+        }
     }
+    // Beyond the clip the current grows linearly (was: flat) and the Jacobian is its slope.
+    for (double vb : {3.0, 6.0}) {
+        const double h = 1e-3;
+        const BjtEval r = npn(5.0, vb, 0.0);
+        const BjtEval up = npn(5.0, vb + h, 0.0);
+        const BjtEval down = npn(5.0, vb - h, 0.0);
+        CHECK(up.i[0] > r.i[0]);
+        for (int i = 0; i < 3; ++i) {
+            CHECK((up.i[i] - down.i[i]) / (2.0 * h) == doctest::Approx(r.d[i][1]).epsilon(1e-6));
+        }
+    }
+    // Deep reverse bias: reverse saturation currents (the exp term is ~1e-35).
+    const BjtEval lo = npn(5.0, -30.0, 0.0);
+    CHECK(lo.i[1] == doctest::Approx(-1e-15 * (1.0 / 151.0 + 1.0 / 4.0)).epsilon(1e-12));
 }
 
 TEST_CASE("BJT: vaf = 0, var = 0, bf = 0 and the PNP mirror") {
@@ -159,7 +187,7 @@ TEST_CASE("BJT: vaf = 0, var = 0, bf = 0 and the PNP mirror") {
     CHECK(no_early.d[0][0] == doctest::Approx(no_early.d[0][0]));
     const double exp_be = std::exp(0.7 / kBjtVt);
     const double ibe = 1e-15 * (exp_be - 1.0);
-    const double exp_bc = std::exp(std::clamp((0.7 - 5.0) / kBjtVt, -80.0, 80.0));
+    const double exp_bc = bjt_exp((0.7 - 5.0) / kBjtVt).value;
     const double ibc = 1e-15 * (exp_bc - 1.0);
     CHECK(no_early.i[0] == (150.0 / 151.0) * ibe * 1.0 - ibc * 1.0);
     const BjtEval no_bf = npn(5.0, 0.7, 0.0, 100.0, 25.0, 0.0, 3.0);

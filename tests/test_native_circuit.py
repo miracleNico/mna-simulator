@@ -94,13 +94,18 @@ def test_builder_matches_reference_on_corpus(case, gmin: float) -> None:
     assert circuit is not None
     size = problem.G.shape[0]
     assert circuit.n == size
+    # build_circuit infers the node count from the tables (P3b node-to-ground gmin): exact on the corpus.
+    assert circuit.node_count == problem.metadata["num_nodes"]
     # Native G excludes gmin: G == native G + gmin * unit stamps (exact at gmin = 0; at gmin > 0
-    # the reference adds gmin once per stamp, so a node with k stamps differs by ~k ulps).
+    # the reference adds gmin once per stamp, so a node with k stamps differs by ~k ulps). The
+    # native gmin pattern also holds one node-to-ground stamp per node (P3b, 2.4.1), which the
+    # reference builder does not stamp.
     effective = circuit.to_dense("G") + gmin * circuit.to_dense("gmin")
     if gmin == 0.0:
         _assert_same_array(effective, reference.G)
     else:
-        np.testing.assert_allclose(effective, reference.G, rtol=1e-13, atol=0.0)
+        node_diagonal = np.diag((np.arange(size) < problem.metadata["num_nodes"]).astype(float))
+        np.testing.assert_allclose(effective - gmin * node_diagonal, reference.G, rtol=1e-13, atol=0.0)
         g_eff = np.zeros((size, size))
         for slot, (row, col) in _pattern_entries(circuit).items():
             g_eff[row, col] = circuit.g_effective(gmin)[slot]
@@ -148,10 +153,13 @@ def test_native_pattern_and_device_slots() -> None:
     assert entries[int(bjt_slots[0])] == (b, b) and entries[int(bjt_slots[1])] == (b, g)
     assert bjt_slots[2] == -1 and bjt_slots[6] == -1 and bjt_slots[8] == -1
     # gmin stamps exist in the native pattern even at gmin = 0: C1 (b, gnd), D1 (a, b),
-    # Q1 base-emitter (g, gnd) and base-collector (g, b), M1 drain-source (a, gnd).
+    # Q1 base-emitter (g, gnd) and base-collector (g, b), M1 drain-source (a, gnd), plus one
+    # node-to-ground stamp per node (P3b, 2.4.1) and none on the branch rows.
+    assert circuit.node_count == 4
     stamps = circuit.to_dense("gmin")
-    assert stamps[b, b] == 3.0
-    assert stamps[a, b] == -1.0 and stamps[a, a] == 2.0 and stamps[g, g] == 2.0 and stamps[vdd, vdd] == 0.0
+    assert stamps[b, b] == 4.0
+    assert stamps[a, b] == -1.0 and stamps[a, a] == 3.0 and stamps[g, g] == 3.0 and stamps[vdd, vdd] == 1.0
+    assert not np.any(stamps[4:, :]) and not np.any(stamps[:, 4:])
     assert not np.any(problem.G_sparse.toarray() - circuit.to_dense("G"))
     np.testing.assert_array_equal(circuit.values("G"), [circuit.to_dense("G")[r, c] for r, c in entries.values()])
     assert circuit.device_counts == {"diode": 1, "mos": 1, "bjt": 1, "behavioral": 0}
@@ -193,6 +201,25 @@ def test_dense_matrices_are_lazy_and_cached() -> None:
     problem.G = np.eye(3)
     assert problem.G[0, 1] == 0.0
     assert problem.metadata["matrix_storage"] == "dense+csr"
+
+
+def test_node_count_inference_and_override() -> None:
+    from mna_simulation.native.circuit import build_circuit, infer_node_count, triplets
+
+    # Nodes are numbered before branch currents; a node touching only voltage sources (pure
+    # unit incidence to higher indices) is still a node, a branch row never is.
+    netlist = "V1 b 0 DC 1\nV2 z b DC 1\nR1 b 0 1k\nI1 q 0 DC 1m\nL1 z w 1m\nR2 w 0 1k\n"
+    problem = build_mna_problem(parse_netlist_text(netlist))
+    assert problem.native.node_count == problem.metadata["num_nodes"] == 4
+    # Explicit counts win; 0 adds no node stamp.
+    plain = build_circuit(2, G=triplets([0, 1], [0, 1], [1.0, 1.0]), node_count=0)
+    assert plain.node_count == 0 and not np.any(plain.to_dense("gmin"))
+    shunted = build_circuit(2, G=triplets([0, 1], [0, 1], [1.0, 1.0]), node_count=1)
+    np.testing.assert_array_equal(shunted.to_dense("gmin"), [[1.0, 0.0], [0.0, 0.0]])
+    assert infer_node_count(0) == 0
+    assert infer_node_count(3) == 3  # unknowns without any entry are nodes (current-source-only nodes)
+    with pytest.raises(core.CoreError):
+        build_circuit(2, node_count=3)
 
 
 def test_native_build_rejects_malformed_specs() -> None:

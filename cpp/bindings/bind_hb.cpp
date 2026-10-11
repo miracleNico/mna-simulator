@@ -180,6 +180,11 @@ nb::dict stats_dict(const hb::HbStats& s) {
     d["dimension"] = s.dimension;
     d["newton_iterations"] = s.newton_iterations;
     d["linear_solves"] = s.linear_solves;
+    d["limited_steps"] = s.limited_steps;
+    d["limit_fallbacks"] = s.limit_fallbacks;
+    d["damped_steps"] = s.damped_steps;
+    d["undamped_steps"] = s.undamped_steps;
+    d["damping_restarts"] = s.damping_restarts;
     d["factorizations"] = s.factorizations;
     d["residual_norm"] = s.residual_norm;
     d["y_nnz"] = s.y_nnz;
@@ -213,7 +218,7 @@ nb::tuple solve(const Circuit& circuit, double omega0, std::int64_t harmonics, I
                 In1D<std::int64_t> source_rows, nb::handle source_programs, double gmin, bool nonlinear,
                 std::int64_t max_iter, double tol, bool use_krylov, const std::string& krylov_method,
                 double krylov_tol, std::int64_t krylov_max_iter, std::int64_t krylov_rank, int num_threads,
-                std::int64_t max_nnz) {
+                std::int64_t max_nnz, const std::string& damping, bool junction_limiting) {
     const auto n = static_cast<std::size_t>(circuit.n());
     if (b_dc.shape(0) != n) {
         bad_input("hb_solve: b_dc has " + std::to_string(b_dc.shape(0)) + " entries, expected n = " +
@@ -255,6 +260,17 @@ nb::tuple solve(const Circuit& circuit, double omega0, std::int64_t harmonics, I
     options.krylov_rank = krylov_rank;
     options.num_threads = mna::effective_threads(num_threads);
     options.max_nnz = max_nnz;
+    if (damping == "on_failure") {
+        options.damping = hb::HbDamping::OnFailure;
+    } else if (damping == "always") {
+        options.damping = hb::HbDamping::Always;
+    } else if (damping == "off") {
+        options.damping = hb::HbDamping::Off;
+    } else {
+        const std::string message = "hb_solve: damping must be 'on_failure', 'always' or 'off', got '" + damping + "'";
+        throw nb::value_error(message.c_str());
+    }
+    options.junction_limiting = junction_limiting;
 
     hb::HbResult result;
     {
@@ -287,10 +303,14 @@ void bind_hb(nb::module_& m) {
     m.def("hb_solve", &solve, "circuit"_a, "omega0"_a, "harmonics"_a, "b_dc"_a, "source_rows"_a,
           "source_programs"_a, "gmin"_a = 0.0, "nonlinear"_a = true, "max_iter"_a = 100, "tol"_a = 1e-6,
           "use_krylov"_a = false, "krylov_method"_a = "auto", "krylov_tol"_a = 1e-9, "krylov_max_iter"_a = 2000,
-          "krylov_rank"_a = 80, "num_threads"_a = 1, "max_nnz"_a = hb::kHbDefaultMaxNnz,
+          "krylov_rank"_a = 80, "num_threads"_a = 1, "max_nnz"_a = hb::kHbDefaultMaxNnz, "damping"_a = "on_failure",
+          "junction_limiting"_a = true,
           "Harmonic balance on a compiled circuit (solvers.solve_harmonic_balance). Time sources are\n"
-          "(row, time-dependent Program) pairs; krylov_rank is the resolved rank. Returns (x_bar (n K,), stats).\n"
-          "Raises CoreError(HB_ERROR) with the reference texts on failure and for the memory policy.");
+          "(row, time-dependent Program) pairs; krylov_rank is the resolved rank. damping: when the P3b damped\n"
+          "Newton (residual backtracking, junction limiting on the samples when junction_limiting) runs:\n"
+          "'on_failure' (restart after a breakdown of the reference iteration), 'always' or 'off'. Returns\n"
+          "(x_bar (n K,), stats). Raises CoreError(HB_ERROR) with the reference texts on failure and for the\n"
+          "memory policy.");
 }
 
 const mna::bindings::Registrar reg_hb{"hb", &bind_hb};

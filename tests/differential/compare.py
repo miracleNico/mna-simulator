@@ -32,6 +32,13 @@ name and the same ``.code`` attribute (``None`` when absent), except for a
 corpus case with ``current_error`` (an applied 2.4.1 ruling changed the live
 error): the oracle is checked against ``expects_error`` and the live package
 against ``current_error``.
+
+name and the same ``.code`` attribute (``None`` when absent).
+
+Analyses with a recorded deliberate change (``corpus.Deviation``) are checked by
+``check_deviation`` instead: the oracle must still end as recorded on the case
+netlist, the live package must succeed and match the oracle's result on the
+equivalent netlist (or an analytic operating point).
 """
 
 from __future__ import annotations
@@ -258,16 +265,32 @@ def _compare_operating_points(out: _Mismatches, ref_md: dict[str, Any], cur_md: 
 _VALUE_SERIES = frozenset({"values", "magnitudes"})
 
 
-def assert_responses_match(
-    ref: Any, cur: Any, tolerance: str = "linear", context: str = "", *, compare_values: bool = True
-) -> None:
-    """Assert two ``SimulationResponse`` objects agree under ``tolerance``.
+def _tolerance_pair(tolerance: str | tuple[float, float]) -> tuple[float, float]:
+    if isinstance(tolerance, str):
+        return TOLERANCES[tolerance]
+    rtol, atol = tolerance
+    return float(rtol), float(atol)
 
-    ``compare_values=False`` compares waveform values and spectrum magnitudes by shape only
-    (everything else as usual); see :func:`assert_mor_matches_full_order`.
+
+def assert_responses_match(
+    ref: Any,
+    cur: Any,
+    tolerance: str | tuple[float, float] = "linear",
+    context: str = "",
+    ignore_metadata: tuple[str, ...] = (),
+    compare_matrices: bool = True,
+    *,
+    compare_values: bool = True,
+) -> None:
+    """Assert two ``SimulationResponse`` objects agree under ``tolerance`` (a class or ``(rtol, atol)``).
+
+    ``ignore_metadata`` drops contract metadata keys from the comparison and
+    ``compare_matrices=False`` skips ``matrices`` (both only for deviation checks);
+    ``compare_values=False`` compares waveform values and spectrum magnitudes by shape
+    only (see :func:`assert_mor_matches_full_order`).
     """
 
-    rtol, atol = TOLERANCES[tolerance]
+    rtol, atol = _tolerance_pair(tolerance)
     out = _Mismatches(context)
 
     if _enum_value(ref.mode) != _enum_value(cur.mode):
@@ -296,7 +319,7 @@ def assert_responses_match(
                 continue
             _compare_arrays(out, f"{name}.{key}", ref_block.get(key), cur_block.get(key), rtol, atol)
 
-    ref_mat, cur_mat = ref.matrices, cur.matrices
+    ref_mat, cur_mat = (ref.matrices, cur.matrices) if compare_matrices else (None, None)
     if (ref_mat is None) != (cur_mat is None):
         out.add("matrices", f"present in {'current' if ref_mat is None else 'reference'} only")
     elif ref_mat is not None:
@@ -311,6 +334,9 @@ def assert_responses_match(
                 _compare_arrays(out, f"matrices[{key!r}]", ref_mat[key], cur_mat[key], rtol, atol)
 
     ref_md, cur_md = dict(ref.metadata or {}), dict(cur.metadata or {})
+    for key in ignore_metadata:
+        ref_md.pop(key, None)
+        cur_md.pop(key, None)
     _compare_contract_metadata(out, ref_md, cur_md)
     _compare_operating_points(out, ref_md, cur_md, rtol, atol)
 
@@ -441,6 +467,59 @@ def assert_mor_matches_full_order(
         selected = full_values[[full_labels.index(label) for label in cur_block.get("labels") or []]]
         _compare_arrays(out, f"{name}.{value_key}", selected, cur_block.get(value_key), rtol, atol)
     out.raise_if_any()
+
+
+def check_deviation(
+    reference_pkg: ModuleType | str,
+    current_pkg: ModuleType | str,
+    netlist_text: str,
+    mode: str | None,
+    options: dict[str, Any] | None,
+    deviation: Any,
+    tolerance: str = "linear",
+    context: str = "",
+) -> tuple[Outcome, Outcome]:
+    """Check one analysis with a recorded deliberate change (a ``corpus.Deviation``)."""
+
+    suffix = f" ({context})" if context else ""
+    ref = run_request(reference_pkg, netlist_text, mode, options)
+    cur = run_request(current_pkg, netlist_text, mode, options)
+    expected = deviation.reference_error
+    if expected is None and ref.error is not None:
+        raise AssertionError(
+            f"deviation expects the reference to succeed but it raised {type(ref.error).__name__}: {ref.error}{suffix}"
+        ) from ref.error
+    if expected is not None and (ref.error is None or type(ref.error).__name__ != expected):
+        got = "succeeded" if ref.error is None else f"raised {type(ref.error).__name__}: {ref.error}"
+        raise AssertionError(f"deviation expects the reference to raise {expected} but it {got}{suffix}")
+    if cur.error is not None:
+        raise AssertionError(
+            f"deviation ({deviation.ruling}) expects the current package to succeed but it raised "
+            f"{type(cur.error).__name__}(code={getattr(cur.error, 'code', None)!r}): {cur.error}{suffix}"
+        ) from cur.error
+    metadata = dict(cur.response.metadata or {})
+    if deviation.gmin is not None and not _values_equal(metadata.get("gmin"), deviation.gmin):
+        raise AssertionError(f"deviation expects metadata gmin {deviation.gmin!r}, got {metadata.get('gmin')!r}{suffix}")
+    pair = _tolerance_pair(deviation.tolerance if deviation.tolerance is not None else tolerance)
+    if deviation.equivalent_netlist is not None:
+        equivalent = run_request(reference_pkg, deviation.equivalent_netlist, mode, options)
+        if equivalent.error is not None:
+            raise AssertionError(
+                f"the reference failed on the deviation's equivalent netlist: {equivalent.error}{suffix}"
+            ) from equivalent.error
+        assert_responses_match(
+            equivalent.response,
+            cur.response,
+            tolerance=pair,
+            context=f"{context} vs equivalent netlist",
+            ignore_metadata=("gmin",),
+            compare_matrices=deviation.compare_matrices,
+        )
+    if deviation.expected_dc is not None:
+        out = _Mismatches(f"{context} vs expected operating point")
+        _compare_arrays(out, "dc_solution", list(deviation.expected_dc), cur.response.dc_solution, *pair)
+        out.raise_if_any()
+    return ref, cur
 
 
 def run_and_compare(

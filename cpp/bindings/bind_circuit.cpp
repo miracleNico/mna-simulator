@@ -89,6 +89,9 @@ std::shared_ptr<Circuit> build_circuit(const nb::dict& spec) {
     if (spec.contains("gmin")) {
         s.gmin = nb::cast<double>(spec["gmin"]);
     }
+    if (spec.contains("node_count") && !spec["node_count"].is_none()) {
+        s.node_count = nb::cast<std::int64_t>(spec["node_count"]);
+    }
     read_triplets(spec, "G", s.g);
     read_triplets(spec, "C", s.c);
     read_triplets(spec, "gmin_stamps", s.gmin_stamps);
@@ -159,6 +162,8 @@ void bind_circuit(nb::module_& m) {
         .def_prop_ro("n", &Circuit::n)
         .def_prop_ro("nnz", &Circuit::nnz)
         .def_prop_ro("gmin", &Circuit::gmin)
+        .def_prop_ro("node_count", &Circuit::node_count,
+                     "Node-voltage unknowns [0, node_count) carrying a node-to-ground gmin stamp.")
         .def_prop_ro("has_nonlinear", &Circuit::has_nonlinear)
         .def_prop_ro("device_counts",
                      [](const Circuit& c) {
@@ -185,7 +190,9 @@ void bind_circuit(nb::module_& m) {
                  const std::size_t size = v.size();
                  return to_numpy(std::move(v), {size});
              },
-             "name"_a, "Values of 'G', 'C' or 'gmin' (unit gmin stamps) in pattern order.")
+             "name"_a,
+             "Values of 'G', 'C' or 'gmin' in pattern order ('gmin': the unit gmin stamps of the builder plus one\n"
+             "unit node-to-ground stamp per node unknown).")
         .def("g_effective",
              [](const Circuit& c, double gmin) {
                  std::vector<double> v = c.g_effective(gmin);
@@ -216,7 +223,22 @@ void bind_circuit(nb::module_& m) {
                  const std::size_t size = slots.size();
                  return to_numpy(std::move(slots), {size});
              },
-             "kind"_a, "Pattern slots of every device Jacobian entry (-1 for ground), in device order.");
+             "kind"_a, "Pattern slots of every device Jacobian entry (-1 for ground), in device order.")
+        .def("junctions",
+             [](const Circuit& c) {
+                 const mna::circuit::Junctions& j = c.junctions();
+                 const std::size_t size = j.size();
+                 nb::dict d;
+                 d["anode"] = to_numpy(std::vector<std::int32_t>(j.anode), {size});
+                 d["cathode"] = to_numpy(std::vector<std::int32_t>(j.cathode), {size});
+                 d["vt"] = to_numpy(std::vector<double>(j.vt), {size});
+                 d["is"] = to_numpy(std::vector<double>(j.is), {size});
+                 d["vcrit"] = to_numpy(std::vector<double>(j.vcrit), {size});
+                 return d;
+             },
+             "Exponential junctions used by the junction voltage-step limiter: dict of arrays anode, cathode\n"
+             "(int32, -1 = ground), vt, is, vcrit (diodes first, then each BJT's base-emitter and\n"
+             "base-collector junction).");
 
     m.def("build_circuit", &build_circuit, "spec"_a,
           "Compile a circuit from plain tables (see mna_simulation/native/circuit.py for the layout).\n"

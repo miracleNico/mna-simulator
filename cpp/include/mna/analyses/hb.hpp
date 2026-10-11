@@ -34,7 +34,10 @@
 // product (any summation order works: the reference's Gamma @ (g * Gamma_inv),
 // einsum, (Gamma * g) @ Gamma_inv and this symmetric evaluation all converge in
 // 36 iterations). An FFT-based Jacobian (phase B) would hit the same wall
-// unless the Newton loop gains damping.
+// unless the Newton loop gains damping. The Fourier-sum evaluation is kept
+// as an experimental, default-off option (HbOptions::fourier_sum_jacobian,
+// hb_fourier_sum_gram) for that study; see CPP_MIGRATION_PLAN.md 2.6 for
+// what the damped Newton changed.
 //
 // Linear solver (BtfSolver): the union pattern is permuted once to block upper
 // triangular form (SuiteSparse BTF, as KLU does internally); each diagonal
@@ -45,9 +48,29 @@
 // the mixer diode node), and a division for 1 x 1 blocks. A block is singular
 // on an exact zero pivot (the LAPACK getrf / KLU rule) or a structural defect.
 //
-// Newton exactly as the reference: x_bar = 0, no damping, stop when
-// ||F||_2 < tol (checked before each solve), at most max_iter solves. Errors
-// (mna::Error, code HB_ERROR, texts of the reference):
+// Newton as the reference: x_bar = 0, stop when ||F||_2 < tol (checked
+// before each solve), at most max_iter solves, plus a damped Newton
+// (CPP_MIGRATION_PLAN.md 2.4.1 / 2.6, P3b: "improve, not parity"):
+//   * junction limiting on the samples (HbOptions::junction_limiting): the K
+//     samples of every junction voltage of x + delta are limited with SPICE's
+//     pnjlim against the samples of x (mna/analyses/limiting.hpp, one sample
+//     at a time) and the changed terminals are transformed back with Gamma;
+//   * residual backtracking: the limited step (when the limiter changed the
+//     update), then the plain step, is halved up to kHbDampingTrials times and
+//     the first trial with a finite ||F|| that does not exceed the current
+//     one is accepted; when no trial of either qualifies, the undamped step
+//     x + delta is taken (as the reference would).
+// HbOptions::damping selects when: OnFailure (default) runs the reference's
+// undamped iteration and restarts from x_bar = 0 with the damped one, for the
+// rest of the max_iter budget, when it breaks down (non-finite ||F|| or a
+// singular Newton matrix, where the reference raises); Always damps from the
+// start; Off is the reference. OnFailure keeps every run the reference
+// solves bit for bit: the undamped iteration stops at the first iterate with
+// ||F|| < tol, and on several corpus cases that iterate is 1e-9..3e-8 away
+// from the exact solution (more than the differential tolerance), so a
+// damped run, although it is as close or closer to the exact solution and
+// needs 3-5x fewer iterations (mixer: 11 instead of 38), would not match it.
+// Errors (mna::Error, code HB_ERROR, texts of the reference):
 //   "Harmonic balance solver did not converge within limit."  max_iter reached,
 //                                                              or a non-finite ||F||
 //   "Singular HB Jacobian."                                    singular Newton matrix
@@ -83,6 +106,8 @@ inline constexpr std::int64_t kHbDefaultMaxNnz = 30000000;
 /// Device-Jacobian blocks are multiplied in column chunks of this width (the
 /// unit of parallel work; fixed, so results do not depend on the thread count).
 inline constexpr std::int64_t kHbBlockChunk = 32;
+/// Halvings tried by the damped HB Newton (as the DC Newton driver).
+inline constexpr int kHbDampingTrials = 28;
 /// BtfSolver factors a diagonal block densely when it has at most this many
 /// rows or when nnz(block) >= kBtfDenseFraction * size^2.
 inline constexpr std::int32_t kBtfDenseMaxSmall = 32;
@@ -127,6 +152,16 @@ void hb_reconstruct(const double* x_bar, std::int64_t n, std::int64_t harmonics,
 /// the dense product is kept.
 void hb_gram_columns(const FourierMatrices& fm, const double* g, std::int64_t col_begin, std::int64_t col_end,
                      double* scratch, double* gram);
+
+/// EXPERIMENTAL (rejected in P4, see the file comment; HbOptions::
+/// fourier_sum_jacobian): the upper triangle of M = Gamma_inv^T diag(g) Gamma_inv
+/// through the discrete Fourier sums C[m] = sum_k g_k cos(2 pi m k / K) and
+/// S[m] = sum_k g_k sin(2 pi m k / K), m = 0..2H, and the product-to-sum
+/// identities, in O(K^2): gram[col * S + row] = M[row, col] for row <= col
+/// (column-major S x S, S = 2H + 1, the layout hb_gram_columns writes).
+/// cos_table / sin_table: cos / sin(2 pi r / K) for r = 0..K-1.
+void hb_fourier_sum_gram(std::int64_t harmonics, std::int64_t num_points, const double* g, const double* cos_table,
+                         const double* sin_table, double* gram);
 
 // ---------------------------------------------------------------------------
 // Block triangular direct solver
@@ -188,6 +223,9 @@ struct HbTimeSource {
     std::shared_ptr<const expr::Program> program;
 };
 
+/// When hb_solve damps its Newton iteration (see the file comment).
+enum class HbDamping { Off, OnFailure, Always };
+
 struct HbOptions {
     double omega0 = 0.0;
     std::int64_t harmonics = 0;
@@ -205,6 +243,15 @@ struct HbOptions {
     std::int64_t krylov_rank = 80;
     int num_threads = 1;
     std::int64_t max_nnz = kHbDefaultMaxNnz;
+    /// Damped Newton (P3b): residual backtracking with the undamped step as the
+    /// last resort, after a breakdown of the reference iteration (OnFailure),
+    /// from the start (Always) or never (Off: the reference iteration).
+    HbDamping damping = HbDamping::OnFailure;
+    /// With damping: pnjlim on the sampled junction voltages.
+    bool junction_limiting = true;
+    /// EXPERIMENTAL, not for production: device blocks through
+    /// hb_fourier_sum_gram instead of the dense product.
+    bool fourier_sum_jacobian = false;
 };
 
 /// One Krylov attempt (the stats entry solvers.solve_linear appends).
@@ -222,6 +269,11 @@ struct HbStats {
     std::int64_t dimension = 0;  ///< N = n K
     std::int64_t newton_iterations = 0;
     std::int64_t linear_solves = 0;
+    std::int64_t limited_steps = 0;    ///< iterations whose update the junction limiter changed
+    std::int64_t limit_fallbacks = 0;  ///< of those, iterations that fell back to the plain step
+    std::int64_t damped_steps = 0;     ///< steps accepted at a scale below 1
+    std::int64_t undamped_steps = 0;   ///< iterations where no trial reduced ||F|| (undamped step taken)
+    std::int64_t damping_restarts = 0;  ///< restarts with the damped iteration after a breakdown (0 or 1)
     double residual_norm = 0.0;  ///< ||F|| at the converged iterate (0 for linear)
     std::int64_t y_nnz = 0;            ///< entries of Y_bar (spec count)
     std::int64_t device_slots = 0;     ///< device Jacobian slots (dense K x K blocks)

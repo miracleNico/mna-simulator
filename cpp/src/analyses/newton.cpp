@@ -5,6 +5,7 @@
 #include <limits>
 #include <utility>
 
+#include "mna/analyses/limiting.hpp"
 #include "mna/assembly.hpp"
 #include "mna/devices/fp_contract.hpp"
 #include "mna/error.hpp"
@@ -68,7 +69,24 @@ SystemSolver::~SystemSolver() = default;
 
 void SystemSolver::invalidate() noexcept {
     factor_valid_ = false;
+    numeric_valid_ = false;
     krylov_valid_ = false;
+}
+
+bool SystemSolver::factor_check(const double* values) {
+    const std::vector<double> zero(static_cast<std::size_t>(pattern_.n), 0.0);
+    std::vector<double> x(zero.size());
+    return direct(values, zero.data(), x.data(), FactorMode::Refactor);
+}
+
+bool SystemSolver::resolve(const double* rhs, double* x) {
+    if (!numeric_valid_ || !direct_) {
+        return false;
+    }
+    const auto n = static_cast<std::size_t>(pattern_.n);
+    std::copy(rhs, rhs + n, x);
+    direct_->solve(x, n, 1);
+    return true;
 }
 
 void SystemSolver::build_krylov_operator(const double* values) {
@@ -127,6 +145,7 @@ bool SystemSolver::solve(const double* values, const double* rhs, double* x, con
             stats_->push_back(stat);
         }
         if (accepted) {
+            numeric_valid_ = false;  // the direct factorization (if any) is of another matrix
             return true;
         }
     }
@@ -160,12 +179,14 @@ bool SystemSolver::direct(const double* values, const double* rhs, double* x, Fa
                 break;
         }
     } catch (const Error& e) {
+        numeric_valid_ = false;
         if (e.code() == ErrorCode::JacobianSingular) {
             factor_valid_ = false;
             return false;
         }
         throw;
     }
+    numeric_valid_ = true;
     std::copy(rhs, rhs + n, x);
     direct_->solve(x, n, 1);
     return true;
@@ -194,6 +215,10 @@ NewtonDriver::NewtonDriver(const Circuit& circuit, const NewtonOptions& options,
     jdev_.resize(nnz);
     trial_jdev_.resize(nnz);
     jacobian_.resize(nnz);
+    if (!circuit.junctions().empty()) {
+        limited_.resize(n);
+        correction_.resize(n);
+    }
 }
 
 NewtonDriver::~NewtonDriver() = default;
@@ -209,7 +234,72 @@ void NewtonDriver::evaluate_residual(const double* a_static, const double* b, do
     }
 }
 
-NewtonOutcome NewtonDriver::solve(const double* a_static, const double* b, double t, std::vector<double>& x) {
+bool NewtonDriver::jacobian_singular(const double* a_static, double t, const std::vector<double>& x) {
+    MNA_NO_FP_CONTRACT
+    const auto nnz = static_cast<std::size_t>(circuit_.nnz());
+    assembly::evaluate(circuit_, x.data(), t, device_threads_, nullptr, jdev_.data());
+    for (std::size_t s = 0; s < nnz; ++s) {
+        jacobian_[s] = a_static[s] + jdev_[s];
+    }
+    return !system_.factor_check(jacobian_.data());
+}
+
+NewtonDriver::Damping NewtonDriver::damp(const double* a_static, const double* b, double t,
+                                          const std::vector<double>& x, const std::vector<double>& step,
+                                          double norm_now, bool monotonicity) {
+    MNA_NO_FP_CONTRACT
+    const auto n = static_cast<std::size_t>(circuit_.n());
+    // _damped_newton_step: first trial that does not increase the finite
+    // residual norm; the best strictly smaller one as the fallback.
+    Damping d;
+    d.best_norm = norm_now;
+    d.next_norm = norm_now;
+    double step_norm = 0.0;
+    if (monotonicity) {
+        step_norm = finite_norm(step.data(), n);
+    }
+    double scale = 1.0;
+    for (int trial = 0; trial < kMaxDampingTrials; ++trial) {
+        for (std::size_t i = 0; i < n; ++i) {
+            trial_[i] = x[i] + step[i] * scale;
+        }
+        evaluate_residual(a_static, b, t, trial_.data(), trial_f_.data(), trial_jdev_.data(), trial_residual_.data());
+        const double trial_norm = finite_norm(trial_residual_.data(), n);
+        const bool finite = std::isfinite(trial_norm);
+        if (finite && trial_norm < d.best_norm) {
+            best_ = trial_;
+            d.best_norm = trial_norm;
+            d.best_scale = scale;
+        }
+        if (finite && trial_norm <= norm_now) {
+            d.accepted = true;
+            d.next_norm = trial_norm;
+            d.step_scale = scale;
+            return d;
+        }
+        // Restricted natural monotonicity test with this iteration's factorization.
+        if (monotonicity && finite && step_norm > 0.0 && std::isfinite(step_norm)) {
+            for (std::size_t i = 0; i < n; ++i) {
+                rhs_[i] = -trial_residual_[i];
+            }
+            if (system_.resolve(rhs_.data(), correction_.data())) {
+                const double correction_norm = finite_norm(correction_.data(), n);
+                if (correction_norm <= (1.0 - 0.25 * scale) * step_norm) {
+                    d.accepted = true;
+                    d.next_norm = trial_norm;
+                    d.step_scale = scale;
+                    d.by_monotonicity = true;
+                    return d;
+                }
+            }
+        }
+        scale *= 0.5;
+    }
+    return d;
+}
+
+NewtonOutcome NewtonDriver::solve(const double* a_static, const double* b, double t, std::vector<double>& x,
+                                  std::int64_t max_iter) {
     MNA_NO_FP_CONTRACT
     const auto n = static_cast<std::size_t>(circuit_.n());
     const auto nnz = static_cast<std::size_t>(circuit_.nnz());
@@ -217,11 +307,47 @@ NewtonOutcome NewtonDriver::solve(const double* a_static, const double* b, doubl
         throw Error(ErrorCode::NetlistFatal, "newton: starting point has " + std::to_string(x.size()) +
                                                  " entries, expected " + std::to_string(n));
     }
+    const std::int64_t iteration_limit = max_iter < 0 ? options_.max_iter : max_iter;
+    // P3b junction strategy: only with exponential junctions, and only after the
+    // reference iteration failed or stalled, so every run it solves without
+    // stalling is unchanged.
+    const bool junctions = options_.junction_limiting && !circuit_.junctions().empty();
+    const bool monotonicity = junctions && !options_.krylov.enabled;
+    bool junction_mode = false;
+    int stalled = 0;
     NewtonOutcome outcome;
     bool have_residual = false;
     double norm_now = 0.0;
 
-    for (std::int64_t iteration = 0; iteration < options_.max_iter; ++iteration) {
+    // Junction-mode damping: the limited step first (when the limiter changed
+    // the update), then the plain Newton step.
+    auto junction_step = [&]() {
+        bool limited = false;
+        Damping d;
+        for (std::size_t i = 0; i < n; ++i) {
+            limited_[i] = x[i] + delta_[i];
+        }
+        if (limit_junctions(circuit_, x.data(), limited_.data()) > 0) {
+            limited = true;
+            ++outcome.limited_steps;
+            for (std::size_t i = 0; i < n; ++i) {
+                limited_[i] = limited_[i] - x[i];
+            }
+            d = damp(a_static, b, t, x, limited_, norm_now, monotonicity);
+        }
+        if (!d.accepted) {
+            if (limited) {
+                ++outcome.fallback_steps;
+            }
+            d = damp(a_static, b, t, x, delta_, norm_now, monotonicity);
+        }
+        if (d.by_monotonicity) {
+            ++outcome.monotonicity_accepts;
+        }
+        return d;
+    };
+
+    for (std::int64_t iteration = 0; iteration < iteration_limit; ++iteration) {
         if (!have_residual) {
             evaluate_residual(a_static, b, t, x.data(), f_.data(), jdev_.data(), residual_.data());
             norm_now = finite_norm(residual_.data(), n);
@@ -245,41 +371,38 @@ NewtonOutcome NewtonDriver::solve(const double* a_static, const double* b, doubl
             return outcome;
         }
 
-        // _damped_newton_step: first trial that does not increase the finite
-        // residual norm; the best strictly smaller one as the fallback.
-        double best_norm = norm_now;
-        double best_scale = 0.0;
-        double scale = 1.0;
-        bool accepted = false;
-        double next_norm = norm_now;
-        double step_scale = 0.0;
-        for (int trial = 0; trial < kMaxDampingTrials; ++trial) {
-            for (std::size_t i = 0; i < n; ++i) {
-                trial_[i] = x[i] + delta_[i] * scale;
+        Damping d;
+        if (junction_mode) {
+            d = junction_step();
+        } else {
+            d = damp(a_static, b, t, x, delta_, norm_now, false);
+            if (junctions) {
+                if (!d.accepted) {
+                    // The reference iteration would stop here: retry this
+                    // iteration's update with the junction strategy.
+                    junction_mode = true;
+                    outcome.junction_switch = iteration;
+                    d = junction_step();
+                } else if (d.step_scale <= kStallScale) {
+                    if (++stalled >= kStallIterations) {
+                        junction_mode = true;  // from the next iteration on
+                        outcome.junction_switch = iteration + 1;
+                    }
+                } else {
+                    stalled = 0;
+                }
             }
-            evaluate_residual(a_static, b, t, trial_.data(), trial_f_.data(), trial_jdev_.data(),
-                              trial_residual_.data());
-            const double trial_norm = finite_norm(trial_residual_.data(), n);
-            const bool finite = std::isfinite(trial_norm);
-            if (finite && trial_norm < best_norm) {
-                best_ = trial_;
-                best_norm = trial_norm;
-                best_scale = scale;
-            }
-            if (finite && trial_norm <= norm_now) {
-                accepted = true;
-                next_norm = trial_norm;
-                step_scale = scale;
-                break;
-            }
-            scale *= 0.5;
         }
 
+        double next_norm = norm_now;
+        double step_scale = 0.0;
         double delta_sq = 0.0;
-        if (accepted) {
+        if (d.accepted) {
+            next_norm = d.next_norm;
+            step_scale = d.step_scale;
             for (std::size_t i = 0; i < n; ++i) {
-                const double d = trial_[i] - x[i];
-                delta_sq += d * d;
+                const double diff = trial_[i] - x[i];
+                delta_sq += diff * diff;
             }
             // The trial's evaluation is the next iteration's evaluation.
             std::swap(x, trial_);
@@ -288,14 +411,14 @@ NewtonOutcome NewtonDriver::solve(const double* a_static, const double* b, doubl
             std::swap(residual_, trial_residual_);
             norm_now = next_norm;
             have_residual = true;
-        } else if (best_scale > 0.0) {
+        } else if (d.best_scale > 0.0) {
             for (std::size_t i = 0; i < n; ++i) {
-                const double d = best_[i] - x[i];
-                delta_sq += d * d;
+                const double diff = best_[i] - x[i];
+                delta_sq += diff * diff;
             }
             x = best_;
-            next_norm = best_norm;
-            step_scale = best_scale;
+            next_norm = d.best_norm;
+            step_scale = d.best_scale;
             have_residual = false;  // re-evaluated at the top: same point, same values
         }
 

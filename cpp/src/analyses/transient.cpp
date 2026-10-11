@@ -153,6 +153,9 @@ TranResult transient(const Circuit& circuit, const double* x0, const std::vector
             x = x_prev;
             const NewtonOutcome outcome = newton->solve(a_step.data(), rhs.data(), t, x);
             result.newton_iterations += outcome.iterations;
+            result.junction_switches += outcome.junction_switch >= 0 ? 1 : 0;
+            result.limited_steps += outcome.limited_steps;
+            result.monotonicity_accepts += outcome.monotonicity_accepts;
             switch (outcome.status) {
                 case NewtonStatus::Converged:
                     break;

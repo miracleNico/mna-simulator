@@ -468,3 +468,182 @@ TEST_CASE("hb_solve errors keep the reference texts") {
     std::vector<hb::HbTimeSource> bad{{3, sine_program(1.0, 1.0)}};
     CHECK_THROWS_AS(hb::hb_solve(diode, b_dc, bad, options), mna::Error);
 }
+
+// ---------------------------------------------------------------------------
+// Damped HB Newton (CPP_MIGRATION_PLAN.md 2.4.1 / 2.6, P3b)
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// The close-tone GHz diode mixer of the corpus (hb_ghz_mixer): unknowns env, mix, I(LENV).
+CircuitSpec ghz_mixer() {
+    CircuitSpec s;
+    s.n = 3;
+    s.g = {{1, 0, 0, 0, 2}, {1, 0, 1, 2, 0}, {1e-4, 1.0 / 4300.0, 1e-3, 1.0, 1.0}};
+    s.c = {{2, 0}, {2, 0}, {-1e-6, 1.013e-9}};
+    s.gmin_stamps = {{1, 0}, {1, 0}, {1.0, 1.0}};
+    s.node_count = 2;
+    s.diodes = {{1}, {-1}, {1e-12}};
+    return s;
+}
+
+struct MixerRun {
+    hb::HbResult result;
+    std::string error;
+};
+
+/// tol = 1e-12: the env node is an LC tank resonant at the 5 MHz beat (|Z| ~ 4.3 kOhm), so an
+/// iterate with ||F|| ~ 1e-7 (below the default tol of 1e-6) can still be ~1e-3 V off; the
+/// comparisons below need fully converged solves.
+MixerRun run_mixer(hb::HbDamping damping, bool fourier_sums, int threads = 1, double tol = 1e-12) {
+    const Circuit circuit(ghz_mixer());
+    const double b_dc[3] = {0.0, 50e-6, 0.0};
+    const std::vector<hb::HbTimeSource> sources{{1, sine_program(40e-6, 2.0 * kPi * 1e9)},
+                                                {1, sine_program(40e-6, 2.0 * kPi * 1.005e9)}};
+    hb::HbOptions options;
+    options.omega0 = 2.0 * kPi * 5e6;
+    options.harmonics = 205;
+    options.max_iter = 200;
+    options.tol = tol;
+    options.damping = damping;
+    options.fourier_sum_jacobian = fourier_sums;
+    options.num_threads = threads;
+    MixerRun run;
+    run.error = hb_error_message([&] { run.result = hb::hb_solve(circuit, b_dc, sources, options); });
+    return run;
+}
+
+double max_abs_difference(const std::vector<double>& a, const std::vector<double>& b) {
+    double worst = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        worst = std::fmax(worst, std::fabs(a[i] - b[i]));
+    }
+    return worst;
+}
+
+}  // namespace
+
+TEST_CASE("hb_fourier_sum_gram equals the dense Gram product (experimental O(K^2) blocks)") {
+    for (const std::int64_t harmonics : {1, 4, 9}) {
+        const std::int64_t K = 2 * harmonics + 1;
+        const hb::FourierMatrices fm = hb::hb_fourier_matrices(harmonics, K);
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> u(0.1, 2.0);
+        std::vector<double> g(static_cast<std::size_t>(K));
+        for (double& v : g) {
+            v = u(rng);
+        }
+        std::vector<double> dense(static_cast<std::size_t>(K * K), 0.0);
+        std::vector<double> scratch(static_cast<std::size_t>(K * K));
+        hb::hb_gram_columns(fm, g.data(), 0, K, scratch.data(), dense.data());
+        std::vector<double> cos_table(static_cast<std::size_t>(K));
+        std::vector<double> sin_table(static_cast<std::size_t>(K));
+        for (std::int64_t r = 0; r < K; ++r) {
+            const double angle = 2.0 * kPi * static_cast<double>(r) / static_cast<double>(K);
+            cos_table[static_cast<std::size_t>(r)] = std::cos(angle);
+            sin_table[static_cast<std::size_t>(r)] = std::sin(angle);
+        }
+        std::vector<double> sums(static_cast<std::size_t>(K * K), 0.0);
+        hb::hb_fourier_sum_gram(harmonics, K, g.data(), cos_table.data(), sin_table.data(), sums.data());
+        for (std::int64_t col = 0; col < K; ++col) {
+            for (std::int64_t row = 0; row <= col; ++row) {
+                const auto at = static_cast<std::size_t>(col * K + row);
+                CHECK(sums[at] == doctest::Approx(dense[at]).epsilon(1e-12).scale(static_cast<double>(K)));
+            }
+        }
+    }
+}
+
+TEST_CASE("damped HB Newton on the close-tone diode mixer") {
+    const MixerRun off = run_mixer(hb::HbDamping::Off, false);
+    REQUIRE(off.error.empty());
+    const MixerRun on_failure = run_mixer(hb::HbDamping::OnFailure, false);
+    REQUIRE(on_failure.error.empty());
+    const MixerRun always = run_mixer(hb::HbDamping::Always, false);
+    REQUIRE(always.error.empty());
+    MESSAGE("mixer Newton iterations (tol 1e-12): undamped " << off.result.stats.newton_iterations << ", damped "
+                                                             << always.result.stats.newton_iterations << " (limited "
+                                                             << always.result.stats.limited_steps << ", backtracked "
+                                                             << always.result.stats.damped_steps << ")");
+    // The reference iteration converges, so OnFailure never damps and is bitwise the reference.
+    CHECK(bitwise_equal(on_failure.result.x_bar, off.result.x_bar));
+    CHECK(on_failure.result.stats.damping_restarts == 0);
+    CHECK(on_failure.result.stats.limited_steps == 0);
+    // Damping from the start: at most twice the iterations (in practice ~3x fewer), the limiter
+    // and the backtracking engage, and the solution is the same.
+    CHECK(always.result.stats.newton_iterations <= 2 * off.result.stats.newton_iterations);
+    CHECK(always.result.stats.newton_iterations < off.result.stats.newton_iterations);
+    CHECK(always.result.stats.limited_steps > 0);
+    CHECK(always.result.stats.damped_steps > 0);
+    CHECK(always.result.stats.residual_norm < 1e-12);
+    CHECK(max_abs_difference(always.result.x_bar, off.result.x_bar) < 1e-9);
+    // At the default tol (1e-6) the damped run needs fewer iterations too.
+    const MixerRun off_default = run_mixer(hb::HbDamping::Off, false, 1, 1e-6);
+    const MixerRun always_default = run_mixer(hb::HbDamping::Always, false, 1, 1e-6);
+    REQUIRE(off_default.error.empty());
+    REQUIRE(always_default.error.empty());
+    CHECK(always_default.result.stats.newton_iterations <= 2 * off_default.result.stats.newton_iterations);
+    // Thread independence of the damped iteration.
+    const MixerRun always4 = run_mixer(hb::HbDamping::Always, false, 4);
+    REQUIRE(always4.error.empty());
+    CHECK(bitwise_equal(always4.result.x_bar, always.result.x_bar));
+}
+
+TEST_CASE("experimental O(K^2) Fourier-sum Jacobian blocks converge on the mixer only with damping") {
+    // P4 rejected these blocks because the undamped Newton overflows at iteration 2 (see
+    // hb.hpp). With the damped Newton they converge to the dense-product solution; hb_solve
+    // keeps the dense product (switching is a separate decision, CPP_MIGRATION_PLAN.md 2.6).
+    const MixerRun dense = run_mixer(hb::HbDamping::Always, false);
+    REQUIRE(dense.error.empty());
+    const MixerRun sums_off = run_mixer(hb::HbDamping::Off, true);
+    CHECK(sums_off.error == "Harmonic balance solver did not converge within limit.");
+    const MixerRun sums_on_failure = run_mixer(hb::HbDamping::OnFailure, true);
+    const MixerRun sums_always = run_mixer(hb::HbDamping::Always, true);
+    MESSAGE("Fourier-sum blocks (tol 1e-12): undamped '" << sums_off.error << "'; on_failure '"
+                                                         << sums_on_failure.error << "' iterations "
+                                                         << sums_on_failure.result.stats.newton_iterations
+                                                         << "; always '" << sums_always.error << "' iterations "
+                                                         << sums_always.result.stats.newton_iterations);
+    REQUIRE(sums_on_failure.error.empty());
+    REQUIRE(sums_always.error.empty());
+    CHECK(sums_on_failure.result.stats.damping_restarts == 1);
+    CHECK(max_abs_difference(sums_always.result.x_bar, dense.result.x_bar) < 1e-9);
+    CHECK(max_abs_difference(sums_on_failure.result.x_bar, dense.result.x_bar) < 1e-9);
+}
+
+TEST_CASE("HB damping restarts after a breakdown: the two-diode DC string") {
+    // rand_diode_s2 of the corpus as a Norton circuit: 4.561 V through 1535 ohm into a,
+    // 33.78k from a to ground, D1 a -> b, D2 b -> ground, 69.83 uA at 5 kHz into b.
+    CircuitSpec s;
+    s.n = 2;
+    s.g = {{0}, {0}, {1.0 / 1535.0 + 1.0 / 33780.0}};
+    s.gmin_stamps = {{0, 1, 0, 1, 1}, {0, 1, 1, 0, 1}, {1.0, 1.0, -1.0, -1.0, 1.0}};
+    s.node_count = 2;
+    s.diodes = {{0, 1}, {1, -1}, {5e-15, 5e-15}};
+    const Circuit circuit(s);
+    const double b_dc[2] = {4.561 / 1535.0, 0.0};
+    const std::vector<hb::HbTimeSource> sources{{1, sine_program(6.983e-5, 2.0 * kPi * 5000.0)}};
+    hb::HbOptions options;
+    options.omega0 = 2.0 * kPi * 5000.0;
+    options.harmonics = 6;
+    options.max_iter = 200;
+    options.damping = hb::HbDamping::Off;
+    // The undamped iteration from x_bar = 0 breaks down (overflowing exponentials here; the
+    // netlist version with the voltage source hits "Singular HB Jacobian.").
+    CHECK(hb_error_message([&] { hb::hb_solve(circuit, b_dc, sources, options); }) ==
+          "Harmonic balance solver did not converge within limit.");
+    options.damping = hb::HbDamping::OnFailure;
+    hb::HbResult r;
+    CHECK(hb_error_message([&] { r = hb::hb_solve(circuit, b_dc, sources, options); }).empty());
+    CHECK(r.stats.damping_restarts == 1);
+    CHECK(r.stats.residual_norm < 1e-6);
+    options.damping = hb::HbDamping::Always;
+    hb::HbResult always;
+    CHECK(hb_error_message([&] { always = hb::hb_solve(circuit, b_dc, sources, options); }).empty());
+    CHECK(always.stats.damping_restarts == 0);
+    // Same circuit, same solution (both converged far below the tolerance).
+    CHECK(max_abs_difference(always.x_bar, r.x_bar) < 1e-9);
+    // DC components: a two-diode string carrying ~2.1 mA (each diode ~0.67 V).
+    CHECK(r.x_bar[0] == doctest::Approx(1.337).epsilon(1e-3));
+    CHECK(r.x_bar[13] == doctest::Approx(0.6686).epsilon(1e-3));
+}

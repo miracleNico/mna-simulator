@@ -205,6 +205,8 @@ def test_hb_solve_rejects_malformed_inputs() -> None:
 
 @pytest.mark.parametrize(("case", "options"), _hb_params())
 def test_corpus_hb_matches_the_oracle(case: Case, options: dict[str, Any]) -> None:
+    if case.deviation_for("hb") is not None:
+        pytest.skip("deliberate P3b change (2.4.1): checked by the differential deviation check")
     ref = _run("mna_reference", case.netlist_text, options)
     cur = _run("mna_simulation", case.netlist_text, options)
     if isinstance(ref, Exception) or isinstance(cur, Exception):

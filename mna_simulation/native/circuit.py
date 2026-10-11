@@ -6,7 +6,7 @@ handle, which owns the union CSC pattern of ``G``, ``C``, the unit gmin stamps
 and every device Jacobian footprint. Table layout of the spec dict passed to
 ``_core.build_circuit``::
 
-    {"n": int, "gmin": float,
+    {"n": int, "gmin": float, "node_count": int,
      "G" / "C" / "gmin_stamps": {"rows": int64, "cols": int64, "values": float64},
      "diodes": {"anode", "cathode": int64, "is": float64},
      "mos": {"drain", "gate", "source": int64, "beta", "vth", "lambda": float64,
@@ -14,6 +14,12 @@ and every device Jacobian footprint. Table layout of the spec dict passed to
      "bjt": {"collector", "base", "emitter": int64, "is", "bf", "br", "vaf", "var": float64,
              "sign": int32 (+1 NPN, -1 PNP)},
      "behavioral": {"node_p", "node_n": int64, "programs": [_core.Program, ...]}}
+
+``node_count`` (P3b, ``CPP_MIGRATION_PLAN.md`` 2.4.1): the unknowns ``[0, node_count)``
+are node voltages; the core appends one unit node-to-ground stamp per node to the gmin
+pattern, so ``G + gmin * gmin_stamps`` shunts every node (never a branch-current row) by
+gmin during gmin stepping. ``build_circuit`` infers it from the tables when the caller
+does not pass it (:func:`infer_node_count`); circuits that only evaluate devices pass 0.
 
 ``compile_device_functions`` is the engine behind
 ``solvers.compile_nl_functions``: it compiles the nonlinear rows of
@@ -40,6 +46,7 @@ __all__ = [
     "build_circuit",
     "compile_device_functions",
     "diode_table",
+    "infer_node_count",
     "mos_table",
     "triplets",
 ]
@@ -125,6 +132,82 @@ def behavioral_table(node_p: Sequence[int], node_n: Sequence[int], programs: Seq
     }
 
 
+def _table_column(table: dict[str, Any] | None, key: str) -> np.ndarray:
+    if table is None or key not in table:
+        return np.zeros(0, dtype=np.int64)
+    return np.asarray(table[key], dtype=np.int64).reshape(-1)
+
+
+def infer_node_count(
+    n: int,
+    *,
+    G: dict[str, np.ndarray] | None = None,
+    C: dict[str, np.ndarray] | None = None,
+    gmin_stamps: dict[str, np.ndarray] | None = None,
+    diodes: dict[str, np.ndarray] | None = None,
+    mos: dict[str, np.ndarray] | None = None,
+    bjt: dict[str, np.ndarray] | None = None,
+    behavioral: dict[str, Any] | None = None,
+) -> int:
+    """Number of node-voltage unknowns of a builder-ordered circuit (nodes first, then branch currents).
+
+    ``mna_builder`` numbers the nodes ``0 .. num_nodes - 1`` and the branch currents of V, L,
+    E and H after them. A branch-current unknown ``k`` of a source between nodes ``p`` and
+    ``q`` has the unit incidence pairs ``(k, p) = (p, k) = +1`` / ``(k, q) = (q, k) = -1`` with
+    ``p, q < k``, no diagonal ``G`` entry, no off-diagonal ``C`` entry (an inductor adds only
+    ``C[k, k]``), and is never a device terminal or a gmin stamp. The count is one past the
+    last unknown that does not look like that, so every branch current is excluded. A node
+    can only be missed in the degenerate case where it is numbered last and touches nothing
+    but voltage-defined branches through unit pairs to lower indices (none in the builder's
+    output). Callers that know the count (``problem.metadata["num_nodes"]``) should pass it.
+    """
+
+    size = int(n)
+    if size <= 0 or size > np.iinfo(np.int32).max:
+        return 0  # empty, or rejected by the core
+    node = np.zeros(size, dtype=bool)
+    for table, keys in (
+        (diodes, ("anode", "cathode")),
+        (mos, ("drain", "gate", "source")),
+        (bjt, ("collector", "base", "emitter")),
+        (behavioral, ("node_p", "node_n")),
+        (gmin_stamps, ("rows", "cols")),
+    ):
+        for key in keys:
+            index = _table_column(table, key)
+            node[index[(index >= 0) & (index < size)]] = True  # out-of-range indices: the core reports them
+    g_rows, g_cols = _table_column(G, "rows"), _table_column(G, "cols")
+    g_values = np.asarray(G["values"], dtype=np.float64).reshape(-1) if G is not None and "values" in G else np.zeros(0)
+    c_rows, c_cols = _table_column(C, "rows"), _table_column(C, "cols")
+    if g_values.shape != g_rows.shape or g_cols.shape != g_rows.shape or c_cols.shape != c_rows.shape:
+        return 0  # malformed: the core reports it
+    keep = (g_rows >= 0) & (g_cols >= 0) & (g_rows < size) & (g_cols < size)
+    g_rows, g_cols, g_values = g_rows[keep], g_cols[keep], g_values[keep]
+    keep = (c_rows >= 0) & (c_cols >= 0) & (c_rows < size) & (c_cols < size)
+    c_rows, c_cols = c_rows[keep], c_cols[keep]
+    node[g_rows[g_rows == g_cols]] = True
+    off = c_rows != c_cols
+    node[c_rows[off]] = True
+    node[c_cols[off]] = True
+    # Branch-like rows: a unit incidence pair (k, j) / (j, k) with equal sign and j < k, or an
+    # inductor whose terminals are both grounded (no G entry, only C[k, k]).
+    unit = np.abs(g_values) == 1.0
+    sign = (g_values > 0.0).astype(np.int64)
+    keys = (g_rows * size + g_cols) * 2 + sign
+    lower = unit & (g_cols < g_rows)
+    transposed = (g_cols * size + g_rows) * 2 + sign
+    paired = np.zeros(size, dtype=bool)
+    hits = lower & np.isin(transposed, keys[unit])
+    paired[g_rows[hits]] = True
+    has_g_row = np.zeros(size, dtype=bool)
+    has_g_row[g_rows] = True
+    c_diagonal = np.zeros(size, dtype=bool)
+    c_diagonal[c_rows[~off]] = True
+    branch_like = ~node & (paired | (~has_g_row & c_diagonal))
+    not_branch = np.flatnonzero(~branch_like)
+    return int(not_branch[-1]) + 1 if not_branch.size else 0
+
+
 def build_circuit(
     n: int,
     *,
@@ -136,10 +219,19 @@ def build_circuit(
     mos: dict[str, np.ndarray] | None = None,
     bjt: dict[str, np.ndarray] | None = None,
     behavioral: dict[str, Any] | None = None,
+    node_count: int | None = None,
 ) -> Any:
-    """Compile the tables into a ``_core.Circuit`` handle (see the module docstring for the layout)."""
+    """Compile the tables into a ``_core.Circuit`` handle (see the module docstring for the layout).
 
-    spec: dict[str, Any] = {"n": int(n), "gmin": float(gmin)}
+    ``node_count``: node-voltage unknowns ``[0, node_count)`` that get a node-to-ground gmin
+    stamp; ``None`` infers it (:func:`infer_node_count`), 0 adds none.
+    """
+
+    if node_count is None:
+        node_count = infer_node_count(
+            n, G=G, C=C, gmin_stamps=gmin_stamps, diodes=diodes, mos=mos, bjt=bjt, behavioral=behavioral
+        )
+    spec: dict[str, Any] = {"n": int(n), "gmin": float(gmin), "node_count": int(node_count)}
     for key, table in (
         ("G", G),
         ("C", C),
@@ -184,6 +276,7 @@ def compile_device_functions(
         mos=mos_table(mos_devices) if mos_devices else None,
         bjt=bjt_table(bjt_devices) if bjt_devices else None,
         behavioral=behavioral_table(rows, [-1] * len(rows), programs) if programs else None,
+        node_count=0,
     )
     core = require_core()
     device_f = core.device_f

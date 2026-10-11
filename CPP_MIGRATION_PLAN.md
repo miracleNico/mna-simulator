@@ -55,7 +55,11 @@ integer/float tables, one per device class, and calls `build_circuit`:
 | `bjt_level1` | (collector, base, emitter, is, bf, br, vaf, var, is_pnp) |
 | `behavioral` | (node_p, node_n, expression id, list of referenced unknowns) |
 
-Ground is index -1 everywhere. `build_circuit` forms the union CSR pattern of
+Ground is index -1 everywhere. Since P3b `build_circuit` also takes `node_count` (the node
+unknowns, numbered before the branch currents; inferred from the tables when not passed): each node
+gets a unit node-to-ground stamp in the gmin pattern, and the compiled circuit exposes its
+exponential junctions (`junctions()`: diodes, BJT base-emitter / base-collector) for junction
+limiting. `build_circuit` forms the union CSR pattern of
 the static matrices and every device Jacobian footprint, precomputes for each
 device the CSR slot of each of its Jacobian entries, and returns a `Circuit`
 handle exposing `n`, `nnz`, `pattern()`, `to_dense(which)`, `metadata()`. The
@@ -121,17 +125,22 @@ exception classes so `pytest.raises(SolverConvergenceError)` keeps working.
   up to 28 trials accepting the first scale that does not increase the finite
   residual norm, otherwise the best trial; convergence when `||F|| < f_tol` or
   `||dx|| < v_tol`; `NR_CONVERGENCE` when no scale reduces the residual or
-  `max_iter` is exhausted; `JACOBIAN_SINGULAR` on a singular factorization.
+  `max_iter` is exhausted; `JACOBIAN_SINGULAR` on a singular factorization. P3b
+  (2.4.1) adds strategies that only engage where this iteration fails or stalls, so
+  every run it solves is unchanged: the junction strategy (pnjlim, natural
+  monotonicity test) and, for `.op`, gmin continuation.
 - Gmin stepping stays in `PythonBackend.run` over `DEFAULT_GMIN_STEPS`, but
   the circuit is compiled once: the builder records a unit `gmin` stamp pattern
-  and the core forms `G_eff = G + gmin * gmin_pattern`. Retries happen only for
+  and the core forms `G_eff = G + gmin * gmin_pattern` (since P3b the pattern also holds
+  one node-to-ground stamp per node unknown, SPICE-style). Retries happen only for
   numerical codes (`NR_CONVERGENCE`, `JACOBIAN_SINGULAR`, `AC_ERROR`, numerical
   `HB_ERROR`); structural errors such as a zero-valued resistor are raised once.
   The final error after exhausting the steps is unchanged.
 - Time grid: `_transient_time_points` semantics (fixed step, snap to `t_stop`
   with the 1e-9 relative tolerance, `TRAN_ERROR` codes).
-- Level-1 MOS/BJT equations, `vt = 0.02585`, exp clipping at +/-80 for BJT,
-  `V_T = 0.025` and no clipping for diodes, PMOS/PNP sign conventions.
+- Level-1 MOS/BJT equations, `vt = 0.02585`, BJT exponential continued linearly
+  beyond +/-80 (P3b; was: clipped), `V_T = 0.025` and no clipping for diodes,
+  PMOS/PNP sign conventions.
 - Krylov auto-rank `ceil(0.5 n)`, method aliases, classification rule (dense
   Cholesky attempt only when n <= 256 on the sparse path), fallback to the
   direct solver when not converged, and the metadata fields consumed by tests.
@@ -154,7 +163,7 @@ the oracle must follow, a CHANGELOG entry in `tests/reference/README.md`):
 | Behaviour | Ruling | When |
 | --- | --- | --- |
 | `0` option values treated as unset (`tran_stop`, `tran_step`, `f_start`, `f_stop`, `points`, `harmonics`) | change: only `None` means unset; `t_stop = 0` returns the single initial sample, `t_step <= 0` is `TRAN_ERROR`, `points <= 0` is `AC_ERROR`, `harmonics <= 0` is `HB_ERROR` | applied for `.tran`/`.ac`; `.hb` in P4 |
-| Diode across an ideal source never converges; CMOS chains of 4+ stages fail at gmin 0 | improve, not parity: junction voltage-step limiting for `exp` devices and SPICE-style node-to-ground gmin during gmin stepping; corpus expectations for the affected cases updated when it lands | P3b |
+| Diode across an ideal source never converges; CMOS chains of 4+ stages fail at gmin 0 | improve, not parity: junction voltage-step limiting for `exp` devices and SPICE-style node-to-ground gmin during gmin stepping; corpus expectations for the affected cases updated when it lands | applied (P3b): when the damped Newton finds no damping scale or stalls (4 iterations at a scale <= 1/64), circuits with junctions switch to SPICE `pnjlim` on every junction before the damping loop (falling back to the plain step) plus the natural monotonicity test as a second acceptance rule; a failed `.op` retries with gmin continuation (1e-2 down to the requested gmin, shared `max_iter`, the final level must leave a nonsingular Newton matrix); node-to-ground gmin in the compiled gmin pattern. The clamped diode (1 V, 5 V) and 4/6/8-stage chains converge at gmin 0; runs the damped Newton solves without stalling are bitwise unchanged. Corpus: `diode_ideal_source`, `cmos_chain6_no_keepers` added as `Deviation`s |
 | `.ac` ignores `max_iter`, `v_tol`, `f_tol` for its operating point | change: pass the options through | applied |
 | `R = 0` raises `ZeroDivisionError` | change: `NETLIST_FATAL: '<name>' has zero resistance` from the builder, raised once (no gmin retries) | applied (also `rpi = 0` of a small-signal BJT) |
 | Singular linear transient step raises raw `LinAlgError` | change: `NR_CONVERGENCE` with the step time in the message (gmin stepping still applies) | applied |
@@ -163,9 +172,9 @@ the oracle must follow, a CHANGELOG entry in `tests/reference/README.md`):
 | `init_condition` strings ignored on linear `.op` and on `.tran` | change: `DEFAULT`/`RANDOM` (case-insensitive) set the Newton starting point everywhere nonlinear and are ignored with a diagnostic on linear paths; arrays are validated | applied |
 | `use_krylov = "false"` enables Krylov; `krylov_rank = 2.7` truncated | change: strict boolean and integer coercion, `ValueError` otherwise (HTTP 400) | applied |
 | Independent current source injects into `node1` (opposite of SPICE) | preserve: project convention used by the UI, demos and every test; documented | - |
-| Floating island fails at every gmin (gmin is stamped only across C, D and transistor terminals) | change together with node-to-ground gmin above; the pinned expectation moves from "fails" to "converges at the first gmin step that regularizes it" | P3b |
+| Floating island fails at every gmin (gmin is stamped only across C, D and transistor terminals) | change together with node-to-ground gmin above; the pinned expectation moves from "fails" to "converges at the first gmin step that regularizes it" | applied (P3b): converges at gmin 1e-12. Side effect, recorded: a gmin-defined operating point moves (capacitor-only node: V(b)/2 -> V(b)/3); corpus `floating_resistor_island` and `capacitor_only_node_gmin` carry `Deviation`s checked against equivalent netlists |
 | Inductor-only loops and C-only nodes are singular at DC; `C = 0` / `L = 0` silently skipped; negative C/L accepted; negative `vth` taken as magnitude; duplicate non-branch names stamped twice | preserve (physically or conventionally defensible); a parser diagnostic for duplicate names may be added later outside the core | - |
-| Level-1 BJT Jacobian disagrees with the clipped current beyond `|vbe/vt| > 80` | change in P3 together with junction voltage-step limiting: beyond the clip the exponential continues linearly (`exp(80) * (1 + x - 80)`), which keeps function and derivative consistent and the Newton matrix nonsingular. A plain zero slope was tried and rejected: it made the HB Newton Jacobian singular when an iterate crossed the clip (random BJT CE case). Until then the verbatim clipped slope is kept | P3b |
+| Level-1 BJT Jacobian disagrees with the clipped current beyond `|vbe/vt| > 80` | change in P3 together with junction voltage-step limiting: beyond the clip the exponential continues linearly (`exp(80) * (1 + x - 80)`), which keeps function and derivative consistent and the Newton matrix nonsingular. A plain zero slope was tried and rejected: it made the HB Newton Jacobian singular when an iterate crossed the clip (random BJT CE case). Until then the verbatim clipped slope is kept | applied (P3b): both clips (+80 and -80, `exp(-80) * (1 + x + 80)`), value and slope continuous; oracle parity of the device kernels is now checked inside the clip only |
 | `TRAN_ERROR` raises the base `CircuitSimulatorError` | change: map `TRAN_ERROR` to `NetlistError` (it is an input error, like `MOR_CONFIG`) | applied |
 | Time grid by repeated addition; snapping tolerance behaviour | preserve bit-for-bit (parity rule) | - |
 | Unknown `probe_nodes` ignored without MOR; decimation keeps the last sample so it can return `max_points + 1` | preserve (service layer, harmless) | - |
@@ -229,6 +238,24 @@ iterations with every summation order tried. The diode conductance spans 1e-16..
 samples, so the Newton matrix has a condition number near 1/eps and the reference's convergence
 relies on the unstructured rounding of the dense product. Consequence: phase B (FFT products) needs
 a damped HB Newton first; that damping is an "improve, not parity" change scheduled with P3b.
+
+**P3b result (applied in `cpp/src/analyses/hb.cpp`).** `hb_solve` has a damped Newton: residual
+backtracking (28 halvings, the first trial whose finite `||F||` does not exceed the current one; the
+undamped step when none does) after junction limiting of the K samples of every junction voltage
+(pnjlim per sample, the changed terminals transformed back with Gamma). By default
+(`HbDamping::OnFailure`) it runs only after the reference's undamped iteration breaks down (non-finite
+`||F||`, singular Newton matrix), restarting from `x_bar = 0` for the rest of `max_iter`: the undamped
+iteration stops at the first iterate with `||F|| < tol = 1e-6`, and on several corpus cases that
+iterate is 1e-9..3e-8 off the exact solution (the mixer's env node is an LC tank resonant at the
+5 MHz beat, |Z| ~ 4.3 kOhm), so a damped run, as close or closer to the exact solution, would not match
+the oracle within the differential tolerance. Damped from the start (`HbDamping::Always`) the mixer
+needs 11 Newton iterations instead of 38 (9 vs 36 with omega0 exactly 2 pi 5 MHz), and the BJT cases
+10-12 instead of 40-57; the damped restart now solves the two-diode DC string (`rand_diode_s2`, was
+"Singular HB Jacobian."). The O(K^2) Fourier-sum blocks (`HbOptions::fourier_sum_jacobian`,
+experimental, default off) now converge on the mixer with damping (14 iterations with the restart, 12
+damped from the start, the dense-product solution to 1e-9 at tol 1e-12), while the undamped iteration
+still overflows; `hb_solve` keeps the dense product. So phase B (FFT products) is unblocked, provided
+it damps; making `Always` the default needs the HB tolerance (or the oracle comparison) revisited.
 
 ### 2.7 Model-order reduction
 
@@ -357,7 +384,7 @@ function, differential run, audit, commit. The suite is green at every commit.
 | Windows/MSVC differences (`long` size, `/fp` model, libm last-bit differences, DLL loading) | `int64_t`/`double` only in interfaces, `/fp:precise`, `std::thread` instead of OpenMP, `delvewheel` for the KLU shared library, tolerances and determinism asserted per platform, CI on `windows-latest` from P0 |
 | KLU and BTF are LGPL-2.1+ | license texts shipped; static link only during phase 0-1; shared `mna_suitesparse` library inside the wheel from phase 2 so relinking is possible without rebuilding the extension |
 | HB memory and time at large n | block-structured assembly (2.6); document the limit (`nnz(G+J) * K^2` doubles); phase B if needed |
-| HB Newton converges on the mixer only through the rounding of the dense Jacobian product (2.6, P4 finding) | damped HB Newton (voltage-step limiting on the sampled junction voltages, residual-based backtracking) with P3b before any FFT/matrix-free HB; corpus `hb` cases are the gate |
+| HB Newton converges on the mixer only through the rounding of the dense Jacobian product (2.6, P4 finding) | mitigated (P3b): damped HB Newton (voltage-step limiting on the sampled junction voltages, residual-based backtracking), on after a breakdown by default; with it the Fourier-sum blocks converge on the mixer (2.6); corpus `hb` cases are the gate |
 | Expression evaluator parity with SymPy | the compiler and evaluator are tested against SymPy-evaluated vectors for every function in the allowed set, including `Heaviside(0)` and `Piecewise` ordering |
 | SymPy remains a dependency | only `exprc.py` imports it, at circuit-build time; acceptable |
 | Throughput regressions hidden by faster hardware | committed baselines and the perf gate compare speedup ratios, not absolute times |

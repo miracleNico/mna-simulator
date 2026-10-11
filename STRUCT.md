@@ -334,10 +334,12 @@ The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel a
 ### `tests/corpus.py`
 - Declarative differential corpus: `Case` (netlist, analyses with explicit parameters, tolerance class, tags, expected error) built from every netlist in the pre-existing tests, frozen copies of the four benchmark workloads, seeded random generators (RLC ladders and meshes, controlled sources, MOS inverter chains, BJT stages, linear sources, diode nets), and error/gmin cases.
 - Size budget per analysis (transient ~60 steps, AC 40 points, HB 8 harmonics except the GHz mixer); `iter_cases`, `iter_analyses`, `get_case`.
+- `Deviation`: a deliberate behaviour change of one analysis (a `CPP_MIGRATION_PLAN.md` 2.4.1 ruling, e.g. the P3b convergence changes), recorded on its `Case` with the oracle's expected outcome and an equivalent netlist or analytic answer for the live result (`Case.deviation_for`).
 
 ### `tests/differential/`
 - `compare.py`: runs one request through a package's own `SimulationService` and compares responses (status, labels, `dc_solution`, waveform, spectrum, matrices, contractual metadata, operating points) with per-class tolerances `linear` 1e-9/1e-12, `nonlinear` and `hb` 1e-6/1e-9, `mor` 5e-2/1e-6; error outcomes compare exception class and `.code`.
-- `test_reference_parity.py`: one parametrized test per corpus `(case, analysis)`, live `mna_simulation` against the oracle (marker `differential`, large circuits also `slow`).
+- `compare.check_deviation`: for an analysis with a `Deviation`, the oracle must still behave as recorded, the live package must succeed and match the oracle on the equivalent netlist (or the analytic operating point).
+- `test_reference_parity.py`: one parametrized test per corpus `(case, analysis)`, live `mna_simulation` against the oracle (marker `differential`, large circuits also `slow`); analyses with a `Deviation` go through `check_deviation`.
 - `test_harness_selftest.py`: oracle integrity (tree digest, distinct packages, no imports of `mna_simulation`), comparator sensitivity in every tolerance class, and corpus rules.
 
 ### `tests/reference/`
@@ -348,6 +350,9 @@ The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel a
 ### `tests/test_edge_cases.py`, `tests/EDGE_CASES.md`
 - Behaviour specification of the current core on edge cases (empty and single-node circuits, singular G, zero/negative values, parser conflicts, conditioning, time grid, non-convergence, `init_condition`, probes and decimation, Krylov, MOR, HB, AC, `show_matrix`), pinning exception classes, codes, and numbers.
 - `EDGE_CASES.md` lists every pinned case with a "looks intentional?" verdict and the highlights flagged as likely unintended; the rulings live in `CPP_MIGRATION_PLAN.md` section 2.4.1.
+
+### `tests/test_native_convergence.py`
+- P3b convergence improvements (`CPP_MIGRATION_PLAN.md` 2.4.1): junction limiting on a diode across an ideal source, unchanged reference iterations on the 1 ohm series versions, the transient junction strategy, gmin continuation on 4/6/8-stage CMOS chains, node-to-ground gmin on a floating island, BJT exponent extrapolation continuity, damped HB iteration counts and restart, and 1 vs 4 thread determinism on these paths.
 
 ### `tests/test_native_smoke.py`
 - Smoke tests of `_core`: version and build info, `klu_solve` against NumPy, `CoreError` codes for singular and malformed input, deterministic `parallel_row_sums`.

@@ -69,6 +69,32 @@ def _close(current: np.ndarray, reference: np.ndarray, rtol: float, atol: float 
     assert not bad.any(), (np.flatnonzero(bad)[:5], current[bad][:5], reference[bad][:5])
 
 
+BJT_VT = 0.02585
+BJT_EXP_CLIP = 80.0
+
+
+def _bjt_inside_clip(devices, x) -> bool:
+    """True when every Level-1 BJT junction of ``devices`` has |v / vt| <= 80 at state ``x``.
+
+    Beyond the clip the native kernel continues the exponential linearly (P3b,
+    CPP_MIGRATION_PLAN.md 2.4.1) while the oracle clips it, so oracle parity is only
+    checked inside; the extrapolation itself is tested in tests/test_native_convergence.py.
+    """
+
+    def v(index) -> float:
+        return 0.0 if int(index) == -1 else float(x[int(index)])
+
+    for device in devices:
+        vc, vb, ve = v(device["collector"]), v(device["base"]), v(device["emitter"])
+        if abs(vb - ve) / BJT_VT > BJT_EXP_CLIP or abs(vb - vc) / BJT_VT > BJT_EXP_CLIP:
+            return False
+    return True
+
+
+def _terminals_inside_clip(vc: float, vb: float, ve: float) -> bool:
+    return abs(vb - ve) / BJT_VT <= BJT_EXP_CLIP and abs(vb - vc) / BJT_VT <= BJT_EXP_CLIP
+
+
 def _bitwise(current: np.ndarray, reference: np.ndarray) -> bool:
     return current.shape == reference.shape and np.array_equal(
         np.ascontiguousarray(current, dtype=np.float64).view(np.uint64),
@@ -90,6 +116,9 @@ def test_compiled_f_and_jacobian_match_reference(case, monkeypatch: pytest.Monke
     )
     exponential = ref_solvers.is_nonlinear(reference.solver_f_str) or bool(reference.level1_bjt_devices)
     states = np.random.default_rng(sum(map(ord, case.name))).uniform(-1.5, 1.5, (N_STATES, n))
+    # Oracle parity only where every BJT junction is inside the exponent clip (P3b extrapolates beyond).
+    states = np.array([x for x in states if _bjt_inside_clip(reference.level1_bjt_devices, x)])
+    assert len(states) >= 200
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
         for x in states:
@@ -154,7 +183,9 @@ def test_level1_mos_facade_is_bit_identical() -> None:
 
 
 def test_level1_bjt_facade_matches_reference(monkeypatch: pytest.MonkeyPatch) -> None:
-    points = _terminal_points(3)
+    # Inside the exponent clip only (P3b extrapolates beyond it, the oracle clips).
+    points = np.array([p for p in _terminal_points(3) if _terminals_inside_clip(*p)])
+    assert len(points) >= 1000
     for device in BJT_DEVICES:
         for vc, vb, ve in points:
             currents, derivatives = solvers._level1_bjt_currents_and_derivatives(device, vc, vb, ve)
@@ -211,7 +242,11 @@ def test_region_boundaries_through_the_facade() -> None:
     bjt = BJT_DEVICES[0]
     clip, d_clip = solvers._level1_bjt_currents_and_derivatives(bjt, 5.0, 80 * 0.02585, 0.0)
     beyond, d_beyond = solvers._level1_bjt_currents_and_derivatives(bjt, 5.0, 6.0, 0.0)
-    assert beyond[0] == pytest.approx(clip[0], rel=1e-12) and d_beyond[0][1] == pytest.approx(d_clip[0][1], rel=1e-12)
+    # Beyond the clip the exponential continues linearly (P3b, 2.4.1): the current keeps growing
+    # with the clip-point slope, which is also the reported derivative.
+    assert d_beyond[0][1] == pytest.approx(d_clip[0][1], rel=1e-12)
+    slope = (beyond[0] - clip[0]) / (6.0 - 80 * 0.02585)
+    assert slope == pytest.approx(d_clip[0][1], rel=1e-6)
     currents, _ = solvers._level1_bjt_currents_and_derivatives(bjt, 0.3, 0.7, 0.1)
     assert currents[2] == -(currents[0] + currents[1])
 

@@ -40,10 +40,22 @@ Test ids are functions in `tests/test_edge_cases.py`.
 2. **A diode clamped by an ideal voltage source never converges** (5 V or 20 V, even with
    10 000 iterations). Damped Newton creeps about Vt per iteration. With 1 Ω in series it
    converges even at 1000 V.
+   **Decided (2.4.1), applied (P3b):** when the damped Newton stalls (4 iterations accepted at
+   a damping scale <= 1/64) or finds no damping scale, circuits with exponential junctions
+   switch to the junction strategy: SPICE `pnjlim` on every diode / BJT junction before the
+   damping loop (falling back to the plain step) and the natural monotonicity test as a
+   second acceptance rule. 1 V and 5 V now converge at gmin 0 to the exact answer (5 V:
+   I = -7.2e72 A); 20 V (exp(800) = inf) still fails. Circuits the damped Newton solves
+   without stalling are bit for bit unchanged.
 3. **CMOS inverter chains of 4 or more Level-1 stages do not converge at gmin=0.** Four
    stages succeed only at gmin=1e-5 (rails visibly pulled to 1.179 V / 8.5 mV). Six stages
    fail at every gmin ("Newton step could not reduce residual at iteration 1."). The corpus
    adds 10 Meg keeper resistors to its random chains to stay robust.
+   **Decided (2.4.1), applied (P3b):** a failed `.op` Newton solve retries inside the core with
+   gmin continuation (node-to-ground and device-terminal gmin from 1e-2 down to the requested
+   gmin, each level from the previous solution, sharing `max_iter`); 4, 6 and 8 stages now
+   converge at gmin 0 with the rails in place. During gmin stepping gmin is also stamped from
+   every node to ground.
 4. **`.ac` ignores `max_iter`, `v_tol` and `f_tol` for its internal operating point.**
    `solve_ac` calls `solve_dc_nr` with the defaults (10 000 / 1e-9 / 1e-9).
    **Decided (2.4.1), applied:** the options are passed through, so the AC operating point is
@@ -100,9 +112,9 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
 | Floating resistor island, *basic* gmin 0 | `SCE` `NR_CONVERGENCE` "Linear system is singular (G matrix): Singular matrix" | `test_floating_island_is_singular_at_gmin0` | yes |
-| Floating island, *service* | Fails at every gmin, because gmin is stamped only across C, D and Level-1 BJT/MOS terminals and never node-to-ground (unlike SPICE GMIN). Same error | `test_floating_island_fails_every_gmin_step_in_the_service` | unclear |
+| Floating island, *service* | Converges at gmin=1e-12: since P3b gmin stepping also stamps gmin from every node unknown to ground (never on branch rows), the island sits at 0 V; `metadata["gmin"] == 1e-12` and the response `G` carries the node stamps. Was: fails at every gmin, because gmin was stamped only across C, D and Level-1 BJT/MOS terminals and never node-to-ground (unlike SPICE GMIN). Same error | `test_floating_island_converges_at_the_first_gmin_step_in_the_service` (was `test_floating_island_fails_every_gmin_step_in_the_service`) | decided: node-to-ground gmin during gmin stepping (2.4.1) |
 | Capacitor-only internal node, *basic* | Same singular `NR_CONVERGENCE` | `test_capacitor_only_node_is_singular_at_gmin0` | yes |
-| Capacitor-only internal node, *service* | Succeeds at gmin=1e-12 (1k + 1T + 1T divider). I(V1) ≈ -5e-13 agrees with the analytic value to only ~7 digits (ill-conditioned) | `test_capacitor_only_node_is_solved_by_gmin_stepping_in_the_service` | yes |
+| Capacitor-only internal node, *service* | Succeeds at gmin=1e-12. The node voltage is defined by gmin alone: with node-to-ground gmin (P3b) V(c) = V(b)/3 (1T across C1, 1T + 1T at c), I(V1) ≈ -2.67e-12, agreeing with the analytic value to only ~7 digits (ill-conditioned). Was: the 1k + 1T + 1T divider, V(c) = V(b)/2, I(V1) ≈ -5e-13 | `test_capacitor_only_node_is_solved_by_gmin_stepping_in_the_service` | decided: node-to-ground gmin moves a gmin-defined operating point (2.4.1) |
 | Voltage-source loop (KVL-consistent or not) | Passes the parser (only *parallel* sources are checked). Singular `NR_CONVERGENCE`. The code says "NR" for a linear singular matrix | `test_voltage_source_loop_passes_the_parser_and_is_singular` | unclear (no topology check; misleading code) |
 | Inductor-only loop / parallel inductors | Passes the parser. Singular `NR_CONVERGENCE` for `.op` and for `.tran` (its OP) at every gmin | `test_inductor_only_loop_is_singular_at_dc_for_op_and_tran` | unclear |
 
@@ -135,17 +147,17 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
 | Values from 1e-15 to 1e9 in one circuit (1G/1m divider, 1e-15 Ω loads, 1e9 A source, 1f, 1n) | `.op` matches the analytic values to 1e-12 relative (currents up to 1e15 A). `.tran` is finite | `test_magnitude_spread_1e_minus15_to_1e9_in_one_circuit` | yes |
-| Diode directly across 5 V / 20 V source | `SCE` `NR_CONVERGENCE` "Solver did not converge after N iterations." (also at the default N=10 000, ~6 s) | `test_diode_clamped_by_an_ideal_source_never_converges` | no |
+| Diode directly across 1 V / 5 V / 20 V source | 1 V and 5 V converge at gmin 0 with `max_iter=200` to V = V1, I = -Is (exp(V1/0.025) - 1) (5 V: -7.2e72 A) through the P3b junction strategy (highlight 2). 20 V: `SCE` `NR_CONVERGENCE` "Newton step could not reduce residual at iteration N." (exp(800) overflows). Was: `NR_CONVERGENCE` "Solver did not converge after N iterations." for 5 V and 20 V (also at the default N=10 000, ~6 s) | `test_diode_clamped_by_an_ideal_source_converges_with_junction_limiting`, `test_diode_clamped_by_an_ideal_source_at_20v_still_fails` (was `test_diode_clamped_by_an_ideal_source_never_converges`) | decided: junction voltage-step limiting (2.4.1) |
 | Diode exp overflow | `f`/`J` evaluate to `inf` at 20 V (RuntimeWarning). Damped Newton treats non-finite trial residuals as +inf and halves the step | `test_diode_expression_overflows_to_inf` | yes |
 | Diode with 5 V / 100 V / 1000 V through 1 Ω | Converges (V_D = 0.842 / 0.921 / 0.979 V) and satisfies the device equation | `test_diode_huge_forward_bias_through_a_resistor_converges` | yes |
-| Level-1 BJT, `vbe/vt > 80` (`vt = 0.02585`) | `exp` argument clipped to [-80, 80]: currents are flat beyond 2.068 V, but the reported dIc/dVb stays at its clip value (2.24e21), so the Jacobian disagrees with the flat function | `test_level1_bjt_exponent_is_clipped_at_80_vt` | decided: keep until P3; a zero slope beyond the clip made the HB Newton Jacobian singular when an iterate crossed the clip, so P3 replaces the hard clip by junction limiting with linear extrapolation (2.4.1) |
+| Level-1 BJT, `vbe/vt > 80` (`vt = 0.02585`) | Beyond `|v/vt| = 80` the junction exponential continues linearly, `exp(80) * (1 + x - 80)` (and `exp(-80) * (1 + x + 80)` below -80), so the currents keep growing with the clip-point slope and dIc/dVb (2.24e21 at the clip) is that slope: value and derivative are continuous and consistent. Was: `exp` argument clipped to [-80, 80], currents flat beyond 2.068 V while the reported dIc/dVb stayed at its clip value | `test_level1_bjt_exponent_continues_linearly_beyond_80_vt` (was `test_level1_bjt_exponent_is_clipped_at_80_vt`) | decided: linear extrapolation together with junction limiting (2.4.1); a zero slope was rejected because it made the HB Newton Jacobian singular |
 | Level-1 BJT, `vbe/vt < -80` | Reverse saturation currents (pinned) | `test_level1_bjt_negative_clip_gives_reverse_saturation_currents` | yes |
 | Level-1 MOS, `vgs == vth` exactly | Off (`vgs <= vth`): zero current and zero derivatives. Region "off" | `test_level1_mos_exactly_at_threshold_is_off` | yes |
 | Level-1 MOS, `vds == vgs - vth` exactly | Saturation branch (`vds < vov` is triode). Model is C1-continuous at the boundary. Region "saturation" | `test_level1_mos_triode_saturation_boundary_uses_saturation_and_is_c1_continuous` | yes |
 | Level-1 MOS, `vd < vs` | Symmetric device: source and drain swap, current negative. Region "reverse". `vd == vs` takes the forward branch | `test_level1_mos_reverse_mode_swaps_source_and_drain` | yes |
 | PMOS polarity | `I = -I_nmos(-vd, -vg, -vs)`. Compiled path and direct function agree | `test_level1_pmos_polarity` | yes |
 | Negative `vth` in a Level-1 netlist | `abs()` applied: `-0.4` behaves as 0.4 | `test_level1_mos_negative_vth_is_taken_as_absolute_value` | unclear |
-| CMOS inverter chain, 3 / 4 / 6 stages, VIN=0, `max_iter=200` | 3: gmin 0 (rails within ~2e-9 V). 4: only gmin=1e-5, rails 1.179 V / 8.5 mV. 6: every gmin fails with `NR_CONVERGENCE` "Newton step could not reduce residual at iteration 1.". 10 Meg keepers give gmin 0 | `test_cmos_inverter_chain_dc_convergence_depends_on_depth` | no |
+| CMOS inverter chain, 3 / 4 / 6 stages, VIN=0, `max_iter=200` | All at gmin 0: 3 directly (rails within ~2e-9 V); 4 and 6 through the P3b gmin continuation of `.op` (rails within the f_tol stop, ~5e-7 V; 8 stages too). 10 Meg keepers give gmin 0 directly. Was: 4 only at gmin=1e-5 (rails 1.179 V / 8.5 mV), 6 failed at every gmin with `NR_CONVERGENCE` "Newton step could not reduce residual at iteration 1." | `test_cmos_inverter_chain_dc_converges_at_gmin_0_at_any_depth` (was `test_cmos_inverter_chain_dc_convergence_depends_on_depth`) | decided: gmin continuation and node-to-ground gmin (2.4.1) |
 
 ### Transient time grid
 
@@ -168,9 +180,9 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
 | Diode `.op` with `max_iter` 1 or 2 | `SCE` `NR_CONVERGENCE` "Solver did not converge after N iterations." | `test_nr_convergence_after_max_iter` | yes |
-| Nonlinear circuit plus floating island / MOS with a floating gate | `SCE` `JACOBIAN_SINGULAR` "Jacobian is singular at iteration 0." (*basic* and *service*) | `test_jacobian_singular_is_reachable` | yes |
+| Nonlinear circuit plus floating island / MOS with a floating gate | *basic* (gmin 0): `SCE` `JACOBIAN_SINGULAR` "Jacobian is singular at iteration 0." (the gmin continuation does not hide it: its final solve at the requested gmin must leave a nonsingular Newton matrix). *service*: converges at gmin=1e-12, node-to-ground gmin holds the floating nodes at 0 V (P3b). Was: `JACOBIAN_SINGULAR` at every gmin in the *service* too | `test_jacobian_singular_is_reachable` | decided: node-to-ground gmin (2.4.1) |
 | `.tran` Newton failure (array IC, `max_iter=1`) | `SCE` `NR_CONVERGENCE` "NR failed to converge at t=1.00e-07 s" | `test_transient_newton_failure_reports_the_time_point` | yes |
-| HB Newton, `max_iter=1` | `SCE` `HB_ERROR` "Harmonic balance solver did not converge within limit." The HB Newton is undamped and starts from x=0 (it also cannot climb a 2-diode DC string; see the corpus note in `random_diode_net`) | `test_harmonic_balance_newton_failure` | yes (undamped HB: unclear) |
+| HB Newton, `max_iter=1` | `SCE` `HB_ERROR` "Harmonic balance solver did not converge within limit." The HB Newton starts from x=0 with the reference's undamped iteration; since P3b a breakdown of it (non-finite residual or singular Newton matrix) restarts from x=0 with a damped Newton (residual backtracking, 28 halvings, pnjlim on the sampled junction voltages) for the rest of `max_iter`, which climbs the 2-diode DC string of `rand_diode_s2` (was: "Singular HB Jacobian."). Runs the undamped iteration solves are bit for bit unchanged | `test_harmonic_balance_newton_failure` | yes; damped restart decided (2.4.1 / 2.6) |
 | `.ac` on a diode circuit with `max_iter=1` | `SCE` `NR_CONVERGENCE` with the same message as `.op` with the same options: the AC operating point receives `max_iter`/`v_tol`/`f_tol` and equals the `.op` solution for them. Was: succeeds, the AC operating point ignored the options (10 000 / 1e-9 / 1e-9) while `.op` failed | `test_ac_operating_point_honours_max_iter` (was `test_ac_operating_point_ignores_max_iter`) | decided: pass the options through (2.4.1) |
 
 ### `init_condition`
@@ -253,8 +265,17 @@ Test ids are functions in `tests/test_edge_cases.py`.
 
 ## Differential corpus notes
 
-- The random MOS chain generator adds 10 Meg keepers because of highlight 3. The diode
-  generator skips HB on its two-diode DC string because the HB Newton is undamped.
+- The random MOS chain generator adds 10 Meg keepers because of highlight 3 (kept although P3b
+  makes keeperless chains converge, so the random cases stay oracle-comparable).
+- P3b deliberate changes are recorded per analysis as `corpus.Deviation` and checked by
+  `differential.compare.check_deviation` (the oracle must still fail or behave as recorded; the
+  live result must match the oracle on an equivalent netlist or an analytic answer):
+  `floating_resistor_island` op (converges at gmin 1e-12; equivalent netlist with the 1e-12 S
+  node shunts as resistors), `capacitor_only_node_gmin` op and tran (gmin-defined node moves
+  from V(b)/2 to V(b)/3; equivalent netlist with every gmin conductance as a resistor), the new
+  `diode_ideal_source` op (analytic answer) and `cmos_chain6_no_keepers` op (oracle on the keeper
+  version, 1e-6 absolute: the keeperless solve stops at f_tol), and `rand_diode_s2` hb (the
+  two-diode DC string HB, added now that the damped HB restart converges; success only).
 - `.ac` cases on circuits whose OP needs gmin stepping are avoided: with `max_iter` ignored
   (highlight 4), each failing gmin step can run 10 000 Newton iterations in the oracle. The
   live core now passes `max_iter` through (2.4.1); every corpus `ac` case converges at gmin 0

@@ -9,6 +9,12 @@
 //     G_eff = G + gmin * gmin_stamps can be formed for any gmin without a
 //     rebuild. Duplicates are summed in input order (the order the Python
 //     builder stamps, so the sums equal its dense +=).
+//   * node_count: unknowns [0, node_count) are node voltages (the builder
+//     orders nodes before branch currents). Each gets a unit node-to-ground
+//     stamp (i, i) appended to the gmin stamps (SPICE-style GMIN to ground,
+//     CPP_MIGRATION_PLAN.md 2.4.1, P3b), so g_effective(gmin) also shunts
+//     every node by gmin; branch-current rows never get one. 0 (the default)
+//     adds none.
 //   * Device tables: diodes (anode, cathode, Is), Level-1 MOS (drain, gate,
 //     source, beta, vth, lambda, sign = +1 NMOS / -1 PMOS), Level-1 BJT
 //     (collector, base, emitter, Is, Bf, Br, Vaf, Var, sign = +1 NPN / -1 PNP),
@@ -75,6 +81,7 @@ struct BehavioralTable {
 struct CircuitSpec {
     std::int64_t n = 0;
     double gmin = 0.0;  ///< the builder's gmin (informational; values exclude it)
+    std::int64_t node_count = 0;  ///< node-voltage unknowns [0, node_count) get node-to-ground gmin
     TripletList g;
     TripletList c;
     TripletList gmin_stamps;
@@ -113,6 +120,22 @@ inline constexpr int kBjtF = 3;     // c, b, e
 inline constexpr int kBjtJ = 9;     // rows (c, b, e) x cols (c, b, e)
 inline constexpr int kBehavioralF = 2;  // +I at p, -I at n; J: rows (p, n) x program unknowns
 
+/// Exponential pn junctions of the compiled circuit, for junction voltage-step
+/// limiting (SPICE pnjlim, mna/analyses/limiting.hpp). Junction j conducts
+/// from anode[j] to cathode[j] (-1 = ground) with I = is * (exp(v / vt) - 1)
+/// at v = V(anode) - V(cathode). Order: every diode (anode, cathode,
+/// vt = 0.025), then per Level-1 BJT its base-emitter and base-collector
+/// junctions (vt = 0.02585; NPN (b, e), (b, c); PNP (e, b), (c, b)).
+/// Junctions with both terminals on ground, or whose is is not a positive
+/// finite number (no critical voltage), are left out.
+/// vcrit = vt * ln(vt / (sqrt(2) * is)).
+struct Junctions {
+    std::vector<std::int32_t> anode, cathode;
+    std::vector<double> vt, is, vcrit;
+    std::size_t size() const noexcept { return anode.size(); }
+    bool empty() const noexcept { return anode.empty(); }
+};
+
 /// Immutable after construction; evaluation never mutates it, so one Circuit
 /// can be used from several threads at once.
 class Circuit : public std::enable_shared_from_this<Circuit> {
@@ -126,6 +149,8 @@ public:
     std::int32_t n() const noexcept { return n_; }
     std::int32_t nnz() const noexcept { return static_cast<std::int32_t>(row_idx_.size()); }
     double gmin() const noexcept { return gmin_; }
+    /// Node-voltage unknowns [0, node_count()) carrying a node-to-ground gmin stamp.
+    std::int32_t node_count() const noexcept { return node_count_; }
     bool has_nonlinear() const noexcept { return counts_.total() > 0; }
     const DeviceCounts& device_counts() const noexcept { return counts_; }
 
@@ -134,8 +159,10 @@ public:
     /// Pattern slot of (row, col), -1 if the entry is not in the pattern.
     std::int32_t slot(std::int32_t row, std::int32_t col) const noexcept;
 
+    /// Values in pattern order; Gmin holds the unit stamps of the builder's
+    /// gmin pattern plus one unit node-to-ground stamp per node unknown.
     const std::vector<double>& values(MatrixKind which) const noexcept;
-    /// G + gmin * gmin_stamps in pattern order.
+    /// G + gmin * gmin_stamps in pattern order (gmin = 0 gives G exactly).
     std::vector<double> g_effective(double gmin) const;
     /// Row-major dense n x n copy of a value array in pattern order.
     void scatter_dense(const double* pattern_values, double* dense) const;
@@ -168,6 +195,8 @@ public:
     const Mos& mos() const noexcept { return mos_; }
     const Bjt& bjt() const noexcept { return bjt_; }
     const Behavioral& behavioral() const noexcept { return behavioral_; }
+    /// Exponential junctions (diodes, BJT base-emitter / base-collector).
+    const Junctions& junctions() const noexcept { return junctions_; }
 
     /// Gather plan of one output vector (residual rows or pattern slots): the
     /// scratch entries that reach output o are src[ptr[o] .. ptr[o+1]), sorted
@@ -198,6 +227,7 @@ private:
     void build(const CircuitSpec& spec);
 
     std::int32_t n_ = 0;
+    std::int32_t node_count_ = 0;
     double gmin_ = 0.0;
     DeviceCounts counts_;
     std::vector<std::int32_t> col_ptr_;
@@ -207,6 +237,7 @@ private:
     Mos mos_;
     Bjt bjt_;
     Behavioral behavioral_;
+    Junctions junctions_;
     AssemblyMap map_;
 };
 

@@ -126,6 +126,8 @@ def test_the_corpus_has_nonlinear_op_cases() -> None:
 
 @pytest.mark.parametrize(("case", "options"), NONLINEAR_OPS)
 def test_native_op_converges_to_the_reference_operating_point(case, options, reference_pkg) -> None:
+    if case.deviation_for("op") is not None:
+        pytest.skip("deliberate P3b change (2.4.1): checked by the differential deviation check")
     max_iter = int(options.get("max_iter", 10000))
     reference = run_request(reference_pkg, case.netlist_text, "op", options)
     problem = build_mna_problem(parse_netlist_text(case.netlist_text))
@@ -151,15 +153,19 @@ def test_native_op_converges_to_the_reference_operating_point(case, options, ref
         (DIODE, {"max_iter": 0}),
         (DIODE + "R2 x y 1k\n", {}),
         ("VDD d 0 DC 1\nM1 d g 0 NMOS LEVEL1 1m 0.4 0.02 2f 1f\n", {}),
-        ("V1 a 0 DC 5\nD1 a 0 1e-14\n", {"max_iter": 60}),
+        ("V1 a 0 DC 5\nD1 a 0 1e-14\n", {"max_iter": 3}),
         ("V1 a 0 DC 1\nR1 a 0 1k\nR2 x y 1k\n", {}),
         ("C1 n1 0 1u\n", {}),
-        (_inverter_chain(6), {"max_iter": 200}),
+        (_inverter_chain(6), {"max_iter": 2}),
     ],
     ids=["max_iter_1", "max_iter_2", "max_iter_0", "jacobian_singular", "mos_floating_gate", "clamped_diode",
          "singular_g", "capacitor_only", "inverter_chain_6"],
 )
 def test_op_errors_match_the_reference(netlist: str, options: dict) -> None:
+    # At gmin 0 (build_and_run_basic) the P3b strategies keep these failures: the junction
+    # strategy and the gmin continuation share max_iter, and a structurally singular circuit
+    # stays singular. The clamped diode and the 6-stage chain converge with a normal budget
+    # (tests/test_native_convergence.py).
     with pytest.raises(Exception) as ref_exc:  # noqa: PT011 - compared below
         ref_build_and_run_basic(ref_parse(netlist), RefOptions(mode=RefMode.OP, **options))
     with pytest.raises(CircuitSimulatorError) as cur_exc:
@@ -385,9 +391,15 @@ def test_gmin_stepping_retries_numerical_failures_only(monkeypatch: pytest.Monke
         return real_run(problem, options)
 
     monkeypatch.setattr(python_backend, "run_basic_analysis", counting_run)
+    # An inconsistent voltage-source loop is singular at every gmin (node-to-ground gmin never
+    # touches branch rows). Was: a floating resistor island, which P3b node gmin now solves at
+    # the first gmin step.
     with pytest.raises(SolverConvergenceError):
-        _backend_run("V1 a 0 DC 1\nR1 a 0 1k\nR2 x y 1k\n", AnalysisMode.OP)
+        _backend_run("V1 a 0 DC 1\nV2 b 0 DC 2\nV3 a b DC 0.5\nR1 a 0 1k\n", AnalysisMode.OP)
     assert calls == list(DEFAULT_GMIN_STEPS)
+    calls.clear()
+    assert _backend_run("V1 a 0 DC 1\nR1 a 0 1k\nR2 x y 1k\n", AnalysisMode.OP).metadata["gmin"] == 1e-12
+    assert calls == [0.0, 1e-12]
     calls.clear()
     with pytest.raises(NetlistError) as exc:
         _backend_run("V1 a 0 DC 1\nR1 a b 1k\nC1 b 0 1u\n", AnalysisMode.TRAN, tran_stop=-1.0, tran_step=1e-4)
@@ -429,20 +441,26 @@ def test_problem_at_gmin_matches_a_build_at_that_gmin() -> None:
     circuit = parse_netlist_text(netlist)
     base = build_mna_problem(circuit, gmin=0.0)
     assert problem_at_gmin(base, circuit, 0.0) is base
+    # The view adds the native gmin pattern, which holds one node-to-ground stamp per node on
+    # top of the builder's device-terminal stamps (P3b, 2.4.1); build_mna_problem(gmin) only
+    # stamps the latter into its G.
+    nodes = base.metadata["num_nodes"]
+    node_diagonal = np.diag((np.arange(base.native.n) < nodes).astype(float))
     for gmin in DEFAULT_GMIN_STEPS[1:]:
         view = problem_at_gmin(base, circuit, gmin)
         rebuilt = build_mna_problem(circuit, gmin=gmin)
         assert view.native is base.native and view.gmin == gmin
-        np.testing.assert_allclose(view.G, rebuilt.G, rtol=1e-15, atol=0.0)
+        np.testing.assert_allclose(view.G, rebuilt.G + gmin * node_diagonal, rtol=1e-15, atol=0.0)
         assert view.metadata["G_nnz"] == rebuilt.metadata["G_nnz"]
         np.testing.assert_array_equal(view.C, rebuilt.C)
 
 
 def test_gmin_reported_by_the_service_matches_the_reference(reference_pkg, current_pkg) -> None:
+    # Was also: the 4-stage inverter chain at gmin 1e-5; it now converges at gmin 0 (P3b gmin
+    # continuation, tests/test_native_convergence.py).
     for netlist, mode, options in (
         ("V1 a 0 DC 1\nR1 a b 1k\nC1 b c 1u\nC2 c 0 1u\n", "op", {}),
         ("V1 a 0 DC 1\nR1 a b 1k\nC1 b c 1u\nC2 c 0 1u\n", "tran", {"t_stop": 1e-3, "t_step": 1e-4}),
-        (_inverter_chain(4), "op", {"max_iter": 200}),
     ):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")

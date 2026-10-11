@@ -195,7 +195,7 @@ nb::ndarray<nb::numpy, double> time_source_vector(const Circuit& circuit, In1D<d
 nb::tuple solve_op(const Circuit& circuit, In1D<double> b, nb::object x0, double gmin, std::int64_t max_iter,
                    double v_tol, double f_tol, int num_threads, bool use_krylov, const std::string& krylov_method,
                    double krylov_tol, std::int64_t krylov_max_iter, std::int64_t krylov_rank,
-                   const std::string& krylov_rank_mode) {
+                   const std::string& krylov_rank_mode, bool junction_limiting, bool gmin_continuation) {
     const auto n = static_cast<std::size_t>(circuit.n());
     check_size("solve_op", "b", b.shape(0), n);
     std::vector<double> start;
@@ -215,6 +215,8 @@ nb::tuple solve_op(const Circuit& circuit, In1D<double> b, nb::object x0, double
     options.f_tol = f_tol;
     options.num_threads = num_threads;
     options.krylov = krylov.options;
+    options.junction_limiting = junction_limiting;
+    options.gmin_continuation = gmin_continuation;
 
     mna::analyses::OpResult result;
     {
@@ -224,6 +226,11 @@ nb::tuple solve_op(const Circuit& circuit, In1D<double> b, nb::object x0, double
     nb::dict info;
     info["iterations"] = result.iterations;
     info["factorizations"] = result.factorizations;
+    info["junction_switches"] = result.junction_switches;
+    info["limited_steps"] = result.limited_steps;
+    info["monotonicity_accepts"] = result.monotonicity_accepts;
+    info["continuation_levels"] = result.continuation_levels;
+    info["continuation_used"] = result.continuation_used;
     info["krylov_stats"] = krylov_stat_list(result.krylov_stats, krylov);
     return nb::make_tuple(to_numpy(std::move(result.x), {n}), info);
 }
@@ -233,7 +240,7 @@ nb::tuple solve_transient(const Circuit& circuit, In1D<double> x0, In1D<double> 
                           std::int64_t max_iter, double v_tol, double f_tol, int num_threads, bool use_krylov,
                           const std::string& krylov_method, double krylov_tol, std::int64_t krylov_max_iter,
                           std::int64_t krylov_rank, const std::string& krylov_rank_mode, bool krylov_csr_operator,
-                          nb::object progress, std::int64_t progress_every) {
+                          nb::object progress, std::int64_t progress_every, bool junction_limiting) {
     const auto n = static_cast<std::size_t>(circuit.n());
     check_size("solve_transient", "x0", x0.shape(0), n);
     check_size("solve_transient", "b_dc", b_dc.shape(0), n);
@@ -250,6 +257,7 @@ nb::tuple solve_transient(const Circuit& circuit, In1D<double> x0, In1D<double> 
     options.newton.f_tol = f_tol;
     options.newton.num_threads = num_threads;
     options.newton.krylov = krylov.options;
+    options.newton.junction_limiting = junction_limiting;
     options.gmin = gmin;
     options.krylov_csr_operator = krylov_csr_operator;
     options.progress_every = progress_every;
@@ -268,6 +276,9 @@ nb::tuple solve_transient(const Circuit& circuit, In1D<double> x0, In1D<double> 
     }
     nb::dict info;
     info["newton_iterations"] = result.newton_iterations;
+    info["junction_switches"] = result.junction_switches;
+    info["limited_steps"] = result.limited_steps;
+    info["monotonicity_accepts"] = result.monotonicity_accepts;
     info["factorizations"] = result.factorizations;
     info["progress_calls"] = result.progress_calls;
     info["krylov_stats"] = krylov_stat_list(result.krylov_stats, krylov);
@@ -286,18 +297,24 @@ void bind_analyses_basic(nb::module_& m) {
     m.def("solve_op", &solve_op, "circuit"_a, "b"_a, "x0"_a = nb::none(), "gmin"_a = 0.0, "max_iter"_a = 10000,
           "v_tol"_a = 1e-9, "f_tol"_a = 1e-9, "num_threads"_a = 1, "use_krylov"_a = false, "krylov_method"_a = "auto",
           "krylov_tol"_a = 1e-9, "krylov_max_iter"_a = 2000, "krylov_rank"_a = 80, "krylov_rank_mode"_a = "manual",
+          "junction_limiting"_a = true, "gmin_continuation"_a = true,
           "DC operating point on G + gmin * gmin_stamps: one linear solve for a linear circuit, the damped\n"
-          "Newton driver (from x0, zeros when None) otherwise. Returns (x, info) with info keys iterations,\n"
-          "factorizations and krylov_stats (solve_linear stats dicts). GIL released.");
+          "Newton driver (from x0, zeros when None) otherwise, switching to the P3b junction strategy (pnjlim\n"
+          "and the natural monotonicity test) when it fails or stalls (junction_limiting), and retrying with\n"
+          "gmin continuation when it still fails (gmin_continuation). Returns (x, info) with info keys\n"
+          "iterations, factorizations, junction_switches, limited_steps, monotonicity_accepts,\n"
+          "continuation_levels, continuation_used and krylov_stats (solve_linear stats dicts). GIL released.");
     m.def("solve_transient", &solve_transient, "circuit"_a, "x0"_a, "t_grid"_a, "b_dc"_a, "source_rows"_a,
           "source_programs"_a, "gmin"_a = 0.0, "max_iter"_a = 10000, "v_tol"_a = 1e-9, "f_tol"_a = 1e-9,
           "num_threads"_a = 1, "use_krylov"_a = false, "krylov_method"_a = "auto", "krylov_tol"_a = 1e-9,
           "krylov_max_iter"_a = 2000, "krylov_rank"_a = 80, "krylov_rank_mode"_a = "manual",
           "krylov_csr_operator"_a = true, "progress"_a = nb::none(), "progress_every"_a = 0,
-          "Backward-Euler transient from the state x0 over t_grid. Returns (values (n, T), info) with info keys\n"
-          "newton_iterations, factorizations, progress_calls and krylov_stats. progress(step, t, x) runs\n"
-          "after every progress_every-th step and after the last one, with the GIL held; the rest of the\n"
-          "call runs without the GIL.");
+          "junction_limiting"_a = true,
+          "Backward-Euler transient from the state x0 over t_grid (junction_limiting: the Newton junction\n"
+          "strategy of solve_op on every step). Returns (values (n, T), info) with info keys newton_iterations,\n"
+          "junction_switches, limited_steps, monotonicity_accepts, factorizations, progress_calls and\n"
+          "krylov_stats. progress(step, t, x) runs after every progress_every-th step and after the last one,\n"
+          "with the GIL held; the rest of the call runs without the GIL.");
 }
 
 const mna::bindings::Registrar reg_analyses_basic{"analyses_basic", &bind_analyses_basic};

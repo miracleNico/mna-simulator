@@ -14,6 +14,7 @@
 #include <string>
 #include <utility>
 
+#include "mna/analyses/limiting.hpp"
 #include "mna/assembly.hpp"
 #include "mna/error.hpp"
 #include "mna/linear/klu_solver.hpp"
@@ -201,6 +202,51 @@ void hb_gram_columns(const FourierMatrices& fm, const double* g, std::int64_t co
     const auto rows = static_cast<Eigen::Index>(col_end);
     m.block(0, static_cast<Eigen::Index>(col_begin), rows, static_cast<Eigen::Index>(width)).noalias() =
         gamma_inv.leftCols(rows).transpose() * weighted;
+}
+
+void hb_fourier_sum_gram(std::int64_t harmonics, std::int64_t num_points, const double* g, const double* cos_table,
+                         const double* sin_table, double* gram) {
+    const std::int64_t S = 2 * harmonics + 1;
+    const std::int64_t K = num_points;
+    const std::int64_t top = 2 * harmonics;  // largest frequency index of a product
+    std::vector<double> c(idx(top) + 1, 0.0);
+    std::vector<double> sn(idx(top) + 1, 0.0);
+    for (std::int64_t m = 0; m <= top; ++m) {
+        double acc_c = 0.0;
+        double acc_s = 0.0;
+        for (std::int64_t k = 0; k < K; ++k) {
+            const std::int64_t r = (m * k) % K;
+            acc_c += g[k] * cos_table[r];
+            acc_s += g[k] * sin_table[r];
+        }
+        c[idx(m)] = acc_c;
+        sn[idx(m)] = acc_s;
+    }
+    auto signed_sin = [&sn](std::int64_t m) { return m >= 0 ? sn[idx(m)] : -sn[idx(-m)]; };
+    for (std::int64_t col = 0; col < S; ++col) {
+        for (std::int64_t row = 0; row <= col; ++row) {
+            double value = 0.0;
+            if (row == 0) {
+                value = col == 0 ? c[0] : (col % 2 == 1 ? c[idx((col + 1) / 2)] : sn[idx(col / 2)]);
+            } else {
+                const std::int64_t p = (row + 1) / 2;
+                const std::int64_t q = (col + 1) / 2;
+                const std::int64_t diff = p - q;
+                const std::int64_t sum = p + q;
+                const double c_diff = c[idx(diff >= 0 ? diff : -diff)];
+                if (row % 2 == 1 && col % 2 == 1) {  // cos p cos q
+                    value = 0.5 * (c_diff + c[idx(sum)]);
+                } else if (row % 2 == 0 && col % 2 == 0) {  // sin p sin q
+                    value = 0.5 * (c_diff - c[idx(sum)]);
+                } else if (row % 2 == 1) {  // cos p sin q
+                    value = 0.5 * (sn[idx(sum)] - signed_sin(diff));
+                } else {  // sin p cos q
+                    value = 0.5 * (sn[idx(sum)] + signed_sin(diff));
+                }
+            }
+            gram[idx(col * S + row)] = value;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -794,10 +840,13 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
     const std::int64_t n_frows = static_cast<std::int64_t>(sys.f_rows.size());
     // Fourier matrices, Y_bar and Newton values, N-vectors, samples, the Gram buffer and
     // per-thread scratch, plus the pattern indices; the factorization is added below.
+    // Two evaluations (current iterate and damping trial) of samples, currents, Jacobian values,
+    // f_bar and residual, plus x, delta, the trial and the limited step.
     const std::int64_t per_thread = K * kHbBlockChunk + 2 * n + nnz_c;
     const std::int64_t base_bytes =
         static_cast<std::int64_t>(sizeof(double)) *
-            (3 * K * K + 2 * assembled + 6 * N + (n_read + n_frows + device_slots) * K + threads * per_thread) +
+            (3 * K * K + 2 * assembled + 7 * N + 2 * (n_read + 2 * n_frows + device_slots) * K +
+             threads * per_thread) +
         static_cast<std::int64_t>(sizeof(std::int32_t)) * (N + 1 + assembled);
     stats.memory_bytes = base_bytes + direct.memory_bytes();
     stats.setup_seconds = seconds_since(t_setup);
@@ -810,7 +859,8 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
     const std::int64_t device_work = 64 * circuit.device_counts().total();
 
     // ---- Linear solve: Krylov first when requested, then the direct solver --
-    auto solve_system = [&](const std::vector<double>& values, std::vector<double>& rhs, const char* singular_text) {
+    // False when the direct solver finds the matrix singular.
+    auto solve_system = [&](const std::vector<double>& values, std::vector<double>& rhs) -> bool {
         if (options.use_krylov) {
             const auto t0 = Clock::now();
             const linear::CsrMatrix<double> A =
@@ -837,7 +887,7 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
             ++stats.linear_solves;
             if (accepted) {
                 rhs.swap(x);
-                return;
+                return true;
             }
         } else {
             ++stats.linear_solves;
@@ -847,7 +897,7 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
             direct.factor(values.data(), threads);
         } catch (const Error& e) {
             if (e.code() == ErrorCode::JacobianSingular) {
-                hb_error(singular_text);
+                return false;
             }
             throw;
         }
@@ -857,6 +907,7 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
         stats.factor_seconds += std::chrono::duration<double>(t2 - t1).count();
         direct.solve(rhs.data());
         stats.solve_seconds += seconds_since(t2);
+        return true;
     };
 
     auto finish = [&]() {
@@ -867,41 +918,46 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
 
     if (!nonlinear) {
         std::vector<double> rhs = b_bar;
-        solve_system(sys.y_values, rhs, kLinearFailed);
+        if (!solve_system(sys.y_values, rhs)) {
+            hb_error(kLinearFailed);
+        }
         result.x_bar = std::move(rhs);
         finish();
         return result;
     }
 
     // ---- Newton --------------------------------------------------------------
-    std::vector<double> x(idx(N), 0.0);
-    std::vector<double> residual(idx(N), 0.0);
-    std::vector<double> a_values(idx(assembled), 0.0);
-    std::vector<double> x_time(idx(n_read * K), 0.0);
-    std::vector<double> f_time(idx(n_frows * K), 0.0);
-    std::vector<double> g_time(idx(device_slots * K), 0.0);
-    std::vector<double> f_bar(idx(n_frows * K), 0.0);
-    const std::int64_t chunks = (K + kHbBlockChunk - 1) / kHbBlockChunk;
-    std::vector<double> gram(device_slots > 0 ? idx(S) * idx(S) : 0, 0.0);
-    std::vector<double> gram_scale(idx(S), 2.0 / static_cast<double>(K));
-    gram_scale[0] = 1.0 / static_cast<double>(K);
+    // One evaluation of an iterate: samples of the device-read unknowns, device currents and
+    // Jacobian values at every sample, f_bar, the residual and its norm.
+    struct Evaluation {
+        std::vector<double> x_time, f_time, g_time, f_bar, residual;
+        double norm = 0.0;
+    };
+    auto make_evaluation = [&]() {
+        Evaluation e;
+        e.x_time.assign(idx(n_read * K), 0.0);
+        e.f_time.assign(idx(n_frows * K), 0.0);
+        e.g_time.assign(idx(device_slots * K), 0.0);
+        e.f_bar.assign(idx(n_frows * K), 0.0);
+        e.residual.assign(idx(N), 0.0);
+        return e;
+    };
     const double* gamma = fm.gamma.data();
     const double* gamma_inv = fm.gamma_inv.data();
-
-    for (std::int64_t iteration = 0; iteration < options.max_iter; ++iteration) {
+    auto evaluate = [&](const std::vector<double>& xv, Evaluation& e) {
         const auto t_eval = Clock::now();
         // x(t_k) of the unknowns the devices read: x_reshaped @ Gamma_inv.T.
         note_threads(parallel_for(n_read * K, threads_for(n_read * K * S), [&](std::int64_t begin, std::int64_t end) {
-            for (std::int64_t e = begin; e < end; ++e) {
-                const std::int64_t q = e / K;
-                const std::int64_t k = e % K;
-                const double* xs = x.data() + idx(sys.read_nodes[idx(q)]) * idx(K);
+            for (std::int64_t q_k = begin; q_k < end; ++q_k) {
+                const std::int64_t q = q_k / K;
+                const std::int64_t k = q_k % K;
+                const double* xs = xv.data() + idx(sys.read_nodes[idx(q)]) * idx(K);
                 const double* row = gamma_inv + idx(k * S);
                 double acc = 0.0;
                 for (std::int64_t s = 0; s < S; ++s) {
                     acc += xs[s] * row[s];
                 }
-                x_time[idx(e)] = acc;
+                e.x_time[idx(q_k)] = acc;
             }
         }));
         // Device currents and Jacobian values at every sample (one slot per sample).
@@ -911,35 +967,36 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
             std::vector<double> js(idx(nnz_c) + 1, 0.0);
             for (std::int64_t k = begin; k < end; ++k) {
                 for (std::int64_t q = 0; q < n_read; ++q) {
-                    xs[idx(sys.read_nodes[idx(q)])] = x_time[idx(q * K + k)];
+                    xs[idx(sys.read_nodes[idx(q)])] = e.x_time[idx(q * K + k)];
                 }
                 assembly::evaluate(circuit, xs.data(), 0.0, 1, fs.data(), js.data());
                 for (std::int64_t q = 0; q < n_frows; ++q) {
-                    f_time[idx(q * K + k)] = fs[idx(sys.f_rows[idx(q)])];
+                    e.f_time[idx(q * K + k)] = fs[idx(sys.f_rows[idx(q)])];
                 }
                 for (std::int64_t d = 0; d < device_slots; ++d) {
-                    g_time[idx(d * K + k)] = js[idx(sys.device_slots[idx(d)])];
+                    e.g_time[idx(d * K + k)] = js[idx(sys.device_slots[idx(d)])];
                 }
             }
         }));
         // f_bar = i_nl_time @ Gamma.T on the device rows.
         note_threads(parallel_for(n_frows * K, threads_for(n_frows * K * K), [&](std::int64_t begin, std::int64_t end) {
-            for (std::int64_t e = begin; e < end; ++e) {
-                const std::int64_t q = e / K;
-                const std::int64_t s = e % K;
-                const double* ft = f_time.data() + idx(q * K);
+            for (std::int64_t q_s = begin; q_s < end; ++q_s) {
+                const std::int64_t q = q_s / K;
+                const std::int64_t s = q_s % K;
+                const double* ft = e.f_time.data() + idx(q * K);
                 const double* row = gamma + idx(s * K);
                 double acc = 0.0;
                 for (std::int64_t k = 0; k < K; ++k) {
                     acc += ft[k] * row[k];
                 }
-                f_bar[idx(e)] = acc;
+                e.f_bar[idx(q_s)] = acc;
             }
         }));
         // residual = (Y_bar x_bar + f_bar) - b_bar
+        std::vector<double>& residual = e.residual;
         std::fill(residual.begin(), residual.end(), 0.0);
         for (std::int64_t j = 0; j < n; ++j) {
-            const double* xj = x.data() + idx(j * K);
+            const double* xj = xv.data() + idx(j * K);
             for (std::int32_t s = cp[idx(j)]; s < cp[idx(j) + 1]; ++s) {
                 double* out = residual.data() + idx(ri[idx(s)]) * idx(K);
                 const double g = g_eff[idx(s)];
@@ -960,7 +1017,7 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
         }
         for (std::int64_t q = 0; q < n_frows; ++q) {
             double* out = residual.data() + idx(sys.f_rows[idx(q)]) * idx(K);
-            const double* fb = f_bar.data() + idx(q * K);
+            const double* fb = e.f_bar.data() + idx(q * K);
             for (std::int64_t s = 0; s < K; ++s) {
                 out[s] += fb[s];
             }
@@ -970,15 +1027,165 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
             residual[idx(i)] -= b_bar[idx(i)];
             sum_sq += residual[idx(i)] * residual[idx(i)];
         }
-        const double norm = std::sqrt(sum_sq);
+        e.norm = std::sqrt(sum_sq);
         stats.evaluate_seconds += seconds_since(t_eval);
-        if (!std::isfinite(norm)) {
+    };
+
+    // Junction limiting on the samples (P3b): the non-ground junction terminals and their
+    // position among the device-read unknowns.
+    const circuit::Junctions& junctions = circuit.junctions();
+    const bool limiting = options.damping != HbDamping::Off && options.junction_limiting && !junctions.empty();
+    std::vector<std::int32_t> junction_nodes;  // unknowns
+    std::vector<std::int64_t> junction_read;   // their index in sys.read_nodes
+    if (limiting) {
+        std::vector<char> terminal(idx(n), 0);
+        for (std::size_t j = 0; j < junctions.size(); ++j) {
+            for (const std::int32_t node : {junctions.anode[j], junctions.cathode[j]}) {
+                if (node >= 0) {
+                    terminal[idx(node)] = 1;
+                }
+            }
+        }
+        for (std::int64_t q = 0; q < n_read; ++q) {
+            const std::int32_t node = sys.read_nodes[idx(q)];
+            if (terminal[idx(node)] != 0) {
+                junction_nodes.push_back(node);
+                junction_read.push_back(q);
+            }
+        }
+    }
+    const std::int64_t n_junction_nodes = static_cast<std::int64_t>(junction_nodes.size());
+
+    std::vector<double> x(idx(N), 0.0);
+    std::vector<double> delta(idx(N), 0.0);
+    std::vector<double> x_trial(idx(N), 0.0);
+    std::vector<double> limited(limiting ? idx(N) : 0, 0.0);
+    std::vector<double> new_time(idx(n_junction_nodes * K), 0.0);
+    std::vector<double> a_values(idx(assembled), 0.0);
+    const std::int64_t chunks = (K + kHbBlockChunk - 1) / kHbBlockChunk;
+    std::vector<double> gram(device_slots > 0 ? idx(S) * idx(S) : 0, 0.0);
+    std::vector<double> gram_scale(idx(S), 2.0 / static_cast<double>(K));
+    gram_scale[0] = 1.0 / static_cast<double>(K);
+    std::vector<double> fourier_cos;
+    std::vector<double> fourier_sin;
+    if (options.fourier_sum_jacobian) {
+        fourier_cos.resize(idx(K));
+        fourier_sin.resize(idx(K));
+        for (std::int64_t r = 0; r < K; ++r) {
+            fourier_cos[idx(r)] = std::cos(fourier_angle(1, r, K));
+            fourier_sin[idx(r)] = std::sin(fourier_angle(1, r, K));
+        }
+    }
+
+    // The junction-limited step: samples of x + delta at the junction terminals, pnjlim per
+    // sample against the samples of x (limit_junctions on one sample at a time), and the
+    // changed terminals transformed back with Gamma. False when nothing was limited.
+    auto limit_step = [&](const Evaluation& current) {
+        for (std::int64_t q = 0; q < n_junction_nodes; ++q) {
+            const std::int64_t base = static_cast<std::int64_t>(junction_nodes[idx(q)]) * K;
+            for (std::int64_t s = 0; s < S; ++s) {
+                x_trial[idx(base + s)] = x[idx(base + s)] + delta[idx(base + s)];
+            }
+            for (std::int64_t k = 0; k < K; ++k) {
+                const double* row = gamma_inv + idx(k * S);
+                double acc = 0.0;
+                for (std::int64_t s = 0; s < S; ++s) {
+                    acc += x_trial[idx(base + s)] * row[s];
+                }
+                new_time[idx(q * K + k)] = acc;
+            }
+        }
+        std::vector<double> x_old(idx(n), 0.0);
+        std::vector<double> x_new(idx(n), 0.0);
+        std::vector<char> changed(idx(n_junction_nodes), 0);
+        bool any = false;
+        for (std::int64_t k = 0; k < K; ++k) {
+            for (std::int64_t q = 0; q < n_junction_nodes; ++q) {
+                const auto node = idx(junction_nodes[idx(q)]);
+                x_old[node] = current.x_time[idx(junction_read[idx(q)] * K + k)];
+                x_new[node] = new_time[idx(q * K + k)];
+            }
+            if (limit_junctions(circuit, x_old.data(), x_new.data()) == 0) {
+                continue;
+            }
+            any = true;
+            for (std::int64_t q = 0; q < n_junction_nodes; ++q) {
+                const double v = x_new[idx(junction_nodes[idx(q)])];
+                if (v != new_time[idx(q * K + k)]) {
+                    new_time[idx(q * K + k)] = v;
+                    changed[idx(q)] = 1;
+                }
+            }
+        }
+        if (!any) {
+            return false;
+        }
+        limited = delta;
+        for (std::int64_t q = 0; q < n_junction_nodes; ++q) {
+            if (changed[idx(q)] == 0) {
+                continue;
+            }
+            const std::int64_t base = static_cast<std::int64_t>(junction_nodes[idx(q)]) * K;
+            const double* samples = new_time.data() + idx(q * K);
+            for (std::int64_t s = 0; s < S; ++s) {
+                const double* row = gamma + idx(s * K);
+                double acc = 0.0;
+                for (std::int64_t k = 0; k < K; ++k) {
+                    acc += row[k] * samples[k];
+                }
+                limited[idx(base + s)] = acc - x[idx(base + s)];
+            }
+        }
+        return true;
+    };
+
+    Evaluation current = make_evaluation();
+    Evaluation trial = make_evaluation();
+    // Backtracking on `step` from x: halve up to kHbDampingTrials times and accept the first
+    // trial whose residual norm does not exceed the current one (the trial's evaluation is
+    // the next iteration's). False when no trial qualifies.
+    auto try_step = [&](const std::vector<double>& step) {
+        double scale = 1.0;
+        for (int t = 0; t < kHbDampingTrials; ++t) {
+            for (std::int64_t i = 0; i < N; ++i) {
+                x_trial[idx(i)] = x[idx(i)] + step[idx(i)] * scale;
+            }
+            evaluate(x_trial, trial);
+            if (std::isfinite(trial.norm) && trial.norm <= current.norm) {
+                if (scale < 1.0) {
+                    ++stats.damped_steps;
+                }
+                return true;
+            }
+            scale *= 0.5;
+        }
+        return false;
+    };
+
+    // The reference's undamped iteration runs first unless damping is Always; with OnFailure a
+    // breakdown (non-finite residual, singular Newton matrix) restarts from x_bar = 0 with the
+    // damped iteration for the rest of the budget.
+    bool damped = options.damping == HbDamping::Always;
+    auto restart_damped = [&]() {
+        if (damped || options.damping != HbDamping::OnFailure) {
+            return false;
+        }
+        damped = true;
+        ++stats.damping_restarts;
+        std::fill(x.begin(), x.end(), 0.0);
+        evaluate(x, current);
+        return true;
+    };
+
+    evaluate(x, current);
+    for (std::int64_t iteration = 0; iteration < options.max_iter; ++iteration) {
+        if (!std::isfinite(current.norm) && !restart_damped()) {
             // The reference keeps iterating on non-finite values until max_iter.
             hb_error(kNotConverged);
         }
-        if (norm < options.tol) {
+        if (current.norm < options.tol) {
             stats.newton_iterations = iteration;
-            stats.residual_norm = norm;
+            stats.residual_norm = current.norm;
             result.x_bar = std::move(x);
             finish();
             return result;
@@ -992,18 +1199,23 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
         // column chunks (the unit of parallel work, independent of the thread count), then
         // block[a, b] = D[a] * M[min(a, b), max(a, b)].
         for (std::int64_t d = 0; d < device_slots; ++d) {
-            const double* g = g_time.data() + idx(d * K);
-            note_threads(parallel_for(chunks, threads_for(K * K * S / 2), [&](std::int64_t begin, std::int64_t end) {
-                std::vector<double> scratch(idx(K) * idx(kHbBlockChunk));
-                for (std::int64_t item = begin; item < end; ++item) {
-                    // Chunk c costs ~ c + 1 (rows [0, c1)); interleave cheap and costly chunks so the
-                    // contiguous item ranges of parallel_for carry similar work.
-                    const std::int64_t c = item % 2 == 0 ? item / 2 : chunks - 1 - item / 2;
-                    const std::int64_t c0 = c * kHbBlockChunk;
-                    const std::int64_t c1 = (std::min)(K, c0 + kHbBlockChunk);
-                    hb_gram_columns(fm, g, c0, c1, scratch.data(), gram.data());
-                }
-            }));
+            const double* g = current.g_time.data() + idx(d * K);
+            if (options.fourier_sum_jacobian) {
+                hb_fourier_sum_gram(H, K, g, fourier_cos.data(), fourier_sin.data(), gram.data());
+            } else {
+                const int gram_threads = threads_for(K * K * S / 2);
+                note_threads(parallel_for(chunks, gram_threads, [&](std::int64_t begin, std::int64_t end) {
+                    std::vector<double> scratch(idx(K) * idx(kHbBlockChunk));
+                    for (std::int64_t item = begin; item < end; ++item) {
+                        // Chunk c costs ~ c + 1 (rows [0, c1)); interleave cheap and costly chunks so the
+                        // contiguous item ranges of parallel_for carry similar work.
+                        const std::int64_t c = item % 2 == 0 ? item / 2 : chunks - 1 - item / 2;
+                        const std::int64_t c0 = c * kHbBlockChunk;
+                        const std::int64_t c1 = (std::min)(K, c0 + kHbBlockChunk);
+                        hb_gram_columns(fm, g, c0, c1, scratch.data(), gram.data());
+                    }
+                }));
+            }
             note_threads(parallel_for(K, threads_for(K * K * 8), [&](std::int64_t begin, std::int64_t end) {
                 for (std::int64_t b = begin; b < end; ++b) {
                     const std::int64_t start = sys.block_col_start[idx(d * K + b)];
@@ -1020,15 +1232,50 @@ HbResult hb_solve(const circuit::Circuit& circuit, const double* b_dc, const std
         }
         stats.jacobian_seconds += seconds_since(t_jac);
 
-        // delta = solve(J, -residual); x_bar = x_bar + delta
-        for (double& v : residual) {
-            v = -v;
-        }
-        solve_system(a_values, residual, kSingularJacobian);
+        // delta = solve(J, -residual)
         for (std::int64_t i = 0; i < N; ++i) {
-            x[idx(i)] = x[idx(i)] + residual[idx(i)];
+            delta[idx(i)] = -current.residual[idx(i)];
         }
+        const bool solved = solve_system(a_values, delta);
         stats.newton_iterations = iteration + 1;
+        if (!solved) {
+            if (restart_damped()) {
+                continue;
+            }
+            hb_error(kSingularJacobian);
+        }
+
+        if (!damped) {
+            // The reference: x_bar = x_bar + delta.
+            for (std::int64_t i = 0; i < N; ++i) {
+                x[idx(i)] = x[idx(i)] + delta[idx(i)];
+            }
+            evaluate(x, current);
+            continue;
+        }
+        // Damped step (P3b): the junction-limited step first (when the limiter changed the
+        // update), then the plain step; when no trial of either reduces ||F||, the reference's
+        // undamped step.
+        bool accepted = false;
+        if (limiting && limit_step(current)) {
+            ++stats.limited_steps;
+            accepted = try_step(limited);
+            if (!accepted) {
+                ++stats.limit_fallbacks;
+            }
+        }
+        if (!accepted) {
+            accepted = try_step(delta);
+        }
+        if (!accepted) {
+            ++stats.undamped_steps;
+            for (std::int64_t i = 0; i < N; ++i) {
+                x_trial[idx(i)] = x[idx(i)] + delta[idx(i)];
+            }
+            evaluate(x_trial, trial);
+        }
+        std::swap(x, x_trial);
+        std::swap(current, trial);
     }
     finish();
     hb_error(kNotConverged);

@@ -130,6 +130,8 @@ def _tran_analyses():
     for case, _index, mode, options in iter_analyses():
         if mode != "tran" or options.get("use_mor") or case.expects_error is not None:
             continue
+        if case.deviation_for("tran") is not None:
+            continue  # a deliberate P3b change (2.4.1), checked by the differential deviation check
         params.append(pytest.param(case, options, id=f"{case.name}-{len(params)}"))
     return params
 

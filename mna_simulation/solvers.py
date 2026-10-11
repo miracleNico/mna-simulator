@@ -109,6 +109,7 @@ def _evaluate_device_dicts(
         size,
         mos=mos_table(mos_devices) if mos_devices else None,
         bjt=bjt_table(bjt_devices) if bjt_devices else None,
+        node_count=0,
     )
     x = np.ascontiguousarray(np.asarray(x_values, dtype=float).reshape(-1)[:size])
     f, jacobian = _native_core().device_f_jacobian_dense(circuit, x, 0.0)
