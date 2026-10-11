@@ -4,6 +4,13 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
+    # Build the wheels whenever the compiled extension or its packaging changes;
+    # the pure-Python package is covered by ci.yml on every push.
+    branches: [dev, main]
+    paths:
+      - "cpp/**"
+      - "pyproject.toml"
+      - ".github/workflows/wheels.yml"
 
 jobs:
   wheels:
