@@ -570,6 +570,76 @@ def solve_transient(
     return WaveformResult(time=t_points, values=values, labels=problem.metadata["labels"])
 
 
+def _ac_thread_count(num_threads: object) -> int:
+    """Threads for the native AC sweep: a positive integer as given, anything else 1.
+
+    The service replaces ``None``/``"auto"`` by the leased count before the
+    backend runs; direct callers that leave it unset get a serial sweep.
+    """
+
+    if isinstance(num_threads, (int, np.integer)) and not isinstance(num_threads, bool) and num_threads > 0:
+        return int(num_threads)
+    return 1
+
+
+def _ac_krylov_entry(
+    entry: dict[str, object],
+    n: int,
+    krylov_method: str,
+    resolved_rank: int,
+    rank_mode: str,
+    krylov_max_iter: int,
+) -> dict[str, object]:
+    """The ``krylov_stats`` entry ``solve_linear`` records for one AC frequency.
+
+    Same keys and values as ``native.linalg.krylov_solve_linear`` on the dense
+    complex system the pre-native AC loop passed (operator storage ``dense``
+    on the small-system kernels, ``csr`` on the SciPy-semantics ones), plus
+    ``used_direct_fallback``.
+    """
+
+    nnz = int(entry["matrix_nnz"])
+    density = float(nnz / (n * n)) if n > 0 else 0.0
+    route = str(entry["route"])
+    info: dict[str, object] = {"method": entry["method"], "engine": "mna_core"}
+    if entry["scipy_semantics"]:
+        info.update(
+            {
+                "operator_storage": "csr",
+                "matrix_nnz": nnz,
+                "matrix_density": density,
+                "converged": bool(entry["converged"]),
+                "iterations": int(entry["iterations"]),
+                "relative_residual": float(entry["relative_residual"]),
+                "iteration_budget": int(entry["iteration_budget"]),
+                "effective_restart": entry["effective_restart"],
+                "exit_code": int(entry["exit_code"]),
+            }
+        )
+    else:
+        info.update(
+            {
+                "converged": bool(entry["converged"]),
+                "iterations": int(entry["iterations"]),
+                "relative_residual": float(entry["relative_residual"]),
+            }
+        )
+    info["requested_method"] = krylov_method
+    info["matrix_kind"] = entry["matrix_kind"]
+    info["route"] = route
+    info["matrix_dimension"] = n
+    info["matrix_nnz"] = info.get("matrix_nnz", nnz)
+    info["matrix_density"] = info.get("matrix_density", density)
+    info["operator_storage"] = info.get("operator_storage", "dense")
+    info["resolved_rank"] = resolved_rank
+    info["rank_mode"] = rank_mode
+    info["iteration_budget"] = info.get("iteration_budget", int(krylov_max_iter) if route == "general" else resolved_rank)
+    if route == "general":
+        info["effective_restart"] = info.get("effective_restart", min(resolved_rank, n))
+    info["threads_used"] = int(entry["threads_used"])
+    return {**info, "used_direct_fallback": bool(entry["used_direct_fallback"])}
+
+
 def solve_ac(
     problem: MnaProblem,
     f_start: float,
@@ -582,18 +652,42 @@ def solve_ac(
     krylov_rank: int | str | None = "auto",
     krylov_method: str = "auto",
     krylov_stats: list[dict[str, object]] | None = None,
+    *,
+    max_iter: int = 10000,
+    v_tol: float = 1e-9,
+    f_tol: float = 1e-9,
+    num_threads: int | str | None = 1,
 ) -> SpectrumResult:
-    """Solve linear small-signal AC response over a frequency sweep."""
+    """Solve the small-signal AC response over a linear frequency sweep (native core).
+
+    Nonlinear circuits are linearized at the ``b_dc`` operating point of
+    :func:`solve_dc_nr`, which receives ``max_iter``/``v_tol``/``f_tol``
+    (CPP_MIGRATION_PLAN.md 2.4.1). The sweep runs in ``_core.ac_sweep``:
+    ``G + gmin * gmin_stamps + J(x_op) + j*omega*C`` in the compiled circuit's
+    pattern, complex KLU per frequency (or the Krylov kernels with
+    ``solve_linear``'s acceptance and fallback rule, recording the same
+    ``krylov_stats`` entries), parallel over frequencies on ``num_threads``
+    threads with bitwise identical results for any thread count.
+    ``points <= 0`` and a singular system raise ``AC_ERROR``; ``f_start = 0``
+    is a plain DC point.
+    """
+
+    if points is not None and points <= 0:
+        error_handler(f"AC_ERROR: AC sweep needs at least one frequency point (points = {points}).")
 
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
     level1_devices = problem.level1_mos_devices
     level1_bjt_devices = problem.level1_bjt_devices
     spectrum_metadata: dict[str, object] = {}
+    x_op: np.ndarray | None = None
     if is_nonlinear(solver_f_str) or level1_devices or level1_bjt_devices:
         dc_solution = solve_dc_nr(
             problem.G,
             solver_f_str,
             problem.b_dc,
+            max_iter=max_iter,
+            v_tol=v_tol,
+            f_tol=f_tol,
             use_krylov=use_krylov,
             krylov_tol=krylov_tol,
             krylov_max_iter=krylov_max_iter,
@@ -604,14 +698,7 @@ def solve_ac(
             level1_mos_devices=level1_devices,
             level1_bjt_devices=level1_bjt_devices,
         )
-        f_func, Jf_func = compile_nl_functions(
-            solver_f_str,
-            problem.G.shape[0],
-            level1_mos_devices=level1_devices,
-            level1_bjt_devices=level1_bjt_devices,
-        )
-        jacobian = np.asarray(Jf_func(*dc_solution.flatten()), dtype=float)
-        G_linearized = problem.G + jacobian
+        x_op = np.ascontiguousarray(np.asarray(dc_solution, dtype=float).reshape(-1))
         spectrum_metadata["op_used"] = True
         spectrum_metadata["operating_point"] = {
             "labels": problem.metadata["labels"],
@@ -619,36 +706,55 @@ def solve_ac(
         }
         spectrum_metadata["linearized_device_count"] = len(level1_devices) + len(level1_bjt_devices)
     else:
-        G_linearized = problem.G
         spectrum_metadata["op_used"] = False
         spectrum_metadata["linearized_device_count"] = 0
 
-    frequencies = np.linspace(f_start, f_stop, points)
-    responses = np.zeros((problem.G.shape[0], points))
+    circuit = problem.native
+    if circuit is None:
+        # Only a behavioral expression the native VM cannot compile leaves no circuit, and the
+        # operating point above has already raised the reference error for it.
+        error_handler("NETLIST_FATAL: The circuit could not be compiled for the native core.")
+    n = int(circuit.n)
 
-    for index, frequency in enumerate(frequencies):
-        omega = 2 * np.pi * frequency
-        system = G_linearized + 1j * omega * problem.C
-        try:
-            solution = solve_linear(
-                system,
-                problem.b_ac,
-                use_krylov=use_krylov,
-                krylov_tol=krylov_tol,
-                krylov_max_iter=krylov_max_iter,
-                krylov_restart=krylov_restart,
-                krylov_rank=krylov_rank,
-                krylov_method=krylov_method,
-                krylov_stats=krylov_stats,
-            )
-        except np.linalg.LinAlgError as exc:
-            error_handler(f"AC_ERROR: AC solve failed at frequency {frequency:.3e} Hz.")
-            raise exc
-        responses[:, index] = np.abs(solution.flatten())
+    frequencies = np.linspace(f_start, f_stop, points)
+    options: dict[str, object] = {"use_krylov": bool(use_krylov)}
+    resolved_rank, rank_mode = 0, "auto"
+    if use_krylov:
+        _krylov_route("general", krylov_method)  # unknown method: the facade's ValueError, before any solve
+        resolved_rank, rank_mode = resolve_krylov_rank(n, krylov_restart if krylov_rank is None else krylov_rank, krylov_restart)
+        options.update(
+            {
+                "krylov_method": str(krylov_method),
+                "krylov_tol": float(krylov_tol),
+                "krylov_max_iter": int(krylov_max_iter),
+                "krylov_rank": int(resolved_rank),
+            }
+        )
+
+    core = _native_core()
+    try:
+        magnitudes, info = core.ac_sweep(
+            circuit,
+            x_op,
+            np.ascontiguousarray(np.asarray(problem.b_ac, dtype=complex).reshape(-1)),
+            np.ascontiguousarray(frequencies, dtype=float),
+            float(problem.gmin),
+            options,
+            _ac_thread_count(num_threads),
+        )
+    except core.CoreError as exc:
+        if getattr(exc, "code", None) == "AC_ERROR":
+            error_handler(f"AC_ERROR: {exc}")
+        raise
+
+    if use_krylov and krylov_stats is not None:
+        krylov_stats.extend(
+            _ac_krylov_entry(entry, n, krylov_method, resolved_rank, rank_mode, krylov_max_iter) for entry in info["krylov"]
+        )
 
     return SpectrumResult(
         frequencies=frequencies,
-        magnitudes=responses,
+        magnitudes=magnitudes,
         labels=problem.metadata["labels"],
         metadata=spectrum_metadata,
     )

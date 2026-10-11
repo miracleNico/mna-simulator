@@ -778,12 +778,44 @@ def _core_tran_rlc_1035_krylov(core_inputs: Any, num_threads: int) -> Any:
     raise UnitUnavailable("lands in P3: native transient driver (Krylov path)")
 
 
+def _core_setup_ac_live(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Live ``MnaProblem`` and ``AnalysisOptions`` for the AC units (untimed, like the reference's prebuilt problem)."""
+
+    import dataclasses
+
+    from mna_simulation.api import contracts
+    from mna_simulation.mna_builder import build_mna_problem
+    from mna_simulation.netlist import parse_netlist_text
+
+    _native()
+    ref_options = inputs["options"]
+    live_fields = {f.name for f in dataclasses.fields(contracts.AnalysisOptions)}
+    values = {
+        f.name: getattr(ref_options, f.name)
+        for f in dataclasses.fields(ref_options)
+        if f.name in live_fields and f.name != "mode"
+    }
+    options = contracts.AnalysisOptions(mode=contracts.AnalysisMode(ref_options.mode.value), **values)
+    return {"problem": build_mna_problem(parse_netlist_text(inputs["netlist"])), "options": options}
+
+
+def _core_ac_live(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    """The live ``run_basic_analysis`` with ``num_threads`` passed through ``AnalysisOptions``."""
+
+    import dataclasses
+
+    from mna_simulation.core_basic import run_basic_analysis
+
+    options = dataclasses.replace(core_inputs["options"], num_threads=int(num_threads))
+    return run_basic_analysis(core_inputs["problem"], options)
+
+
 def _core_ac_rlc_1035(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P3: native AC sweep (parallel over frequencies)")
+    return _core_ac_live(core_inputs, num_threads)
 
 
 def _core_ac_bjt_3stage(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P3: native AC sweep")
+    return _core_ac_live(core_inputs, num_threads)
 
 
 # P4: harmonic balance.
@@ -1057,6 +1089,7 @@ _register(
     setup=_setup_basic("rlc", "ac", {"ac_start": 1e6, "ac_stop": 1e9, "ac_points": 100}, {"ac_points": 5}),
     reference=_ref_basic,
     core=_core_ac_rlc_1035,
+    core_setup=_core_setup_ac_live,
     parity=parity_analysis,
     phase="P3",
     tolerance=TOL_LINEAR,
@@ -1069,6 +1102,7 @@ _register(
     setup=_setup_basic("bjt", "ac", {"ac_start": 10.0, "ac_stop": 1e6, "ac_points": 400}, {"ac_points": 5}),
     reference=_ref_basic,
     core=_core_ac_bjt_3stage,
+    core_setup=_core_setup_ac_live,
     parity=parity_analysis,
     phase="P3",
     tolerance=TOL_NONLINEAR,

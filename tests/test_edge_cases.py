@@ -712,12 +712,24 @@ def test_harmonic_balance_newton_failure() -> None:
     _assert_error(exc, SolverConvergenceError, "HB_ERROR", "Harmonic balance solver did not converge within limit.")
 
 
-def test_ac_operating_point_ignores_max_iter() -> None:
+def test_ac_operating_point_honours_max_iter() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: the AC operating point receives max_iter, v_tol and
+    # f_tol (was: ignored, so .ac with max_iter=1 succeeded where .op with the same options failed).
     netlist = "V1 a 0 DC 5\nVs s 0 SIN 0.1 1k\nR1 a b 1k\nR2 s b 1k\nD1 b 0 1e-14\n"
-    with pytest.raises(SolverConvergenceError):
+    with pytest.raises(SolverConvergenceError) as op_exc:
         _svc(netlist, "op", max_iter=1)
-    response = _svc(netlist, "ac", f_start=10, f_stop=100, points=2, max_iter=1)
+    with pytest.raises(SolverConvergenceError) as ac_exc:
+        _svc(netlist, "ac", f_start=10, f_stop=100, points=2, max_iter=1)
+    _assert_error(ac_exc, SolverConvergenceError, "NR_CONVERGENCE", str(op_exc.value))
+    response = _svc(netlist, "ac", f_start=10, f_stop=100, points=2, max_iter=200)
     assert response.status == "ok" and response.metadata["op_used"] is True
+    # The AC operating point is the .op solution for the same Newton options (both use b_dc):
+    # a huge f_tol stops at the zero start, a loose v_tol after the first damped steps.
+    for newton in ({"max_iter": 200}, {"v_tol": 0.5}, {"f_tol": 1e3}):
+        op = _dc(_basic(netlist, AnalysisMode.OP, **newton))
+        ac = _basic(netlist, AnalysisMode.AC, ac_start=10, ac_stop=100, ac_points=2, **newton)
+        assert ac.metadata["operating_point"]["values"] == op
+    assert _dc(_basic(netlist, AnalysisMode.OP, f_tol=1e3)) == [0.0] * 5
 
 
 # ---------------------------------------------------------------------------
@@ -1070,13 +1082,26 @@ def test_ac_single_point() -> None:
     assert response.spectrum["magnitudes"][1] == pytest.approx([_rc_mag(100.0)], rel=1e-12)
 
 
-def test_ac_falsy_start_stop_and_points_are_replaced_by_defaults() -> None:
-    # ``ac_start or 1.0``, ``ac_stop or 1e6``, ``ac_points or 100``.
-    assert _svc(AC_NET, "ac", f_start=0, f_stop=1e3, points=3).spectrum["frequencies"] == [1.0, 500.5, 1000.0]
-    assert _svc(AC_NET, "ac", f_start=0.0, f_stop=0, points=2).spectrum["frequencies"] == [1.0, 1e6]
-    assert len(_svc(AC_NET, "ac", f_start=10, f_stop=1e3, points=0).spectrum["frequencies"]) == 100
+def test_ac_zero_start_and_stop_are_dc_points_and_nonpositive_points_raise() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: only None means unset (was ``ac_start or 1.0``,
+    # ``ac_stop or 1e6``, ``ac_points or 100``). f = 0 is a DC point; points <= 0 is AC_ERROR.
+    dc = _svc(AC_NET, "ac", f_start=0, f_stop=1e3, points=3)
+    assert dc.spectrum["frequencies"] == [0.0, 500.0, 1000.0]
+    assert dc.spectrum["magnitudes"][1] == pytest.approx([1.0, _rc_mag(500.0), _rc_mag(1e3)], rel=1e-12)
+    assert dc.spectrum["magnitudes"][2][0] == 0.0  # no DC current through the capacitor
+    assert _svc(AC_NET, "ac", f_start=0.0, f_stop=0, points=2).spectrum["frequencies"] == [0.0, 0.0]
+    for points in (0, -1):
+        message = f"AC sweep needs at least one frequency point (points = {points})."
+        with pytest.raises(SolverConvergenceError) as svc_exc:
+            _svc(AC_NET, "ac", f_start=10, f_stop=1e3, points=points)
+        _assert_error(svc_exc, SolverConvergenceError, "AC_ERROR", message)
+        with pytest.raises(SolverConvergenceError) as mor_exc:
+            _svc(AC_NET, "ac", f_start=10, f_stop=1e3, points=points, use_mor=True, mor_output_nodes=["V(out)"])
+        _assert_error(mor_exc, SolverConvergenceError, "AC_ERROR", message)
+    unset = _basic(AC_NET, AnalysisMode.AC).spectrum.frequencies
+    assert (len(unset), unset[0], unset[-1]) == (100, 1.0, 1e6)
     assert parse_directive(".ac 0 1k 1").params == {"f_start": 0.0, "f_stop": 1000.0, "points": 1}
-    assert _svc(AC_NET + ".ac 0 1k 1\n", None).spectrum["frequencies"] == [1.0]
+    assert _svc(AC_NET + ".ac 0 1k 1\n", None).spectrum["frequencies"] == [0.0]
 
 
 def test_ac_sweep_is_linear_and_accepts_descending_and_negative_frequencies() -> None:

@@ -29,6 +29,9 @@ Test ids are functions in `tests/test_edge_cases.py`.
 1. **Falsy option values are replaced by defaults.** `options.x or default` turns 0 into
    "unset": `tran_stop=0` runs to 0.1 s, `tran_step=0` uses 1e-5, `.ac` `f_start=0` uses 1 Hz,
    `f_stop=0` uses 1 MHz, `points=0` uses 100, HB `harmonics=0` uses 8.
+   **Decided (2.4.1), applied for `.ac`:** only `None` means unset; `f_start=0` / `f_stop=0`
+   are DC points and `points <= 0` raises `AC_ERROR` (full and MOR sweeps). The `.tran` and
+   HB parts land with their own P3/P4 cut-overs.
 2. **A diode clamped by an ideal voltage source never converges** (5 V or 20 V, even with
    10 000 iterations). Damped Newton creeps about Vt per iteration. With 1 Ω in series it
    converges even at 1000 V.
@@ -38,6 +41,8 @@ Test ids are functions in `tests/test_edge_cases.py`.
    adds 10 Meg keeper resistors to its random chains to stay robust.
 4. **`.ac` ignores `max_iter`, `v_tol` and `f_tol` for its internal operating point.**
    `solve_ac` calls `solve_dc_nr` with the defaults (10 000 / 1e-9 / 1e-9).
+   **Decided (2.4.1), applied:** the options are passed through, so the AC operating point is
+   the `.op` solution for the same `max_iter`/`v_tol`/`f_tol` and fails where `.op` fails.
 5. **Unwrapped exceptions.** R=0 raises `ZeroDivisionError`. A singular linear transient
    step raises raw `numpy.linalg.LinAlgError` at gmin 0, which the service then hides by
    succeeding at gmin=1e-12. String `t_stop` and float `points` raise `TypeError`. A JSON list
@@ -151,7 +156,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Nonlinear circuit plus floating island / MOS with a floating gate | `SCE` `JACOBIAN_SINGULAR` "Jacobian is singular at iteration 0." (*basic* and *service*) | `test_jacobian_singular_is_reachable` | yes |
 | `.tran` Newton failure (array IC, `max_iter=1`) | `SCE` `NR_CONVERGENCE` "NR failed to converge at t=1.00e-07 s" | `test_transient_newton_failure_reports_the_time_point` | yes |
 | HB Newton, `max_iter=1` | `SCE` `HB_ERROR` "Harmonic balance solver did not converge within limit." The HB Newton is undamped and starts from x=0 (it also cannot climb a 2-diode DC string; see the corpus note in `random_diode_net`) | `test_harmonic_balance_newton_failure` | yes (undamped HB: unclear) |
-| `.ac` on a diode circuit with `max_iter=1` | Succeeds: the AC operating point ignores `max_iter`/`v_tol`/`f_tol`, while `.op` with the same options fails | `test_ac_operating_point_ignores_max_iter` | no |
+| `.ac` on a diode circuit with `max_iter=1` | `SCE` `NR_CONVERGENCE` with the same message as `.op` with the same options: the AC operating point receives `max_iter`/`v_tol`/`f_tol` and equals the `.op` solution for them. Was: succeeds, the AC operating point ignored the options (10 000 / 1e-9 / 1e-9) while `.op` failed | `test_ac_operating_point_honours_max_iter` (was `test_ac_operating_point_ignores_max_iter`) | decided: pass the options through (2.4.1) |
 
 ### `init_condition`
 
@@ -215,7 +220,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
 | `points=1` | Single frequency `f_start` | `test_ac_single_point` | yes |
-| `f_start=0`, `f_stop=0`, `points=0` (options or `.ac 0 1k 1`) | Replaced by 1 Hz, 1 MHz and 100 points | `test_ac_falsy_start_stop_and_points_are_replaced_by_defaults` | no |
+| `f_start=0`, `f_stop=0`, `points=0` (options or `.ac 0 1k 1`) | Only `None` means unset (defaults 1 Hz, 1 MHz, 100 points). `f_start=0` / `f_stop=0` are DC points (`.ac 0 1k 1` gives `[0.0]`; an RC low-pass reads 1 at 0 Hz). `points <= 0` is `SCE` `AC_ERROR` "AC sweep needs at least one frequency point (points = 0)." on the full and the MOR sweep. Was: 0 replaced by 1 Hz, 1 MHz and 100 points | `test_ac_zero_start_and_stop_are_dc_points_and_nonpositive_points_raise` (was `test_ac_falsy_start_stop_and_points_are_replaced_by_defaults`) | decided: only `None` means unset (2.4.1) |
 | Sweep shape | **Linear** `np.linspace` (SPICE uses dec/oct/lin). Descending and negative frequencies are accepted (\|H(-f)\| = \|H(f)\|) | `test_ac_sweep_is_linear_and_accepts_descending_and_negative_frequencies` | linear: unclear; negative f: no |
 | `points=2.5` / `"3"` | `"3"` and `3.0` are coerced to 3; `2.5` and `"2.5"` are a plain `ValueError` "points must be an integer" (HTTP 400). Was: `TypeError` from `np.linspace` for both | `test_ac_points_must_be_an_integer` | decided: strict integers (2.4.1) |
 | No AC/SIN/COS source | All-zero magnitudes, `status="ok"` | `test_ac_without_an_ac_source_returns_zero_magnitudes` | yes |
@@ -235,7 +240,11 @@ Test ids are functions in `tests/test_edge_cases.py`.
 - The random MOS chain generator adds 10 Meg keepers because of highlight 3. The diode
   generator skips HB on its two-diode DC string because the HB Newton is undamped.
 - `.ac` cases on circuits whose OP needs gmin stepping are avoided: with `max_iter` ignored
-  (highlight 4), each failing gmin step can run 10 000 Newton iterations.
+  (highlight 4), each failing gmin step can run 10 000 Newton iterations in the oracle. The
+  live core now passes `max_iter` through (2.4.1); every corpus `ac` case converges at gmin 0
+  within its `max_iter` (200 for `ac_nl`), so the oracle and the live core still agree. No
+  corpus case uses `f_start=0`, `f_stop=0` or `points <= 0`, so the `.ac` option ruling needs
+  no corpus edits either.
 - The oracle keeps the old option coercion and raises `TRAN_ERROR` as the base `CSE`. No
   corpus case uses a non-canonical option value (string boolean, non-integral number,
   string time, list `init_condition`) or reaches `TRAN_ERROR`, so the 2.4.1 option and

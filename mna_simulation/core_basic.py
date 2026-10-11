@@ -478,6 +478,13 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
         )
 
     if options.mode == AnalysisMode.AC:
+        # Only None means "unset" (CPP_MIGRATION_PLAN.md 2.4.1): f_start = 0 / f_stop = 0 are
+        # DC points and points <= 0 is AC_ERROR on the full and the reduced sweep alike.
+        f_start = 1.0 if options.ac_start is None else options.ac_start
+        f_stop = 1e6 if options.ac_stop is None else options.ac_stop
+        points = 100 if options.ac_points is None else options.ac_points
+        if points <= 0:
+            error_handler(f"AC_ERROR: AC sweep needs at least one frequency point (points = {points}).")
         if options.use_mor:
             if options.mor_method == "tpwl":
                 error_handler("MOR_CONFIG: tpwl MOR is transient-only; use auto or linear_krylov for .ac.")
@@ -485,9 +492,9 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
 
             spectrum = solve_ac_mor(
                 problem,
-                f_start=options.ac_start or 1.0,
-                f_stop=options.ac_stop or 1e6,
-                points=options.ac_points or 100,
+                f_start=f_start,
+                f_stop=f_stop,
+                points=points,
                 mor_output_nodes=options.mor_output_nodes,
                 mor_order=options.mor_order,
                 requested_method=options.mor_method,
@@ -516,9 +523,13 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
 
         spectrum = solve_ac(
             problem,
-            f_start=options.ac_start or 1.0,
-            f_stop=options.ac_stop or 1e6,
-            points=options.ac_points or 100,
+            f_start=f_start,
+            f_stop=f_stop,
+            points=points,
+            max_iter=options.max_iter,
+            v_tol=options.v_tol,
+            f_tol=options.f_tol,
+            num_threads=options.num_threads,
             **linear_kwargs,
         )
         metadata = _result_metadata(problem, options, krylov_stats)
