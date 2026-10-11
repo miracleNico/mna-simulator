@@ -219,6 +219,16 @@ is one batched, parallel call. Memory is `nnz(G + J) * K^2` doubles instead of
 `(nK)^2`. Phase B (optional, after parity): FFT-based Gamma products and a
 matrix-free GMRES with block-diagonal preconditioner.
 
+**P4 finding (applied in `cpp/src/analyses/hb.cpp`).** The device-Jacobian blocks must stay a dense
+`Gamma diag(g) Gamma_inv` product. An O(K^2) evaluation through the discrete Fourier sums of `g`
+(exact in exact arithmetic, more accurate in floating point) was implemented and rejected: on the
+close-tone diode mixer (H = 205) the undamped Newton then overflows at iteration 2 with every direct
+solver tried, exactly like Newton with exactly solved steps, while the dense product converges in 36
+iterations with every summation order tried. The diode conductance spans 1e-16..1e12 S over the
+samples, so the Newton matrix has a condition number near 1/eps and the reference's convergence
+relies on the unstructured rounding of the dense product. Consequence: phase B (FFT products) needs
+a damped HB Newton first; that damping is an "improve, not parity" change scheduled with P3b.
+
 ### 2.7 Model-order reduction
 
 `mor/linear.py` keeps option handling, metadata, and validation; the basis
@@ -346,6 +356,7 @@ function, differential run, audit, commit. The suite is green at every commit.
 | Windows/MSVC differences (`long` size, `/fp` model, libm last-bit differences, DLL loading) | `int64_t`/`double` only in interfaces, `/fp:precise`, `std::thread` instead of OpenMP, `delvewheel` for the KLU shared library, tolerances and determinism asserted per platform, CI on `windows-latest` from P0 |
 | KLU and BTF are LGPL-2.1+ | license texts shipped; static link only during phase 0-1; shared `mna_suitesparse` library inside the wheel from phase 2 so relinking is possible without rebuilding the extension |
 | HB memory and time at large n | block-structured assembly (2.6); document the limit (`nnz(G+J) * K^2` doubles); phase B if needed |
+| HB Newton converges on the mixer only through the rounding of the dense Jacobian product (2.6, P4 finding) | damped HB Newton (voltage-step limiting on the sampled junction voltages, residual-based backtracking) with P3b before any FFT/matrix-free HB; corpus `hb` cases are the gate |
 | Expression evaluator parity with SymPy | the compiler and evaluator are tested against SymPy-evaluated vectors for every function in the allowed set, including `Heaviside(0)` and `Piecewise` ordering |
 | SymPy remains a dependency | only `exprc.py` imports it, at circuit-build time; acceptable |
 | Throughput regressions hidden by faster hardware | committed baselines and the perf gate compare speedup ratios, not absolute times |
