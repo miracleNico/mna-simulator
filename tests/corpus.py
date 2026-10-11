@@ -1231,7 +1231,11 @@ def random_resistive_controlled(seed: int) -> Case:
     lines.append(f"RH hout 0 {_fmt(rng.uniform(100, 10e3))}")
     lines.append(".op")
     lines.append(".end")
-    analyses = [op(), show(), op(use_krylov=True)]
+    # Full-restart GMRES (rank >= n): with the default auto rank (ceil(n/2)) the
+    # restarted iteration on these ill-conditioned 11x11 systems stalls exactly at
+    # the tolerance and the converged flag depends on rounding luck between
+    # implementations (seed 3 flipped when the native solver landed).
+    analyses = [op(), show(), op(use_krylov=True, krylov_rank=64)]
     return Case(f"rand_resistive_ctrl_s{seed}", "\n".join(lines), analyses, tags=("random", "dc", "controlled"))
 
 

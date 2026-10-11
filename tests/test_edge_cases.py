@@ -239,8 +239,12 @@ def test_negative_capacitor_and_inductor_are_accepted_in_transient() -> None:
         [0.0, -0.06530947247694148, -0.17823902678495207, -0.3037163093494082],
         rtol=1e-12,
     )
-    ind = _basic("V1 a 0 DC 1\nR1 a b 1k\nL1 b 0 -1m\n", AnalysisMode.TRAN, tran_stop=3e-6, tran_step=1e-6)
-    assert np.asarray(ind.waveform.values)[3] == pytest.approx([1e-3] * 4, **LIN)
+    # With L = -1 mH and h = 1 us the Backward-Euler matrix G + C/h is exactly singular
+    # (det 0 in exact arithmetic). The Python oracle returned values from a 1e-16 LAPACK
+    # pivot; the native KLU solve reports the singularity (decided: CPP_MIGRATION_PLAN.md
+    # 2.4.1, "singular linear transient step"; becomes NR_CONVERGENCE in P3).
+    with pytest.raises(np.linalg.LinAlgError):
+        _basic("V1 a 0 DC 1\nR1 a b 1k\nL1 b 0 -1m\n", AnalysisMode.TRAN, tran_stop=3e-6, tran_step=1e-6)
 
 
 def test_singular_linear_transient_step_raises_raw_numpy_linalg_error() -> None:
@@ -358,7 +362,10 @@ def test_overflowing_literals_parse_to_infinity() -> None:
     assert open_resistor.dc_solution == pytest.approx([1.0, 1.0, 0.0], **LIN)
     infinite_source = _svc("V1 a 0 DC 1e999\nR1 a 0 1k\n", "op")
     assert infinite_source.status == "ok"
-    assert math.isnan(infinite_source.dc_solution[0]) and infinite_source.dc_solution[1] == -math.inf
+    # Decided (CPP_MIGRATION_PLAN.md 2.4.1): non-finite solutions become NR_CONVERGENCE in P3.
+    # Until then the exact NaN/Inf pattern is implementation-defined (LAPACK gave [nan, -inf],
+    # KLU propagates the infinity differently); only "not finite" is pinned.
+    assert not np.all(np.isfinite(infinite_source.dc_solution))
     with pytest.raises(TypeError):
         _svc("V1 a 0 SIN 1 1e999\nR1 a 0 1k\n", "tran", t_stop=2e-3, t_step=1e-3)
 
@@ -433,7 +440,10 @@ def test_level1_bjt_exponent_is_clipped_at_80_vt() -> None:
         assert float(derivatives[0][1]) == pytest.approx(float(d_clip[0][1]), rel=1e-12)
     ic = float(at_clip[0])
     assert ic == pytest.approx(5.779125996966741e19, rel=1e-12)
-    # The current is flat beyond the clip but the reported dIc/dVb is not zero.
+    # The current is flat beyond the clip but the reported dIc/dVb is not zero. Kept for now
+    # (CPP_MIGRATION_PLAN.md 2.4.1): a zero slope made the HB Newton Jacobian singular when an
+    # iterate crossed the clip; P3 replaces the hard clip by junction limiting with linear
+    # extrapolation, which is consistent and nonsingular.
     assert float(d_clip[0][1]) == pytest.approx(2.2356386835461277e21, rel=1e-12)
     flat_a, _ = _level1_bjt_currents_and_derivatives(BJT, 5.0, 5.0, 0.0)
     flat_b, _ = _level1_bjt_currents_and_derivatives(BJT, 5.0, 5.001, 0.0)

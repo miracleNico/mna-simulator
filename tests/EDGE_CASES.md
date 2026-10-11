@@ -94,7 +94,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | C = 0 | Silently skipped (`add_entry` drops 0.0). A node reached only through C=0 floats, giving singular `NR_CONVERGENCE` | `test_zero_capacitor_is_silently_skipped` | unclear |
 | L = 0 | Branch row and `I(L1)` label kept, C entry dropped, so it acts as a 0 V source (a short) | `test_zero_inductor_keeps_its_branch_and_acts_as_a_short` | yes |
 | Negative R | Accepted: divider 1k/-2k gives V(b) = 2 V | `test_negative_resistor_is_accepted` | unclear (no validation) |
-| Negative C / L in `.tran` | Accepted and integrated (pinned values) | `test_negative_capacitor_and_inductor_are_accepted_in_transient` | unclear |
+| Negative C / L in `.tran` | Negative C: accepted and integrated (pinned values). Negative L with L/h making G + C/h exactly singular: native KLU raises `LinAlgError` (the oracle returned garbage from a 1e-16 LAPACK pivot) | `test_negative_capacitor_and_inductor_are_accepted_in_transient` | decided: KLU singularity report kept; NR_CONVERGENCE wrapper in P3 (2.4.1) |
 | Linear `.tran` step with G + C/h exactly singular (R=1k, C=-1u, h=1m) | *basic*: raw `numpy.linalg.LinAlgError` "Singular matrix" (only the linear transient loop is unwrapped). *service*: hidden, succeeds at gmin=1e-12 | `test_singular_linear_transient_step_raises_raw_numpy_linalg_error` | no |
 
 ### Parser conflicts, duplicates, ground aliases, NaN/Inf
@@ -107,7 +107,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Duplicate non-branch names (R1 twice, C1 twice) | Silently accepted, both stamped (C doubles). Names are case-sensitive (`R1` and `r1` are distinct) | `test_duplicate_non_branch_component_names_are_silently_accepted` | unclear |
 | GND aliases: several aliases, alias declared after use, lowercase `gnd`, alias used as a control node, `GND 0`, wrong arity | All aliases map to "0" in any order. `GND`/`GND a b` give `COMPONENT_ERROR` "'GND' GND statement expects '<node>' (got N arg(s))." | `test_gnd_aliases` | yes |
 | `nan`, `NaN`, `inf` literals | Rejected by the value regex: `NETLIST_FATAL` "'R2' has invalid value format 'nan'." / "'V1' has invalid value 'nan'." | `test_nan_and_inf_literals_are_rejected_by_the_value_pattern` | yes |
-| `1e999` literal | Parses to `inf`. As R: an open circuit. As a V source: `status="ok"` with `[nan, -inf]`. As a SIN frequency: `TypeError` from SymPy | `test_overflowing_literals_parse_to_infinity` | no |
+| `1e999` literal | Parses to `inf`. As R: an open circuit. As a V source: `status="ok"` with a non-finite solution (the exact NaN/Inf pattern differs between LAPACK and KLU). As a SIN frequency: `TypeError` from the expression compiler | `test_overflowing_literals_parse_to_infinity` | decided: NR_CONVERGENCE for non-finite solutions in P3 (2.4.1) |
 | `FUNC 0 nan` | `status="ok"`, all-NaN waveform | `test_func_expression_nan_produces_an_ok_all_nan_waveform` | no |
 
 ### Conditioning and device models
@@ -118,7 +118,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Diode directly across 5 V / 20 V source | `SCE` `NR_CONVERGENCE` "Solver did not converge after N iterations." (also at the default N=10 000, ~6 s) | `test_diode_clamped_by_an_ideal_source_never_converges` | no |
 | Diode exp overflow | `f`/`J` evaluate to `inf` at 20 V (RuntimeWarning). Damped Newton treats non-finite trial residuals as +inf and halves the step | `test_diode_expression_overflows_to_inf` | yes |
 | Diode with 5 V / 100 V / 1000 V through 1 Ω | Converges (V_D = 0.842 / 0.921 / 0.979 V) and satisfies the device equation | `test_diode_huge_forward_bias_through_a_resistor_converges` | yes |
-| Level-1 BJT, `vbe/vt > 80` (`vt = 0.02585`) | `exp` argument clipped to [-80, 80]: currents are flat beyond 2.068 V, but the reported dIc/dVb stays at its clip value (2.24e21), so the Jacobian disagrees with the flat function | `test_level1_bjt_exponent_is_clipped_at_80_vt` | unclear |
+| Level-1 BJT, `vbe/vt > 80` (`vt = 0.02585`) | `exp` argument clipped to [-80, 80]: currents are flat beyond 2.068 V, but the reported dIc/dVb stays at its clip value (2.24e21), so the Jacobian disagrees with the flat function | `test_level1_bjt_exponent_is_clipped_at_80_vt` | decided: keep until P3; a zero slope beyond the clip made the HB Newton Jacobian singular when an iterate crossed the clip, so P3 replaces the hard clip by junction limiting with linear extrapolation (2.4.1) |
 | Level-1 BJT, `vbe/vt < -80` | Reverse saturation currents (pinned) | `test_level1_bjt_negative_clip_gives_reverse_saturation_currents` | yes |
 | Level-1 MOS, `vgs == vth` exactly | Off (`vgs <= vth`): zero current and zero derivatives. Region "off" | `test_level1_mos_exactly_at_threshold_is_off` | yes |
 | Level-1 MOS, `vds == vgs - vth` exactly | Saturation branch (`vds < vov` is triode). Model is C1-continuous at the boundary. Region "saturation" | `test_level1_mos_triode_saturation_boundary_uses_saturation_and_is_c1_continuous` | yes |
