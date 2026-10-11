@@ -1,21 +1,10 @@
-# Python
-__pycache__/
-*.pyc
-.pytest_cache/
-*.egg-info/.cache
-
-# Front end caches (node_modules and dist are intentionally tracked today)
-app/web/node_modules/.vite/
-app/web/.vite/
-
-# Editors / OS
-.DS_Store
-Thumbs.db
 # Python bytecode and caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .cache/
+.mypy_cache/
+.ruff_cache/
 
 # Packaging / build outputs. Anchored to the repository root so that the
 # tracked frontend bundle in app/web/dist/ (and future rebuilds of it) is not
@@ -30,7 +19,17 @@ __pycache__/
 *.so
 *.pyd
 cpp/build*/
+/build-cpp/
 
 # Coverage
 .coverage*
 htmlcov/
+coverage*.xml
+
+# Front end caches (node_modules and dist are intentionally tracked today)
+app/web/node_modules/.vite/
+app/web/.vite/
+
+# Editors / OS
+.DS_Store
+Thumbs.db
