@@ -106,6 +106,18 @@ Schematic runs return the generated canonical netlist in response metadata. Simu
 - `probe_nodes`: optional labels such as `V(n1)` or `I(L1)` for result filtering.
 - `output_max_points`: optional waveform decimation limit for API responses.
 
+## Threads and Concurrency
+
+Every run leases worker threads from one machine-wide budget, so concurrent API requests and websocket streams divide the cores instead of oversubscribing them.
+
+- `MNA_NUM_THREADS` caps the server (default: `os.cpu_count()`, never more). `/api/simulate` and `/ws/dyn` run on a thread pool of that size, and a request waits while every thread is leased. `GET /health` reports `thread_budget` (`total`, `free`, `active`), `core_version`, and `build_info`.
+- Requests pass `options.num_threads`: `"auto"` (default: as many as are free right now) or a positive integer, which acts as an upper limit. Anything else returns HTTP 400. The CLI takes `--threads N|auto` and the UI has a Threads control. Result metadata reports `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend`, `core_version`, and `elapsed_ms`.
+- NumPy/SciPy BLAS is pinned to one thread for the duration of every run (`threadpoolctl`). With four concurrent SRAM transients in separate processes this takes the batch from 45 s to 3.5 s on a 4-core machine (`PERFORMANCE_PLAN.md` section 4.2). Still start the server with `OPENBLAS_NUM_THREADS=1` as belt and braces, because it also covers BLAS calls made outside a run:
+
+```bash
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MNA_NUM_THREADS=4 python -m uvicorn app.server.main:app --host 127.0.0.1 --port 8010
+```
+
 ## Supported Devices
 
 - Passive: `R`, `C`, `L`.

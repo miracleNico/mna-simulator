@@ -5,6 +5,7 @@ import {
   CanvasComponent,
   DeviceType,
   SchematicLevel,
+  ThreadSetting,
   DEVICE_LABELS
 } from "../lib/schematic";
 import { drawPalettePreview } from "../lib/symbols";
@@ -12,6 +13,8 @@ import { drawPalettePreview } from "../lib/symbols";
 type Props = {
   analysis: AnalysisState;
   onAnalysisChange: (patch: Partial<AnalysisState>) => void;
+  /** Server thread budget (GET /health thread_budget.total); null until known. */
+  threadBudgetTotal: number | null;
   onRun: () => void;
   running: boolean;
   availableNodes: string[];
@@ -52,6 +55,7 @@ export function LeftPane(props: Props) {
         <SimulationControls
           analysis={props.analysis}
           onAnalysisChange={props.onAnalysisChange}
+          threadBudgetTotal={props.threadBudgetTotal}
           availableNodes={props.availableNodes}
           onAddProbeNode={props.onAddProbeNode}
           onRemoveProbeNode={props.onRemoveProbeNode}
@@ -212,6 +216,45 @@ function CollapsibleSection({
   );
 }
 
+/** "auto" or 1..N worker threads, N = the server's thread budget from /health. */
+function ThreadsControl({
+  value,
+  budgetTotal,
+  onChange
+}: {
+  value: ThreadSetting;
+  budgetTotal: number | null;
+  onChange: (value: ThreadSetting) => void;
+}) {
+  const current = value === "auto" ? "auto" : Math.max(1, Math.floor(Number(value) || 1));
+  const total = Math.max(1, budgetTotal ?? 1);
+  const counts = Array.from({ length: total }, (_, i) => i + 1);
+  // A saved workspace may ask for more threads than this server has; keep it selectable.
+  if (current !== "auto" && current > total) counts.push(current);
+  const budgetText = budgetTotal ? `The server budget is ${budgetTotal} threads` : "The server budget is not known yet";
+  return (
+    <div className="formRow">
+      <label
+        title={`Worker threads for each run. auto = as many as the server has free right now; a number is an upper limit. ${budgetText} (MNA_NUM_THREADS); concurrent runs share it.`}
+      >
+        Threads
+      </label>
+      <select
+        className="select"
+        value={String(current)}
+        onChange={(e) => onChange(e.target.value === "auto" ? "auto" : Number(e.target.value))}
+      >
+        <option value="auto">auto</option>
+        {counts.map((n) => (
+          <option key={n} value={String(n)}>
+            {budgetTotal !== null && n > budgetTotal ? `${n} (capped at ${budgetTotal})` : n}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
+
 /** Secondary disclosure used for advanced solver options inside a section. */
 function SubPanel({ title, children, defaultOpen }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
   const [open, setOpen] = useState(!!defaultOpen);
@@ -229,6 +272,7 @@ function SubPanel({ title, children, defaultOpen }: { title: string; children: R
 function SimulationControls({
   analysis,
   onAnalysisChange,
+  threadBudgetTotal,
   availableNodes,
   onAddProbeNode,
   onRemoveProbeNode,
@@ -242,6 +286,7 @@ function SimulationControls({
 }: {
   analysis: AnalysisState;
   onAnalysisChange: (patch: Partial<AnalysisState>) => void;
+  threadBudgetTotal: number | null;
   availableNodes: string[];
   onAddProbeNode: (label: string) => void;
   onRemoveProbeNode: (label: string) => void;
@@ -364,6 +409,12 @@ function SimulationControls({
           </div>
         </>
       )}
+
+      <ThreadsControl
+        value={analysis.numThreads}
+        budgetTotal={threadBudgetTotal}
+        onChange={(numThreads) => onAnalysisChange({ numThreads })}
+      />
 
       <div className="formRow" style={{ flexDirection: "column", alignItems: "stretch" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>

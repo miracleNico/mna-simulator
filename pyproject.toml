@@ -18,6 +18,7 @@ dependencies = [
   "pydantic>=2,<3",
   "fastapi>=0.100,<1",
   "uvicorn[standard]>=0.20,<1",
+  "threadpoolctl>=3",
 ]
 
 [project.optional-dependencies]

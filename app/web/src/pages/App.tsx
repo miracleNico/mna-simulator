@@ -15,6 +15,7 @@ import {
   DeviceType,
   SchematicLevel,
   SchematicPreset,
+  ThreadSetting,
   buildSchematicPayload,
   extractClipboard,
   normalizeNodeName,
@@ -43,7 +44,8 @@ const defaultAnalysis: AnalysisState = {
   morMethod: "auto",
   morOrderMode: "auto",
   morOrder: 40,
-  morOutputNodes: []
+  morOutputNodes: [],
+  numThreads: "auto"
 };
 
 type TileRecord = {
@@ -185,10 +187,18 @@ function isEditableTarget(target: EventTarget | null): boolean {
   return tag === "input" || tag === "textarea" || tag === "select" || target.isContentEditable;
 }
 
+/** Accept "auto" or a positive integer from saved workspaces; anything else keeps the fallback. */
+function threadSettingOr(value: unknown, fallback: ThreadSetting): ThreadSetting {
+  if (value === "auto") return "auto";
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 ? n : fallback;
+}
+
 function simulationRequestOptions(analysis: AnalysisState): Record<string, unknown> {
   const options: Record<string, unknown> = {
     use_krylov: analysis.krylov,
-    probe_nodes: analysis.probeNodes
+    probe_nodes: analysis.probeNodes,
+    num_threads: threadSettingOr(analysis.numThreads, "auto")
   };
   if (analysis.krylov) {
     options.krylov_rank =
@@ -370,6 +380,8 @@ export function App() {
   const [zoomScale, setZoomScale] = useState(1);
   const [historyVersion, setHistoryVersion] = useState(0);
   const [propertiesFocusToken, setPropertiesFocusToken] = useState(0);
+  /** Server thread budget from GET /health (null until known). */
+  const [threadBudgetTotal, setThreadBudgetTotal] = useState<number | null>(null);
   const canvasHandleRef = useRef<SchematicCanvasHandle | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const redoRef = useRef<EditorSnapshot[]>([]);
@@ -389,6 +401,22 @@ export function App() {
   const netlistTextRef = useRef(netlistText);
   const generatedNetlistRef = useRef(generatedNetlist);
   const historyRef = useRef<EditorSnapshot[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/health")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => {
+        const total = Number(body?.thread_budget?.total);
+        if (!cancelled && Number.isInteger(total) && total >= 1) setThreadBudgetTotal(total);
+      })
+      .catch(() => {
+        // The Threads control falls back to "auto" and 1 until the server answers.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     levelsRef.current = levels;
@@ -789,7 +817,9 @@ export function App() {
         setResponsePreview(formatResponsePreview(body));
       } else {
         setStatus("ok");
-        setStatusMsg(`${effective.mode.toUpperCase()} complete (${body.status}).`);
+        const metrics = runMetrics(body?.metadata);
+        const done = `${effective.mode.toUpperCase()} complete (${body.status})`;
+        setStatusMsg(metrics ? `${done} · ${metrics}` : `${done}.`);
         setStatusIterationCount(responseIterationCount(body, effective.mode));
         if (body?.metadata?.generated_netlist) {
           setGeneratedNetlist(String(body.metadata.generated_netlist));
@@ -919,7 +949,8 @@ export function App() {
         const msg = JSON.parse(e.data);
         if (msg.type === "meta") {
           streamLabels = msg.labels ?? [];
-          setStatusMsg(`Dynamic probe: ${streamLabels.length} series.`);
+          const metrics = runMetrics(msg);
+          setStatusMsg(`Dynamic probe: ${streamLabels.length} series${metrics ? ` · ${metrics}` : "."}`);
         } else if (msg.type === "frame") {
           const rec = tilesRef.current.get(tileId);
           if (rec?.push && streamLabels.length > 0) {
@@ -1014,7 +1045,8 @@ export function App() {
       const msg = JSON.parse(e.data);
       if (msg.type === "meta") {
         streamLabels = msg.labels ?? [];
-        setStatusMsg(`Dynamic display: ${streamLabels.length} series.`);
+        const metrics = runMetrics(msg);
+        setStatusMsg(`Dynamic display: ${streamLabels.length} series${metrics ? ` · ${metrics}` : "."}`);
       } else if (msg.type === "frame") {
         const rec = tilesRef.current.get(tileId);
         if (rec?.push && streamLabels.length > 0) {
@@ -1146,7 +1178,7 @@ export function App() {
     }));
     setLevels([rootLevel, ...extras]);
     setActiveLevelId("root");
-    setAnalysis({ ...defaultAnalysis, ...preset.analysis });
+    setAnalysis((cur) => ({ ...defaultAnalysis, ...preset.analysis, numThreads: cur.numThreads }));
     setSelectedIds(new Set());
     setGeneratedNetlist("");
     setNetlistMode("schematic");
@@ -1168,7 +1200,7 @@ export function App() {
     pushEditorHistory();
     setLevels([{ ...EMPTY_ROOT }]);
     setActiveLevelId("root");
-    setAnalysis({ ...defaultAnalysis });
+    setAnalysis((cur) => ({ ...defaultAnalysis, numThreads: cur.numThreads }));
     setSelectedIds(new Set());
     setGeneratedNetlist("");
     setNetlistMode("schematic");
@@ -1200,7 +1232,11 @@ export function App() {
       pushEditorHistory();
       setLevels(cloneLevels(parsed.levels));
       setActiveLevelId(parsed.activeLevelId);
-      setAnalysis({ ...defaultAnalysis, ...parsed.analysis });
+      setAnalysis((cur) => ({
+        ...defaultAnalysis,
+        ...parsed.analysis,
+        numThreads: threadSettingOr(parsed.analysis.numThreads, cur.numThreads)
+      }));
       setNetlistMode(parsed.netlistMode);
       setNetlistText(parsed.netlistText);
       setGeneratedNetlist("");
@@ -1695,6 +1731,7 @@ export function App() {
       <LeftPane
         analysis={analysis}
         onAnalysisChange={(patch) => setAnalysis((cur) => ({ ...cur, ...patch }))}
+        threadBudgetTotal={threadBudgetTotal}
         onRun={() => void runSimulation()}
         running={running}
         availableNodes={availableNodes}
@@ -1848,6 +1885,18 @@ function formatElapsed(ms: number): string {
   const minutes = Math.floor(seconds / 60);
   const rest = Math.floor(seconds % 60);
   return `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+/** "2 threads · 412 ms" from run metadata (threads_used, elapsed_ms); empty when absent. */
+function runMetrics(metadata: Record<string, unknown> | null | undefined): string {
+  const parts: string[] = [];
+  const threads = Number(metadata?.threads_used);
+  if (Number.isInteger(threads) && threads > 0) parts.push(`${threads} thread${threads === 1 ? "" : "s"}`);
+  const elapsedMs = metadata?.elapsed_ms;
+  if (typeof elapsedMs === "number" && Number.isFinite(elapsedMs) && elapsedMs >= 0) {
+    parts.push(elapsedMs < 1000 ? `${elapsedMs < 10 ? elapsedMs.toFixed(1) : elapsedMs.toFixed(0)} ms` : `${(elapsedMs / 1000).toFixed(2)} s`);
+  }
+  return parts.join(" · ");
 }
 
 function formatCount(value: number): string {

@@ -9,6 +9,7 @@ from ..core_advanced import build_and_run_advanced
 from ..core_basic import build_and_run_basic
 from ..library.registry import DeviceRegistry, create_default_registry
 from ..netlist import parse_netlist_file, parse_netlist_text, select_analysis
+from ..native.threads import coerce_num_threads
 from ..utils import DEFAULT_GMIN_STEPS
 
 
@@ -148,6 +149,7 @@ class PythonBackend:
         use_mor = bool(option_values.get("use_mor", option_values.get("mor", False)))
         mor_method = _coerce_mor_method(option_values.get("mor_method", "auto"))
         mor_order = _coerce_mor_order(option_values.get("mor_order", "auto"))
+        num_threads = coerce_num_threads(option_values.get("num_threads"))
 
         return AnalysisOptions(
             mode=effective_mode or directive.mode,
@@ -175,6 +177,7 @@ class PythonBackend:
             mor_order=mor_order,
             mor_output_nodes=_coerce_label_list(option_values.get("mor_output_nodes")),
             mor_validate=bool(option_values.get("mor_validate", True)),
+            num_threads=num_threads,
         )
 
     def run(self, circuit: CircuitIR, options: AnalysisOptions) -> SimulationResult:

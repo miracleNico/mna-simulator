@@ -56,6 +56,14 @@ This guide explains the normal web-app workflow for drawing circuits, running an
 - `.hb` solves steady-state harmonic balance. Supplying a time window reconstructs a time-domain waveform from harmonic-balance coefficients.
 - `.dyn` is the frontend dynamic display path. It streams transient samples through the backend websocket.
 
+## Threads
+
+- Threads in the Simulation panel sets how many worker threads a run may use. `auto` (the default) takes as many as the server has free right now; a number is an upper limit. The list goes up to the server's thread budget (`GET /health` → `thread_budget.total`).
+- The server enforces one machine-wide budget: `MNA_NUM_THREADS` (default: the CPU count). Concurrent runs share it; a run waits while every thread is in use, so simultaneous requests divide the cores instead of oversubscribing them.
+- After each run the status line shows the threads granted and the solver time, e.g. `TRAN complete (ok) · 4 threads · 412 ms`. Result metadata carries `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend`, `core_version`, and `elapsed_ms`. The thread count changes speed only, never results.
+- Analyses use the granted threads as they move to the native core; until then the setting mainly controls how concurrent runs share the machine. NumPy/SciPy BLAS is always kept to one thread per run.
+- API requests pass `"num_threads": "auto"` or a positive integer in `options` (anything else returns HTTP 400); the CLI takes `--threads N|auto`.
+
 ## Display Results
 
 - Use Display nodes to choose labels such as `V(out)`, `V(vin)`, or `I(L1)`.

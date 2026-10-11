@@ -84,6 +84,9 @@ class AnalysisOptions:
     mor_order: int | str | None = "auto"
     mor_output_nodes: list[str] = field(default_factory=list)
     mor_validate: bool = True
+    # Worker threads for this run: None/"auto" or a positive int on input; the service
+    # replaces it with the count granted by the thread budget before the backend runs.
+    num_threads: int | str | None = None
 
 
 @dataclass(slots=True)

@@ -2,22 +2,50 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import asdict
+from functools import lru_cache
 
 import numpy as np
 
 from .contracts import AnalysisRequest, SimulationResponse
 from ..backends.python_backend import PythonBackend
 from ..errors import CircuitSimulatorError
+from ..native import build_info, core_version
+from ..native.threads import ThreadBudget, default_budget, pin_blas_threads
 from ..schematic_pipeline import schematic_to_circuit_ir
 from ..utils import ndarray_to_list
+
+
+# PEP 678 note attached to ValueErrors raised while validating request options. The
+# exception stays a plain ValueError (a pinned contract, see tests/EDGE_CASES.md); the note
+# only lets the HTTP layer answer 400 for bad options without catching every ValueError.
+INVALID_OPTION_NOTE = "mna_simulation: invalid request option"
+
+
+def is_invalid_option_error(exc: BaseException) -> bool:
+    """True for a ValueError raised by request-option validation in ``run_request``."""
+
+    return isinstance(exc, ValueError) and INVALID_OPTION_NOTE in getattr(exc, "__notes__", ())
+
+
+@lru_cache(maxsize=1)
+def _core_version() -> str:
+    return core_version()
 
 
 class SimulationService:
     """Single orchestration entry point shared by CLI and HTTP API."""
 
-    def __init__(self, backend: PythonBackend | None = None) -> None:
+    def __init__(self, backend: PythonBackend | None = None, budget: ThreadBudget | None = None) -> None:
         self.backend = backend or PythonBackend()
+        self._budget = budget
+
+    @property
+    def budget(self) -> ThreadBudget:
+        """Thread budget leased by every run (the process-wide default unless one was given)."""
+
+        return self._budget if self._budget is not None else default_budget()
 
     def run_request(self, request: AnalysisRequest) -> SimulationResponse:
         """Run a request and convert the result to a JSON-safe response."""
@@ -33,8 +61,36 @@ class SimulationService:
             generated_netlist = converted.netlist_text
         else:
             circuit = self.backend.parse_text(request.netlist_text)
-        options = self.backend.build_options(circuit, overrides=request.options, mode=request.mode)
-        result = self.backend.run(circuit, options)
+        try:
+            options = self.backend.build_options(circuit, overrides=request.options, mode=request.mode)
+        except ValueError as exc:
+            if not is_invalid_option_error(exc):
+                exc.add_note(INVALID_OPTION_NOTE)
+            raise
+
+        # Lease worker threads for the run and keep NumPy/SciPy BLAS single-threaded, so
+        # concurrent requests divide the machine instead of oversubscribing it. The granted
+        # count replaces the raw request so the backend reads exactly what it may use.
+        budget = self.budget
+        threads_requested: int | str = options.num_threads if options.num_threads is not None else "auto"
+        with budget.lease(threads_requested) as threads_used, pin_blas_threads():
+            options.num_threads = threads_used
+            started = time.perf_counter()
+            result = self.backend.run(circuit, options)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+        result.metadata = dict(result.metadata)
+        result.metadata.update(
+            {
+                "threads_requested": threads_requested,
+                "threads_used": threads_used,
+                "thread_budget_total": budget.total,
+                # Which implementation produced the numbers. Still the Python solvers; each
+                # C++ cut-over (CPP_MIGRATION_PLAN.md section 6) switches its analyses to "cpp".
+                "core_backend": "python",
+                "core_version": _core_version(),
+                "elapsed_ms": round(elapsed_ms, 3),
+            }
+        )
         if generated_netlist is not None:
             result.metadata = dict(result.metadata)
             result.metadata["generated_netlist"] = generated_netlist
@@ -91,6 +147,9 @@ class SimulationService:
             "status": "ok",
             "capabilities": asdict(self.backend.capabilities),
             "models": [model.name for model in self.backend.registry.list_models()],
+            "core_version": _core_version(),
+            "build_info": build_info(),
+            "thread_budget": self.budget.snapshot(),
         }
 
 

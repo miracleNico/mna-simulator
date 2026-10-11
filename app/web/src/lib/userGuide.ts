@@ -50,6 +50,15 @@ export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
     ]
   },
   {
+    title: "Threads",
+    items: [
+      "Threads in the Simulation panel sets how many worker threads a run may use. auto (the default) takes as many as the server has free right now; a number is an upper limit. The list goes up to the server's thread budget.",
+      "The server enforces one machine-wide budget (MNA_NUM_THREADS, default: the CPU count). Concurrent runs share it: a run waits while every thread is in use, so simultaneous requests divide the cores instead of oversubscribing them.",
+      "After each run the status line shows the threads granted and the solver time, e.g. TRAN complete (ok) · 4 threads · 412 ms. The thread count changes speed only, never results.",
+      "Analyses use the granted threads as they move to the native core; until then the setting mainly controls how concurrent runs share the machine. NumPy/SciPy BLAS is always kept to one thread per run."
+    ]
+  },
+  {
     title: "Display Results",
     items: [
       "Use Display nodes to choose labels such as V(out), V(vin), or I(L1). Empty display selection means all available waveform labels are shown.",

@@ -29,7 +29,8 @@ const defaultAnalysis: AnalysisState = {
   morMethod: "auto",
   morOrderMode: "auto",
   morOrder: 40,
-  morOutputNodes: []
+  morOutputNodes: [],
+  numThreads: "auto"
 };
 
 function cloneAnalysis(overrides: Partial<AnalysisState>): AnalysisState {

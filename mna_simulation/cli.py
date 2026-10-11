@@ -10,6 +10,27 @@ from .api.contracts import AnalysisMode, AnalysisRequest
 from .api.service import SimulationService
 from .backends.python_backend import PythonBackend
 from .errors import CircuitSimulatorError
+from .native.threads import ENV_VAR, coerce_num_threads
+
+
+def _threads_arg(value: str) -> int | str:
+    """argparse type for ``--threads N|auto``."""
+
+    try:
+        return coerce_num_threads(value)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _add_threads_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--threads",
+        type=_threads_arg,
+        default=None,
+        metavar="N|auto",
+        help=f"Worker threads for the run: a positive integer or 'auto' (default). "
+        f"Capped by the thread budget ({ENV_VAR}, default: CPU count).",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the analysis mode.",
     )
     run_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    _add_threads_option(run_parser)
 
     text_parser = subparsers.add_parser("run-text", help="Run a simulation from inline netlist text.")
     text_parser.add_argument("netlist_text", help="Raw netlist text.")
@@ -37,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override the analysis mode.",
     )
     text_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
+    _add_threads_option(text_parser)
 
     return parser
 
@@ -47,6 +70,12 @@ def _print_response(response, as_json: bool) -> None:
         return
     print(f"Mode: {response.mode}")
     print(f"Status: {response.status}")
+    metadata = response.metadata or {}
+    if "threads_used" in metadata:
+        print(
+            f"Threads used: {metadata['threads_used']} "
+            f"(requested {metadata.get('threads_requested', 'auto')}, budget {metadata.get('thread_budget_total', '?')})"
+        )
     if response.diagnostics:
         print("Diagnostics:")
         for line in response.diagnostics:
@@ -79,7 +108,8 @@ def main(argv: list[str] | None = None) -> int:
             text = args.netlist_text
 
         mode = AnalysisMode(args.mode) if args.mode else None
-        response = service.run_request(AnalysisRequest(netlist_text=text, mode=mode))
+        options = {} if args.threads is None else {"num_threads": args.threads}
+        response = service.run_request(AnalysisRequest(netlist_text=text, mode=mode, options=options))
         _print_response(response, as_json=args.json)
         return 0
     except CircuitSimulatorError as exc:

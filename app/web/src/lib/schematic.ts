@@ -29,6 +29,8 @@ export type DeviceType =
 export type BasicAnalysisMode = "op" | "tran" | "ac" | "hb" | "dyn";
 export type KrylovMethod = "auto" | "arnoldi_gmres" | "conjugate_residual" | "conjugate_gradient";
 export type MorMethod = "auto" | "linear_krylov" | "tpwl";
+/** Worker threads requested for a run: "auto" or a positive integer. */
+export type ThreadSetting = "auto" | number;
 
 export type Rotation = 0 | 90 | 180 | 270;
 
@@ -97,6 +99,8 @@ export type AnalysisState = {
   morOrder: number;
   /** Output labels kept by MOR, independent of plot display filtering. */
   morOutputNodes: string[];
+  /** Threads requested per run; the server grants at most what its budget has free. */
+  numThreads: ThreadSetting;
 };
 
 /**

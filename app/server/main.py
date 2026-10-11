@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
+from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,11 +20,32 @@ from mna_simulation.api.contracts import (
     SchematicDocument,
     SimulationResponse,
 )
-from mna_simulation.api.service import SimulationService
+from mna_simulation.api.service import SimulationService, is_invalid_option_error
 from mna_simulation.errors import CircuitSimulatorError
+from mna_simulation.native.threads import budget_total
 from mna_simulation.schematic_pipeline import schematic_to_circuit_ir
 
-app = FastAPI(title="MNA Simulation Service", version="0.60.0")
+_EXECUTOR_LOCK = threading.Lock()
+
+
+def _new_executor() -> ThreadPoolExecutor:
+    # One worker per budget thread: requests beyond that queue here, and each running
+    # request additionally holds a lease from the service's thread budget.
+    return ThreadPoolExecutor(max_workers=budget_total(), thread_name_prefix="mna-sim")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.executor = _new_executor()
+    try:
+        yield
+    finally:
+        executor = app.state.executor
+        app.state.executor = None
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+app = FastAPI(title="MNA Simulation Service", version="0.70.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,21 +56,42 @@ app.add_middleware(
 service = SimulationService()
 
 
+def _executor() -> ThreadPoolExecutor:
+    """The simulation executor (created lazily when the lifespan did not run)."""
+
+    executor = getattr(app.state, "executor", None)
+    if executor is None:
+        with _EXECUTOR_LOCK:
+            executor = getattr(app.state, "executor", None)
+            if executor is None:
+                executor = app.state.executor = _new_executor()
+    return executor
+
+
+async def _run_simulation(request: AnalysisRequest) -> SimulationResponse:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor(), service.run_request, request)
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
-    """Return service health and backend capabilities."""
+    """Return service health, backend capabilities, core version, and thread budget."""
 
     return service.healthcheck()
 
 
 @app.post("/api/simulate", response_model=SimulationResponse)
-def simulate(request: AnalysisRequest) -> SimulationResponse:
-    """Run a simulation request."""
+async def simulate(request: AnalysisRequest) -> SimulationResponse:
+    """Run a simulation request on the bounded simulation executor."""
 
     try:
-        return service.run_request(request)
+        return await _run_simulation(request)
     except CircuitSimulatorError as exc:
         raise HTTPException(status_code=400, detail={"code": exc.code, "message": exc.message}) from exc
+    except ValueError as exc:
+        if not is_invalid_option_error(exc):
+            raise
+        raise HTTPException(status_code=400, detail={"code": "INVALID_OPTIONS", "message": str(exc)}) from exc
 
 
 def _resolve_pin_refs_to_labels(
@@ -108,9 +154,11 @@ async def dyn_stream(ws: WebSocket) -> None:
             "nodes": ["n1", ...],                  # optional, legacy label filter
             "continuous": false,                   # optional, loop playback forever
             "use_krylov": false,                   # optional, auto Krylov linear solve
+            "num_threads": "auto",                 # optional, "auto" or a positive integer
             "max_frame_rate": 60                   # optional display stream cap
         }
-        server -> {"type": "meta", "labels": [...], "t_stop": <float>, "speed": <float>, "sim_span": <float>, "continuous": <bool>}
+        server -> {"type": "meta", "labels": [...], "t_stop": <float>, "speed": <float>, "sim_span": <float>, "continuous": <bool>,
+                   "threads_used": <int>, "elapsed_ms": <float>}
         server -> {"type": "frame", "t": <float>, "values": [...] }   (many)
         server -> {"type": "loop"}     # emitted between playback loops when continuous
         server -> {"type": "done"}
@@ -135,6 +183,7 @@ async def dyn_stream(ws: WebSocket) -> None:
         use_krylov = bool(payload.get("use_krylov", False))
         krylov_rank = payload.get("krylov_rank", "auto")
         krylov_method = payload.get("krylov_method", "auto")
+        num_threads = payload.get("num_threads")
         max_frame_rate = max(1.0, float(payload.get("max_frame_rate", 60.0)))
 
         # Force the schematic to run as .tran with the requested params. Writing
@@ -146,22 +195,30 @@ async def dyn_stream(ws: WebSocket) -> None:
             mode=AnalysisMode.TRAN,
             params={"t_stop": t_stop, "t_step": t_step},
         )
+        options: dict[str, object] = {
+            "use_krylov": use_krylov,
+            "krylov_rank": krylov_rank,
+            "krylov_method": krylov_method,
+            "output_max_points": 6000,
+        }
+        if num_threads is not None:
+            options["num_threads"] = num_threads
         request = AnalysisRequest(
             netlist_text="",
             mode=AnalysisMode.TRAN,
-            options={
-                "use_krylov": use_krylov,
-                "krylov_rank": krylov_rank,
-                "krylov_method": krylov_method,
-                "output_max_points": 6000,
-            },
+            options=options,
             schematic=schematic,
         )
-        loop = asyncio.get_event_loop()
         try:
-            response = await loop.run_in_executor(None, service.run_request, request)
+            response = await _run_simulation(request)
         except CircuitSimulatorError as exc:
             await ws.send_text(json.dumps({"type": "error", "message": exc.message}))
+            await ws.close()
+            return
+        except ValueError as exc:
+            if not is_invalid_option_error(exc):
+                raise
+            await ws.send_text(json.dumps({"type": "error", "message": str(exc)}))
             await ws.close()
             return
 
@@ -210,6 +267,8 @@ async def dyn_stream(ws: WebSocket) -> None:
                     "sim_span": total_sim_span,
                     "speed": speed,
                     "continuous": continuous,
+                    "threads_used": response.metadata.get("threads_used"),
+                    "elapsed_ms": response.metadata.get("elapsed_ms"),
                 }
             )
         )
