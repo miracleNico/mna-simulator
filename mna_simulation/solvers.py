@@ -39,31 +39,6 @@ def _native_core():
 _NATIVE_CORE: dict[str, object] = {}
 
 
-def _nmos_level1_forward(
-    vgs: float,
-    vds: float,
-    beta: float,
-    vth: float,
-    lambda_: float,
-) -> tuple[float, float, float]:
-    """Return IDS, dIDS/dVGS, dIDS/dVDS for an NMOS with VDS >= 0."""
-
-    if vgs <= vth:
-        return 0.0, 0.0, 0.0
-    vov = vgs - vth
-    if vds < vov:
-        channel = vov * vds - 0.5 * vds * vds
-        modulation = 1.0 + lambda_ * vds
-        current = beta * channel * modulation
-        d_vgs = beta * vds * modulation
-        d_vds = beta * ((vov - vds) * modulation + channel * lambda_)
-        return current, d_vgs, d_vds
-    current = 0.5 * beta * vov * vov * (1.0 + lambda_ * vds)
-    d_vgs = beta * vov * (1.0 + lambda_ * vds)
-    d_vds = 0.5 * beta * vov * vov * lambda_
-    return current, d_vgs, d_vds
-
-
 def _nmos_level1_current_and_derivatives(
     vd: float,
     vg: float,
