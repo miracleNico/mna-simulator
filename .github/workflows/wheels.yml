@@ -11,6 +11,7 @@ on:
       - "cpp/**"
       - "pyproject.toml"
       - ".github/workflows/wheels.yml"
+      - ".github/scripts/**"
 
 jobs:
   wheels:
