@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import functools
-
 import numpy as np
 
 from .api.contracts import ComponentRecord
@@ -22,11 +20,6 @@ from .solvers import (
 )
 from .solvers import solve_operating_point
 from .utils import parse_value
-
-# The device operating points of .op / .tran results parse each device's values; with
-# hundreds of identical devices (SRAM) the regex parse dominated a native .op. Values
-# repeat, so cache them (parse_value is pure; errors are not cached).
-parse_value = functools.lru_cache(maxsize=8192)(parse_value)
 
 
 def _linear_solver_kwargs(options: AnalysisOptions, stats: list[dict[str, object]] | None = None) -> dict[str, object]:

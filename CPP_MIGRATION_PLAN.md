@@ -156,7 +156,7 @@ the oracle must follow, a CHANGELOG entry in `tests/reference/README.md`):
 | `0` option values treated as unset (`tran_stop`, `tran_step`, `f_start`, `f_stop`, `points`, `harmonics`) | change: only `None` means unset; `t_stop = 0` returns the single initial sample, `t_step <= 0` is `TRAN_ERROR`, `points <= 0` is `AC_ERROR`, `harmonics <= 0` is `HB_ERROR` | applied for `.tran`/`.ac`; `.hb` in P4 |
 | Diode across an ideal source never converges; CMOS chains of 4+ stages fail at gmin 0 | improve, not parity: junction voltage-step limiting for `exp` devices and SPICE-style node-to-ground gmin during gmin stepping; corpus expectations for the affected cases updated when it lands | P3b |
 | `.ac` ignores `max_iter`, `v_tol`, `f_tol` for its operating point | change: pass the options through | applied |
-| `R = 0` raises `ZeroDivisionError` | change: `NETLIST_FATAL: '<name>' has zero resistance` from the builder, raised once (no gmin retries) | P6a (builder fast path) |
+| `R = 0` raises `ZeroDivisionError` | change: `NETLIST_FATAL: '<name>' has zero resistance` from the builder, raised once (no gmin retries) | applied (also `rpi = 0` of a small-signal BJT) |
 | Singular linear transient step raises raw `LinAlgError` | change: `NR_CONVERGENCE` with the step time in the message (gmin stepping still applies) | applied |
 | String `t_stop` / float `points` raise `TypeError`; JSON-list `init_condition` raises `AttributeError` | change: option coercion in `build_options` (metric suffix strings accepted, lists accepted); wrong-length arrays become `NETLIST_FATAL` in P3 | applied |
 | Non-finite results returned with `status = "ok"` | change: `NR_CONVERGENCE: non-finite solution` | applied |
