@@ -133,11 +133,11 @@ def test_available_core_units_match_reference_at_full_size(unit_id: str) -> None
 
 
 def test_unavailable_core_raises_with_phase() -> None:
-    unit = perf_units.get_unit("tran_sram_248")
+    unit = perf_units.get_unit("tpwl_train_sram_248")
     with pytest.raises(UnitUnavailable) as info:
         unit.core(None, 1)
-    assert info.value.phase == "P3"
-    assert compare_backends.unavailable_tag(str(info.value)) == "P3"
+    assert info.value.phase == "P5"
+    assert compare_backends.unavailable_tag(str(info.value)) == "P5"
 
 
 def test_parity_metrics() -> None:

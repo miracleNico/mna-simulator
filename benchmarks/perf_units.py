@@ -755,27 +755,60 @@ def _core_krylov_cg_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> A
     return _core_krylov(core_inputs, num_threads)
 
 
+def _core_setup_basic(inputs: dict[str, Any]) -> dict[str, Any]:
+    """The live package's problem and options for ``run_basic_analysis`` (untimed).
+
+    The problem is built by ``mna_simulation`` from the same netlist (its compiled native
+    circuit is part of the problem, like the reference's dense matrices are part of its
+    problem); the options copy the reference options field by field.
+    """
+
+    import dataclasses
+
+    from mna_simulation.api import contracts
+    from mna_simulation.mna_builder import build_mna_problem
+    from mna_simulation.netlist import parse_netlist_text
+
+    _native()
+    ref_options = inputs["options"]
+    fields = {field.name for field in dataclasses.fields(contracts.AnalysisOptions)}
+    values = {name: getattr(ref_options, name) for name in fields if hasattr(ref_options, name) and name != "mode"}
+    options = contracts.AnalysisOptions(mode=contracts.AnalysisMode(ref_options.mode.value), **values)
+    return {"problem": build_mna_problem(parse_netlist_text(inputs["netlist"])), "options": options}
+
+
+def _core_basic(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    """``mna_simulation.core_basic.run_basic_analysis`` (native .op / .tran) at ``num_threads``."""
+
+    import dataclasses
+
+    from mna_simulation.core_basic import run_basic_analysis
+
+    options = dataclasses.replace(core_inputs["options"], num_threads=num_threads)
+    return run_basic_analysis(core_inputs["problem"], options)
+
+
 def _core_op_sram_248(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P2: native Newton .op")
+    return _core_basic(core_inputs, num_threads)
 
 
 # P3: transient and AC drivers.
 
 
 def _core_tran_sram_248(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P3: native transient driver")
+    return _core_basic(core_inputs, num_threads)
 
 
 def _core_tran_bjt_3stage_2001(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P3: native transient driver")
+    return _core_basic(core_inputs, num_threads)
 
 
 def _core_tran_rlc_1035_dense(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P3: native transient driver (cached factorization)")
+    return _core_basic(core_inputs, num_threads)
 
 
 def _core_tran_rlc_1035_krylov(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P3: native transient driver (Krylov path)")
+    return _core_basic(core_inputs, num_threads)
 
 
 def _core_setup_ac_live(inputs: dict[str, Any]) -> dict[str, Any]:
@@ -1021,6 +1054,7 @@ _register(
     setup=_setup_basic("sram", "op", {"max_iter": 200}, {}),
     reference=_ref_basic,
     core=_core_op_sram_248,
+    core_setup=_core_setup_basic,
     parity=parity_analysis,
     phase="P2",
     tolerance=TOL_NONLINEAR,
@@ -1037,6 +1071,7 @@ _register(
     ),
     reference=_ref_basic,
     core=_core_tran_sram_248,
+    core_setup=_core_setup_basic,
     parity=parity_analysis,
     phase="P3",
     tolerance=TOL_NONLINEAR,
@@ -1049,6 +1084,7 @@ _register(
     setup=_setup_basic("bjt", "tran", {"tran_stop": 10e-3, "tran_step": 5e-6}, {"tran_stop": 50e-6}),
     reference=_ref_basic,
     core=_core_tran_bjt_3stage_2001,
+    core_setup=_core_setup_basic,
     parity=parity_analysis,
     phase="P3",
     tolerance=TOL_NONLINEAR,
@@ -1061,6 +1097,7 @@ _register(
     setup=_setup_basic("rlc", "tran", {"tran_stop": 40e-9, "tran_step": 1e-9}, {"tran_stop": 5e-9}),
     reference=_ref_basic,
     core=_core_tran_rlc_1035_dense,
+    core_setup=_core_setup_basic,
     parity=parity_analysis,
     phase="P3",
     tolerance=TOL_LINEAR,
@@ -1075,6 +1112,7 @@ _register(
     ),
     reference=_ref_basic,
     core=_core_tran_rlc_1035_krylov,
+    core_setup=_core_setup_basic,
     parity=parity_analysis,
     phase="P3",
     tolerance=TOL_KRYLOV,
