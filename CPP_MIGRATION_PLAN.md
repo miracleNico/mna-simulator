@@ -1,9 +1,55 @@
 # C++ Core Migration Plan
 
-Status: approved scope, execution in progress on branch `claude/trusting-hopper-lnnt8g`.
 Companion documents: `PERFORMANCE_PLAN.md` (measurements that motivate this
-migration), `tests/EDGE_CASES.md` (behaviour specification of the current core),
-`cpp/third_party/README.md` (vendored components and licenses).
+migration; its section 10 holds the measured results and what is left), `tests/EDGE_CASES.md`
+(behaviour specification of the current core), `cpp/third_party/README.md` (vendored components
+and licenses).
+
+## Status (2026-10-11)
+
+The migration has landed on `dev`. Every analysis (`.op`, `.tran`, `.ac`, `.hb`, the Krylov
+solvers, linear MOR, TPWL) runs in `mna_simulation._core`, result metadata reports
+`core_backend: "cpp"`, and the pure-Python core survives only as the oracle
+`tests/reference/mna_reference`. The CI workflow (the full pytest suite on Linux and Windows with
+Python 3.12 and 3.13, ctest, ASan/UBSan, C++ coverage) and the Wheels workflow passed on `dev` at
+`04c46a3` (P5 and P6a) and at `0c46c39` (P3b). Speedups below are reference time / core time at one core thread from
+`benchmarks/results/baseline-shared-machine.md` (shared machine, interim: measured at `04c46a3` on
+a 4-CPU VM with a load average of 4-5; an idle-machine baseline replaces it).
+
+| Phase | State | Evidence |
+| --- | --- | --- |
+| P0 Freeze and scaffold | done | oracle `tests/reference/mna_reference` with its digest check (`tests/differential/test_harness_selftest.py`); the corpus `tests/corpus.py` compared analysis by analysis by `tests/differential/test_reference_parity.py`; `tests/test_edge_cases.py` + `tests/EDGE_CASES.md`; `cpp/` with vendored Eigen/KLU/doctest; CI on Linux and Windows |
+| P1 Expressions and devices | done | `tests/test_native_expressions.py` (every expression form at 1e-13 over 10 000 points), `tests/test_native_circuit.py` (builder bit for bit), `tests/test_native_devices.py` (`f`/`J` at 1000 random states: Level-1 MOS bit-identical, exponentials 1e-13); SRAM device evaluation 29x (gate floor 20x), Jacobian assembly 28x (floor 10x) |
+| P2 Linear algebra and `.op` | done | `tests/test_native_linalg.py`, `tests/test_native_newton.py`, `tests/test_krylov_solvers.py`, `.op` differential; SRAM `.op` 14x (exit criterion 5x); RLC direct solve 39x real, 80x complex |
+| P3 Transient, AC, operating points | done | `tests/test_native_transient.py`, `tests/test_native_ac.py`, `.tran`/`.ac` differential including the 1035-unknown mesh; SRAM `.tran` 123x, BJT 2001 steps 354x, RLC `.tran` 272x, RLC `.ac` 174x plus 3.0x from 4 threads (floor 1.5x) |
+| P3b Convergence improvements | done | `tests/test_native_convergence.py`, `cpp/tests/test_pnjlim.cpp`, corpus `Deviation`s checked by `differential.compare.check_deviation`; rulings and details in 2.4.1 and 2.6 |
+| P4 Harmonic balance | done, one target open | `tests/test_native_hb.py` (every corpus `hb` analysis within 1e-6, the 205-harmonic mixer included), `tests/test_harmonic_balance.py`; mixer 6.3x (floor 2x), but 0.69-0.71 s on the shared machine against the 0.5 s exit target: recheck on the idle-machine baseline |
+| P5 MOR | done | `tests/test_native_mor.py`, `tests/test_mor.py`, MOR differential (three analyses against the oracle's full-order solution, 2.4.1); MOR basis 30x, TPWL training 131x, reduced AC 47x, reduced transient 80x |
+| P6 Cut-over and hardening | done except the open items below | front end (P6a, `tests/test_front_end_fast_path.py`: SRAM build 20x, parse 3.5x); thread budget, `num_threads`, UI control, metadata, CLI `--threads` (`tests/test_thread_budget.py`, `tests/test_thread_options.py`, `tests/test_server_api.py`); `benchmarks/compare_backends.py` and `tests/perf/test_perf_gate.py` (every floor met on the interim baseline and in a `--run-perf` run after P3b, shared machine); `tests/test_determinism.py` (every corpus analysis bitwise identical at 1 and 4 threads); `tests/test_native_leaks.py` (250 SRAM runs, RSS growth below 20 MB); README, STRUCT, USER_GUIDE, PERFORMANCE_PLAN |
+| P7 Optional | not started | known limitations and candidates in `PERFORMANCE_PLAN.md` sections 10.3 and 10.4 |
+
+Open P6 items:
+
+- **Concurrent requests (exit criterion missed).** Four concurrent SRAM 10x10 `.tran` requests take
+  3.8-5.0x the wall time of one (criterion <= 1.5x; `benchmarks/concurrent_requests.py`,
+  `tests/perf/test_concurrent_requests.py` fails with `--run-perf`). A request costs about 26 ms,
+  of which about 3.3 ms is the GIL-free native transient; parsing, building, the device
+  operating-point table and response conversion hold the GIL, so a thread pool cannot overlap
+  requests (2.5 assumed the heavy work no longer holds the GIL; for small circuits it still does).
+  `num_threads="auto"` also serializes simultaneous requests, because the first lease takes the
+  whole budget. Options: `PERFORMANCE_PLAN.md` section 10.2.
+- **Wheels.** The Wheels workflow builds the abi3 wheels for Linux and Windows and smoke-imports
+  `_core`; the full suite runs on 3.12 and 3.13 only against editable builds (CI), not against the
+  wheels.
+- **Baselines.** Only the interim `benchmarks/results/baseline-shared-machine.{json,md}` is
+  committed; idle-machine `baseline-linux.json` / `baseline-windows.json` are pending.
+- **Smaller deviations from the P6 deliverables.** ASan/UBSan and coverage cover ctest only (no
+  pytest subset under the sanitizers, no coverage threshold); KLU/BTF stay statically linked
+  (`cpp/third_party/README.md` records the LGPL reasoning) instead of a shared library in the
+  wheel; the backend adapter keeps its name `PythonBackend` (no `CoreBackend`) and
+  `backends/cpp_backend.py` is an unused placeholder; the `MNA_CORE_UNIT` toggles of section 6 were
+  never added (each cut-over landed with the differential suite as its gate); the determinism and
+  resource tests landed as `tests/test_determinism.py` and `tests/test_native_leaks.py` (section 4).
 
 ## 1. Decisions (binding)
 
@@ -299,8 +345,8 @@ benchmarks/compare_backends.py, benchmarks/results/
 | C++ unit tests | `cpp/tests/*.cpp` (doctest, ctest) | device models at region boundaries, KLU wrapper (singular, refactor, 1x1, n=0), Krylov methods on known matrices, Newton damping cases, time grid, expression evaluator against SymPy-generated vectors, `parallel_for` coverage and determinism |
 | Binding unit tests | `tests/test_native_*.py` | each exported call: shapes, dtypes, invalid inputs (wrong shapes, NaN, negative steps), error codes, GIL release (concurrent calls overlap), thread determinism |
 | Existing suite | `tests/test_*.py` (82 tests) | unchanged behaviour of parser, builder, service, MOR, HB, SRAM; they keep calling the public functions, which become facades |
-| Determinism | `tests/test_threads_determinism.py` | bitwise equality across thread counts |
-| Resource tests | `tests/test_resources.py` | 2000 small runs without RSS growth (Linux), no handle leaks across KLU objects |
+| Determinism | `tests/test_determinism.py` (planned as `test_threads_determinism.py`) | bitwise equality of the whole service response at 1 and 4 threads on every corpus analysis |
+| Resource tests | `tests/test_native_leaks.py` (planned as `test_resources.py`) | 200 SRAM `.op` and 50 SRAM `.tran` runs after a warm-up without 20 MB of RSS growth (peak and, on Linux, current RSS) |
 | Sanitizers and coverage | CI jobs | ASan/UBSan clean on ctest and on a pytest subset; line coverage >= 85 % for `cpp/src` (gcovr) and `mna_simulation` (pytest-cov) once facades are thin |
 
 ### 4.1 Edge-case catalogue

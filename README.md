@@ -4,7 +4,7 @@ Layered circuit-simulation workbench built around Modified Nodal Analysis (MNA).
 
 The project includes:
 
-- Python simulation core for `.op`, `.tran`, `.ac`, and `.hb`.
+- A native C++17 numerical core (`mna_simulation._core`) for `.op`, `.tran`, `.ac`, `.hb`, the Krylov solvers, and model-order reduction, driven by a Python front end (parser, MNA builder, schematic pipeline, service).
 - FastAPI service for schematic and netlist simulation.
 - React + TypeScript schematic editor.
 - Backend-owned schematic-to-netlist pipeline with hierarchy validation.
@@ -21,7 +21,7 @@ The project includes:
 - **Close-tone HB demo:** Frequency Domain Demos includes a nonlinear diode mixer driven by 1 GHz and 1.005 GHz tones, showing the 5 MHz beat/difference product in a high-Q envelope tank that would need 40+ beat periods of picosecond-step transient settling.
 - **Krylov subspace solver controls:** API/UI requests can use automatic method selection or explicitly choose Arnoldi/GMRES, MINRES/CR, or Conjugate Gradient for full-system iterative solves. Auto Krylov rank resolves after MNA assembly as `ceil(0.5 * matrix_dimension)`.
 - **Selected-output MOR:** optional model-order reduction keeps only cared outputs. Linear `.ac` and linearized `.tran` use output-aware rational Krylov projection; nonlinear `.tran` can use TPWL/POD with an in-memory ROM cache.
-- **Sparse large-circuit path:** linear transient Krylov runs can use cached SciPy CSR Backward-Euler operators instead of dense conversion on every step.
+- **Sparse large-circuit path:** every direct solve runs through SuiteSparse KLU on the circuit's sparse pattern; linear transients reuse one factorization of `G + C/h` while the step size is unchanged, and linear transient Krylov runs use the CSR Backward-Euler operator.
 - **Functional MOS SRAM demo:** the Large Scale Circuits menu includes a hierarchical 10x10 Level-1 MOS 6T SRAM demo with FUNC-driven write/hold/read timing; the root canvas shows cell instances while the reusable child level holds the transistor cell body.
 - **Large RLC benchmark demo:** the 23x23 distributed RLC mesh produces a 1035-unknown sparse MNA system for Krylov/MINRES benchmarking.
 - **Editable netlist mode:** the web app can switch from schematic mode to raw netlist editing after a confirmation that clears the schematic hierarchy.
@@ -32,20 +32,51 @@ The project includes:
 
 ## Repository Layout
 
-- `mna_simulation/`: Python parser, MNA builder, solvers, schematic pipeline, API service, and backend adapters.
+- `mna_simulation/`: Python parser, MNA builder, solver facades, schematic pipeline, API service, and backend adapters.
+- `mna_simulation/native/`: the Python side of the native core: import guard, circuit tables, expression compiler, linear-algebra and MOR facades, and the thread budget.
+- `cpp/`: C++17 sources of the extension `mna_simulation._core` (headers, sources, nanobind bindings, doctest unit tests, vendored Eigen/SuiteSparse/doctest).
 - `app/server/`: FastAPI app exposing `/health`, `/api/simulate`, and dynamic simulation websocket routes.
 - `app/web/`: React + TypeScript schematic editor and demo UI.
-- `tests/`: parser, builder, service, harmonic-balance, transistor, and hierarchy regression tests.
-- `benchmarks/`: benchmark entry points, workload netlists, and performance research prototypes.
-- `PERFORMANCE_PLAN.md`: measured performance review, multithreading plan, and C++ migration research.
+- `tests/`: parser, builder, service, harmonic-balance, transistor, and hierarchy regression tests; native binding tests (`test_native_*.py`); the frozen Python oracle (`tests/reference/`) with the differential corpus (`tests/corpus.py`, `tests/differential/`); thread-determinism and leak tests; opt-in performance tests (`tests/perf/`).
+- `benchmarks/`: benchmark entry points, the Python-vs-C++ comparison harness, the concurrent-request benchmark, workload netlists, committed results, and performance research prototypes.
+- `CPP_MIGRATION_PLAN.md`: plan, edge-case rulings, and status of the move of the numerical core to C++.
+- `PERFORMANCE_PLAN.md`: measured performance review, multithreading plan, C++ migration research, and the status of what landed.
 - `legacy/`: older simulator snapshots kept for comparison.
 - `USER_GUIDE.md`: user-facing web-app guide mirrored by the in-app Help dialog.
 - `DESIGN_AUDIT.md`: front end design audit, changes made, and LTspice feature comparison.
 - `STRUCT.md`: file-by-file architecture reference.
 
+## Native Core
+
+Every analysis runs in the compiled extension `mna_simulation._core`, built from `cpp/`:
+
+- C++17, bound to Python with nanobind (stable ABI: one wheel serves CPython 3.12 and later) and built by scikit-build-core.
+- Sparse direct solves with SuiteSparse KLU (with AMD, COLAMD, and BTF); dense linear algebra, complex arithmetic, and SVD with Eigen 3.4. Both are vendored, unmodified, under `cpp/third_party/` (versions, licenses, and the LGPL note for the statically linked KLU/BTF are in `cpp/third_party/README.md`), so a build downloads nothing.
+- Deterministic internal threading: each call starts its own `std::thread` workers for the threads it was granted (no OpenMP, no process-wide pool) and splits work into chunks that depend only on the item count, so results are bitwise identical for every thread count (`tests/test_determinism.py`). Parallel work: device evaluation from 2048 devices, AC sweep frequencies, harmonic-balance samples and block factorizations, the reduced MOR AC sweep, MOR shift factorizations from 2048 unknowns, and Krylov matrix-vector products from 4096 unknowns. A transient steps sequentially; below those sizes a call runs on one thread whatever it was granted.
+- The GIL is released for the whole native region of a call. FUNC time sources and `B` behavioral sources are parsed by SymPy once in Python and compiled to a bytecode that the core evaluates.
+- The extension is mandatory: there is no Python numerical fallback. The pure-Python core as of the migration start survives only as the test oracle `tests/reference/mna_reference`, which never ships.
+
+Build requirements (Linux and Windows are the supported, CI-tested platforms):
+
+- Python >= 3.12, CMake >= 3.26, and a C++17 compiler (GCC or Clang on Linux, Visual Studio 2022 Build Tools on Windows). Ninja is optional (`pip install ninja`); CI uses it for the C++ unit tests on Linux.
+- `python -m pip install -e ".[dev]"` compiles the extension (Release build into `build/<wheel tag>/`) and installs it into `mna_simulation/`. Editable installs do not rebuild on import: run `python -m pip install -e .` again after changing C++ sources or after adding or moving Python modules.
+- An `ImportError` that names `mna_simulation._core` means the extension was not built for this interpreter; the message repeats the build command.
+
+Wheels: the Wheels workflow (`.github/workflows/wheels.yml`; runs on `v*` tags, on manual dispatch, and on pushes to `dev`/`main` that change `cpp/`, `pyproject.toml`, or the workflow) builds one abi3 `cp312` wheel per platform for 64-bit Linux (manylinux) and Windows (repaired with `delvewheel`), smoke-imports `_core`, and uploads the wheels as artifacts. Installing a wheel needs no compiler.
+
+C++ unit tests (doctest, registered with ctest) build without Python:
+
+```bash
+cmake -S cpp -B build-cpp -G Ninja -DCMAKE_BUILD_TYPE=Release -DMNA_BUILD_TESTS=ON -DMNA_BUILD_PYTHON_MODULE=OFF
+cmake --build build-cpp --parallel
+ctest --test-dir build-cpp --output-on-failure
+```
+
+`-DMNA_ENABLE_SANITIZERS=ON` builds them with ASan + UBSan and `-DMNA_ENABLE_COVERAGE=ON` with coverage instrumentation; CI runs both on Linux.
+
 ## Quick Start
 
-Install the Python package with dev dependencies:
+Install the Python package with dev dependencies (this compiles the native core, see [Native Core](#native-core)):
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -106,18 +137,27 @@ Schematic runs return the generated canonical netlist in response metadata. Simu
 - `probe_nodes`: optional labels such as `V(n1)` or `I(L1)` for result filtering.
 - `output_max_points`: optional waveform decimation limit for API responses.
 - Option values are type-checked: booleans take `true`/`false` (also `yes/no/on/off/1/0`, any case), counts take whole numbers (`3`, `"3"`, `3.0`), time/frequency values (`t_stop`, `t_step`, `f_start`, `f_stop`, `time_window`) and tolerances take numbers or metric strings such as `"1m"`, and `init_condition` takes `DEFAULT`, `RANDOM` (any case) or a list of numbers. Anything else returns HTTP 400 (`INVALID_OPTIONS`).
+- Only an absent (or `null`) option falls back to its default; zero is a value: `t_stop = 0` returns the single initial sample, `f_start = 0` / `f_stop = 0` are DC points, and `t_step <= 0`, `points <= 0`, or `harmonics <= 0` are errors (`TRAN_ERROR`, `AC_ERROR`, `HB_ERROR`; HTTP 400 with the code). `USER_GUIDE.md` lists every behaviour that changed with the native core.
 
 ## Threads and Concurrency
 
 Every run leases worker threads from one machine-wide budget, so concurrent API requests and websocket streams divide the cores instead of oversubscribing them.
 
 - `MNA_NUM_THREADS` caps the server (default: `os.cpu_count()`, never more). `/api/simulate` and `/ws/dyn` run on a thread pool of that size, and a request waits while every thread is leased. `GET /health` reports `thread_budget` (`total`, `free`, `active`), `core_version`, and `build_info`.
-- Requests pass `options.num_threads`: `"auto"` (default: as many as are free right now) or a positive integer, which acts as an upper limit. Anything else returns HTTP 400. The CLI takes `--threads N|auto` and the UI has a Threads control. Result metadata reports `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend`, `core_version`, and `elapsed_ms`.
-- NumPy/SciPy BLAS is pinned to one thread for the duration of every run (`threadpoolctl`). With four concurrent SRAM transients in separate processes this takes the batch from 45 s to 3.5 s on a 4-core machine (`PERFORMANCE_PLAN.md` section 4.2). Still start the server with `OPENBLAS_NUM_THREADS=1` as belt and braces, because it also covers BLAS calls made outside a run:
+- Requests pass `options.num_threads`: `"auto"` (the default) or a positive integer, which acts as an upper limit (`min(requested, free, total)`). `"auto"` takes a fair share of what is free, `max(1, total // (active runs + 1))`, so a run that finds the server idle gets the whole budget. Anything else returns HTTP 400. The CLI takes `--threads N|auto` and the UI has a Threads control. Result metadata reports `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend` (`"cpp"`), `core_version`, and `elapsed_ms` (wall time of the backend run).
+- The native core uses the granted threads where an analysis has parallel work (see [Native Core](#native-core)); the thread count changes speed only, never results. Small circuits gain nothing from more threads, because every parallel region starts its own workers.
+- Concurrent requests in one server process overlap only in their native parts. Parsing, MNA building, the device operating-point table, and response conversion run in Python under the GIL and are most of a short request: four simultaneous SRAM 10x10 transients take about four times as long as one (`python benchmarks/concurrent_requests.py`; `PERFORMANCE_PLAN.md` section 10). Simultaneous `"auto"` requests also queue behind each other's leases, since the first one takes the whole budget.
+- NumPy/SciPy BLAS is pinned to one thread for the duration of every run (`threadpoolctl`). Before the native core, with four concurrent SRAM transients in separate processes, this took the batch from 45 s to 3.5 s on a 4-core machine (`PERFORMANCE_PLAN.md` section 4.2). Still start the server with `OPENBLAS_NUM_THREADS=1` as belt and braces, because it also covers BLAS calls made outside a run:
 
 ```bash
 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MNA_NUM_THREADS=4 python -m uvicorn app.server.main:app --host 127.0.0.1 --port 8010
 ```
+
+## Environment Variables
+
+- `MNA_NUM_THREADS`: size of the machine-wide thread budget (a positive integer, capped at `os.cpu_count()`; unset means the CPU count; an invalid value is ignored with a `RuntimeWarning`).
+- `MNA_HB_MAX_NNZ`: upper bound on the matrix entries a harmonic-balance run may store (default `3e7`, the core's `HB_DEFAULT_MAX_NNZ`; any positive number such as `5e7` or `250000`; an invalid value is ignored with a `RuntimeWarning`). A larger system fails before anything is allocated with `HB_ERROR` "HB system too large (N=..., nnz=...); reduce harmonics". The HB dimension N = n (2H + 1) is also capped at 1e6.
+- `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`: set them to 1 for servers (above).
 
 ## Supported Devices
 
@@ -137,6 +177,8 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MNA_NUM_THREADS=4 python -m uvicorn app
 - `.ac <f_start> <f_stop> <points>`
 - `.hb [harmonics] [time_window]`
 - `.dyn` frontend websocket stream, executed by the backend as transient analysis.
+
+Convergence aids, each engaged only when the plain iteration fails, so circuits that converge without them give the same results: gmin stepping in the service (`0, 1e-12, ..., 1e-5`, with gmin across device terminals and from every node to ground), gmin continuation from 1e-2 inside a failed `.op`, SPICE-style junction voltage-step limiting when the damped Newton of `.op`/`.tran` stalls, and a damped harmonic-balance Newton after the undamped one breaks down. `USER_GUIDE.md` ("What Changed With The Native Core") has the details.
 
 ## MOR Method Notes
 
@@ -160,11 +202,23 @@ The frontend supports:
 
 ## Testing
 
-Run all Python tests:
+Run all Python tests: parser, builder, service, analyses, the native bindings (`tests/test_native_*.py`), the differential suite against the frozen Python oracle, thread determinism, and the leak check. Tests marked `perf` are skipped unless `--run-perf` is given.
 
 ```bash
 python -m pytest
 ```
+
+Subsets and performance checks:
+
+```bash
+python -m pytest -m differential                 # live core vs the frozen oracle on every corpus analysis
+python -m pytest -m "differential and not slow"  # the same without the 1035-unknown circuits
+python -m pytest tests/perf --run-perf           # speedup floors, thread scaling, concurrent-request criterion
+python benchmarks/compare_backends.py            # Python reference vs C++ core per unit (Markdown table + JSON)
+python benchmarks/concurrent_requests.py         # N concurrent SRAM requests against the FastAPI app
+```
+
+The perf tests and the benchmarks compare ratios rather than absolute times, and they need an otherwise idle machine (`compare_backends.py` warns when the 1-minute load average is above 0.5). Committed results and their policy are in `benchmarks/results/README.md`.
 
 Build the frontend:
 
@@ -176,12 +230,15 @@ npm run build
 ## Benchmark
 
 ```bash
+python benchmarks/compare_backends.py --list    # comparison units: device evaluation, assembly, solves, analyses, MOR
+python benchmarks/compare_backends.py --quick --threads 1,4 --json out.json --markdown out.md
+python benchmarks/concurrent_requests.py --server uvicorn   # concurrent requests over real HTTP
 python benchmarks/benchmark_basic.py        # tiny RC transient
 python benchmarks/benchmark_workloads.py    # SRAM, RLC mesh, BJT amplifier, and HB workloads (add --profile for hot spots)
 python benchmarks/blas_contention.py        # concurrent runs vs OPENBLAS_NUM_THREADS
 ```
 
-Run benchmarks with nothing else competing for the CPU. Multithreaded OpenBLAS calls degrade sharply when several simulations overlap; `PERFORMANCE_PLAN.md` documents the measurements and the planned fixes.
+Run benchmarks with nothing else competing for the CPU. `PERFORMANCE_PLAN.md` documents the original measurements, the speedups of the native core, and what is left.
 
 ## Legacy Entry Points
 

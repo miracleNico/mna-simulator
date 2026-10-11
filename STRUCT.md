@@ -8,24 +8,27 @@ This document describes the project-authored source, config, docs, and tests. It
 2. `SimulationService` (`mna_simulation/api/service.py`) normalizes request handling, leases worker threads from the machine-wide thread budget (`mna_simulation/native/threads.py`), and pins NumPy/SciPy BLAS to one thread for the run.
 3. Raw netlists go directly to the parser. Schematic JSON goes through `mna_simulation/schematic_pipeline.py`.
 4. The schematic pipeline validates hierarchy, flattens `SUBCKT` instances, forms nets, emits canonical netlist text, and parses it back into `CircuitIR`.
-5. `mna_simulation/backends/python_backend.py` builds `AnalysisOptions`.
-6. `mna_simulation/netlist.py` and `mna_simulation/mna_builder.py` produce the MNA problem.
-7. Optional selected-output MOR in `mna_simulation/mor/` reduces `.ac` and `.tran` problems when requested.
-8. `mna_simulation/solvers.py` executes `.op`, `.tran`, `.ac`, or `.hb`.
-9. Results return through the API service (with `threads_used`, `core_version`, and `elapsed_ms` metadata) and are plotted by the frontend.
+5. `mna_simulation/backends/python_backend.py` builds `AnalysisOptions` (strict option coercion) and runs the gmin-stepping loop.
+6. `mna_simulation/netlist.py` and `mna_simulation/mna_builder.py` produce the MNA problem; the builder also compiles it once into the native `Circuit` (`mna_simulation/native/circuit.py`, `_core.build_circuit`) that every gmin step reuses.
+7. Optional selected-output MOR in `mna_simulation/mor/` reduces `.ac` and `.tran` problems when requested (numerics in `_core.mor_*`).
+8. `mna_simulation/core_basic.py` / `core_advanced.py` dispatch to the facades in `mna_simulation/solvers.py`, which call the native core (`_core.solve_op`, `solve_transient`, `ac_sweep`, `hb_solve`, `direct_solve`, `krylov_solve`) with the GIL released and the granted thread count.
+9. Results return through the API service (with `threads_used`, `core_backend`, `core_version`, and `elapsed_ms` metadata) and are plotted by the frontend.
 
-The numerical core is being moved into the mandatory C++ extension `mna_simulation._core` (`cpp/`), one unit at a time behind the existing Python functions (`CPP_MIGRATION_PLAN.md`). Every analysis still runs on the Python solvers today; the extension currently provides `version`, `build_info`, `klu_solve`, `parallel_row_sums`, `effective_threads`, and `binding_units`. The pure-Python core as of the migration start is frozen as the test oracle `tests/reference/mna_reference`.
+Every analysis runs in the mandatory C++17 extension `mna_simulation._core` (`cpp/`, nanobind, vendored Eigen and SuiteSparse KLU); there is no Python numerical fallback (`CPP_MIGRATION_PLAN.md`, status at its top). Python keeps everything that involves strings: parsing, node naming, labels, error messages, the expression text, option handling, metadata, and the response. The pure-Python core as of the migration start is frozen as the test oracle `tests/reference/mna_reference`, against which `tests/differential/` compares every corpus analysis.
 
 ## Root Files
 
 ### `README.md`
 - Project-level usage guide.
 - Covers setup, CLI/API usage, hierarchy behavior, supported devices/modes, tests, and frontend startup.
-- "Threads and Concurrency" section: the `MNA_NUM_THREADS` budget, the `num_threads` request option, `--threads`, BLAS pinning, and the recommended `OPENBLAS_NUM_THREADS=1` server start.
+- "Native Core" section: what `mna_simulation._core` is (C++17, nanobind, vendored Eigen and KLU, deterministic per-call threading), build requirements, wheels, and the C++ unit tests.
+- "Threads and Concurrency" section: the `MNA_NUM_THREADS` budget, the `num_threads` request option and its `auto` rule, `--threads`, BLAS pinning, what concurrent requests in one process can and cannot overlap, and the recommended `OPENBLAS_NUM_THREADS=1` server start; "Environment Variables" adds `MNA_HB_MAX_NNZ`.
+- "Testing" and "Benchmark": the default suite, the differential subset, `pytest tests/perf --run-perf`, `compare_backends.py`, and `concurrent_requests.py`.
 
 ### `USER_GUIDE.md`
 - User-facing guide for the web app.
 - Mirrors the main topics exposed by the in-app Help dialog: demos, schematic editing, hierarchy, analyses, threads, result display, Krylov subspace solver controls, raw netlist mode, and troubleshooting.
+- "What Changed With The Native Core" lists every user-visible behaviour change with the old behaviour (strict options, zero values, `init_condition`, zero-ohm resistors, the AC operating point, the MOR basis, threads, error reports, and the P3b convergence improvements: junction limiting, gmin continuation, node-to-ground gmin, BJT exponent extrapolation, damped HB Newton). The in-app copy (`app/web/src/lib/userGuide.ts`) has not been updated for this section yet.
 
 ### `STRUCT.md`
 - This file-by-file architecture reference.
@@ -35,15 +38,17 @@ The numerical core is being moved into the mandatory C++ extension `mna_simulati
 
 ### `.gitignore`
 - Ignores Python bytecode and tool caches, packaging outputs (anchored to the root: `/build/`, `/dist/`, `/wheelhouse/`, `*.whl`, `*.egg-info/`), native extension artefacts (`*.so`, `*.pyd`, `cpp/build*/`, `/build-cpp/`), coverage outputs, and Vite caches.
-- Ignores perf comparison runs (`benchmarks/results/*.json`) except the committed per-platform baselines (`!benchmarks/results/baseline-*.json`).
+- Ignores perf comparison runs (`benchmarks/results/*.json`) except the committed baselines (`!benchmarks/results/baseline-*.json`, e.g. `baseline-shared-machine.json`); the Markdown tables next to them are not ignored.
 - `app/web/node_modules` and `app/web/dist` remain tracked.
 
 ### `PERFORMANCE_PLAN.md`
 - Measured performance review of the Python core (profiles of the SRAM, RLC mesh, BJT amplifier, and harmonic-balance workloads).
 - Prioritized plan for multithreading and solver changes, and the research on a C++ kernel migration.
 - Section 4.1 (wall-clock per workload) and 4.3 (prototype kernels) fix the workload sizes used by `benchmarks/perf_units.py`.
+- Section 10 (status): what landed per migration phase with the measured speedups, the concurrent-request finding, and what is left (P7).
 
 ### `CPP_MIGRATION_PLAN.md`
+- Status table at the top: P0-P6 and P3b with one line of evidence each (tests and gates), the open P6 exit criteria, and P7 (optional).
 - Approved plan for moving the whole numerical core (`.op`, `.tran`, `.ac`, `.hb`, Krylov, MOR, TPWL) into the mandatory nanobind extension `mna_simulation._core`; parser, schematic pipeline, FastAPI app, CLI, and UI stay in Python/TypeScript.
 - Binding decisions (KLU + Eigen, frozen Python oracle, Linux + Windows, explicit thread control, `std::thread` pool), target architecture and `Circuit` data contract, kernel API, parity rules and edge-case rulings (2.4.1), multithreading design, HB and MOR designs.
 - Repository layout, test harness layers, the performance comparison harness (section 5), phases P0-P7 with exit criteria (section 6), the load-bearing quirks parity checklist (6.1), and risks.
@@ -85,35 +90,36 @@ The numerical core is being moved into the mandatory C++ extension `mna_simulati
 
 ### `mna_simulation/mna_builder.py`
 - Converts `CircuitIR` to `MnaProblem`.
-- Builds dense and sparse conductance/capacitance matrices, RHS vectors, nonlinear vectors, labels, and branch maps.
-- Stamps passive devices, sources, controlled sources, diodes, BJTs, and MOSFETs.
-- Stamps Level-1 BJT/MOS nonlinear device metadata and junction/gate capacitances for transient analysis.
+- Stamps COO triplets once (P6a fast path) and forms the SciPy CSR `G`/`C` with duplicates summed in stamping order (bit-identical to the reference builder), RHS vectors, the symbolic `f_str`/`b_time_str` display vectors, labels, and branch maps; dense `G`/`C` stay available for `.show_matrix`, small circuits, and tests.
+- Stamps passive devices, sources, controlled sources, diodes, BJTs, and MOSFETs, plus Level-1 device metadata and junction/gate capacitances for transient analysis.
+- Raises `NETLIST_FATAL` "'<name>' has zero resistance" for `R = 0` and a small-signal BJT with `rpi = 0` (2.4.1).
+- `_compile_native` builds `problem.native`, the compiled `_core.Circuit` (gmin-free `G`, `C`, the unit gmin stamps, device tables, behavioral programs) shared by every gmin step.
 
 ### `mna_simulation/solvers.py`
-- Numerical solver library.
-- Implements Newton-Raphson DC, Backward-Euler transient, linear AC sweep, harmonic balance, and time reconstruction helpers.
-- Solves physical Level-1 BJT/MOS operating points, linearizes them for `.ac`, and keeps nonlinear device I-V equations active in `.tran`.
-- Implements Krylov routing for Arnoldi/GMRES, MINRES/CR, and Conjugate Gradient.
-- Allows explicit Krylov method overrides even when matrix classification would choose another route.
-- Uses cached sparse CSR Backward-Euler operators for linear transient Krylov runs when sparse MNA matrices are available.
+- Facades over the native core with the reference signatures, return shapes, metadata keys, and exceptions: `solve_dc_nr` / `solve_operating_point` (`_core.solve_op`), `solve_transient` (`_core.solve_transient`, optional progress callback), `solve_ac` (`_core.ac_sweep`), `solve_harmonic_balance` / `create_fourier_matrices` / `reconstruct_time_domain` (`_core.hb_*`), `compile_nl_functions` / `compile_time_source_func` (compiled programs), `_transient_time_points`, and the Level-1 device facades.
+- Re-exports the linear-algebra facades of `native/linalg.py` (`solve_linear`, `krylov_solve_linear`, `classify_krylov_matrix`, `resolve_krylov_rank`, `describe_krylov_choice`).
+- `newton_start` turns `init_condition` (`DEFAULT`/`RANDOM` in any case, or an array validated for length) into the Newton starting point; `RANDOM` draws from NumPy's global RNG in Python.
+- `hb_max_nnz()` reads `MNA_HB_MAX_NNZ` (default `_core.HB_DEFAULT_MAX_NNZ`, 3e7).
+- `_nmos_level1_forward` is a leftover Python copy of the Level-1 MOS equations with no callers.
 
 ### `mna_simulation/core_basic.py`
 - Facade for `.op`, `.tran`, `.ac`, and matrix inspection.
+- Builds the `.op`/`.tran` operating-point tables in Python (`_device_operating_points`, one native device call per transistor).
 - Adds solver metadata for Krylov method, requested method, matrix dimension, sparse density, iteration count, rank mode, and fallback status.
 - Routes selected-output MOR for `.ac`, linear `.tran`, and nonlinear TPWL `.tran`; `.op` and matrix inspection report MOR as intentionally unused.
 
 ### `mna_simulation/core_advanced.py`
 - Facade for `.hb`.
 - Infers base frequency from sinusoidal sources and optionally reconstructs time-domain waveforms from harmonic-balance coefficients.
-- Passes Krylov rank/method options through harmonic-balance linear solves.
+- Passes Krylov rank/method options, `num_threads`, and the `MNA_HB_MAX_NNZ` bound through to `_core.hb_solve`; only an unset `harmonics` means 8, `harmonics <= 0` is `HB_ERROR` (2.4.1); solver statistics are reported as `metadata["hb_solver"]`.
 - Reports MOR as intentionally unused for `.hb` v1.
 
 ### `mna_simulation/mor/`
-- Decoupled model-order reduction package.
+- Decoupled model-order reduction package: option handling, metadata, validation, and the TPWL cache in Python; the numerics in `_core.mor_*` through `native/mor.py`.
 - `selectors.py` maps labels such as `V(out)` and `I(L1)` to selector matrices and validates display-node subsets.
 - `metadata.py` resolves automatic MOR order and emits compression/cache metadata.
-- `linear.py` implements output-aware rational Krylov/PRIMA-like projection for linear and `.op`-linearized `.ac` plus linear transient. Large sparse linear transients can validate selected outputs against the sparse full-order Krylov path and fall back when the reduced model underfits or becomes unstable.
-- `tpwl.py` implements TPWL/POD nonlinear transient MOR with an in-memory LRU cache.
+- `linear.py` implements output-aware rational Krylov/PRIMA-like projection for linear and `.op`-linearized `.ac` plus linear transient (basis built with classical Gram-Schmidt twice, 2.4.1). Large sparse linear transients can validate selected outputs against the sparse full-order Krylov path and fall back when the reduced model underfits or becomes unstable.
+- `tpwl.py` implements TPWL/POD nonlinear transient MOR with an in-memory LRU cache (8 entries) keyed by a digest of the problem and options.
 
 ### `mna_simulation/schematic_pipeline.py`
 - Backend-owned schematic graph to netlist conversion.
@@ -135,6 +141,23 @@ The numerical core is being moved into the mandatory C++ extension `mna_simulati
 - `require_core()` returns the module or raises an `ImportError` that explains how to build it (`pip install -e ".[dev]"`, CMake >= 3.26, a C++17 compiler).
 - `core_version()` and `build_info()` (compiler, Eigen/SuiteSparse/KLU versions, build flags) for health checks and result metadata.
 
+### `mna_simulation/native/circuit.py`
+- Plain-table interface to `_core.build_circuit` (the tables of `CPP_MIGRATION_PLAN.md` 2.1): `triplets`, `diode_table`, `mos_table`, `bjt_table`, `behavioral_table`, and `build_circuit` (0-based node indices, `-1` is ground; `node_count`, the node unknowns that get a node-to-ground gmin stamp, is inferred from the tables when not given and is 0 for device-only circuits).
+- `compile_device_functions` is the engine of `solvers.compile_nl_functions`: it compiles the nonlinear rows of `solver_f_str` and the Level-1 device dicts into a temporary circuit and returns native `f(*x)` / `J(*x)` callables.
+
+### `mna_simulation/native/expressions.py`
+- Compiles FUNC time sources, `B` behavioral sources, and nonlinear current rows to the native bytecode VM: SymPy `sympify` with the reference locals, the NumPy code printer configured as `lambdify` does, then the printed AST lowered to postfix `_core.Program` bytecode, so evaluation reproduces the reference operation by operation.
+- `compile_expression(text, time_dependent=..., n_unknowns=...)` is cached per `(text, time_dependent, n_unknowns)` (LRU, 4096); unsupported constructs raise `NETLIST_FATAL`, unknown symbols `TypeError` (the reference's exception).
+- Also home of `_sympy_locals` and `_prepare_sympy_expression`, which `solvers.py` re-exports.
+
+### `mna_simulation/native/linalg.py`
+- Drop-in facades for the reference linear algebra: `classify_krylov_matrix` (the sparse rule for every input), `resolve_krylov_rank`, `describe_krylov_choice`, `krylov_solve_linear` (`_core.krylov_solve`, `info["engine"] == "mna_core"`), `solve_linear` and `direct_solve` (`_core.direct_solve`: KLU or dense LU, `np.linalg.LinAlgError("Singular matrix")` on a singular system), and `LinearSolver`.
+- Converts dense arrays and SciPy sparse matrices to CSC with int32 indices once per call (`to_csc_arrays`).
+
+### `mna_simulation/native/mor.py`
+- Facades over `_core.mor_*` used by `mor/linear.py` and `mor/tpwl.py`: `circuit_operands` / `matrix_operands` (`MorOperands`: `G` and `C` values in one CSC pattern), `krylov_basis`, `project`, `reduced_ac`, `reduced_transient`, `pod_basis`, `training_indexes`, `tpwl_local_models`, `tpwl_simulate`, and `safe_solve`.
+- `resolve_threads` maps `None`/`"auto"` to 1; `PARALLEL_MIN_UNKNOWNS` (2048) is the size from which the per-circuit MOR work uses more than one thread. Core errors are translated to the reference exceptions.
+
 ### `mna_simulation/native/threads.py`
 - Machine-wide thread budget: `budget_total()` reads `MNA_NUM_THREADS` (capped at the CPU count, invalid values warn and fall back to the CPU count).
 - `coerce_num_threads()` validates the `num_threads` option (`None`, `"auto"`, positive integers or integer strings; anything else raises `ValueError`).
@@ -155,21 +178,23 @@ The numerical core is being moved into the mandatory C++ extension `mna_simulati
 - Routes schematic payloads through `schematic_pipeline`.
 - Adds generated canonical netlist text to response metadata.
 - Applies optional output decimation to large waveform responses.
-- Leases threads from a `ThreadBudget` (the process default unless one is injected) and runs the backend inside `pin_blas_threads()`; adds `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend` (`"python"` until the cut-overs), `core_version`, and `elapsed_ms` to result metadata.
+- Leases threads from a `ThreadBudget` (the process default unless one is injected) and runs the backend inside `pin_blas_threads()`; adds `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend` (`"cpp"`: every analysis runs in the native core), `core_version`, and `elapsed_ms` (wall time of `backend.run`) to result metadata.
 - Tags option-validation `ValueError`s with a PEP 678 note (`is_invalid_option_error`) so the HTTP layer can answer 400 without catching solver `ValueError`s.
 - `healthcheck()` also reports `core_version`, `build_info`, and the thread budget snapshot.
 
 ## Backends: `mna_simulation/backends/`
 
 ### `mna_simulation/backends/python_backend.py`
-- Active backend adapter.
+- Active backend adapter (the name is historical: its analyses run in the native core).
 - Parses netlists, builds options from directives, runs analysis, and exposes capability flags.
+- `build_options` coerces request options strictly (booleans, integers, metric-suffix numbers, `init_condition`); rejections are plain `ValueError`s that the service tags for HTTP 400 (`tests/test_option_coercion.py`).
+- `run` builds the problem and its native circuit once and retries over `DEFAULT_GMIN_STEPS` only for numerical failures (`is_numerical_failure`: `NR_CONVERGENCE`, `JACOBIAN_SINGULAR`, `AC_ERROR`, `LU_CONVERGENCE`, numerical `HB_ERROR`, `LinAlgError`); structural errors are raised at once.
 - Coerces Krylov rank/method request options, including aliases such as `arnoldi`, `gmres`, `minres`, and `cg`.
 - Coerces MOR method/order/output options and advertises model-order reduction capability.
 - Coerces `num_threads` with `coerce_num_threads` into `AnalysisOptions.num_threads`.
 
 ### `mna_simulation/backends/cpp_backend.py`
-- Placeholder adapter for a future C++ core.
+- Placeholder adapter from before the migration (raises `NotImplementedError`); unused, since the native core is reached through `PythonBackend` and the solver facades.
 
 ## Model Library: `mna_simulation/library/`
 
@@ -182,39 +207,48 @@ The numerical core is being moved into the mandatory C++ extension `mna_simulati
 
 ## Native Core: `cpp/`
 
-The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel and editable installs) or directly with CMake (C++ tests). Only the phase-0 scaffold is committed; later units add files under `include/mna/`, `src/`, `bindings/`, and `tests/` without editing CMake.
+The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel and editable installs) or directly with CMake (C++ unit tests). One directory per unit under `include/mna/` (public headers) and `src/` (implementation), one nanobind file per unit under `bindings/`, and doctest files under `tests/`; CMake globs each directory, so a new file needs no CMake edit. Every header opens with a comment that states the algorithm, the parity rules against the Python reference, the threading, and the error codes; read those comments before the code.
 
 ### `cpp/CMakeLists.txt`
 - CMake >= 3.26 project `mna_core` (C++17, C11, hidden symbol visibility, PIC).
-- Targets: `klu_vendored` (SuiteSparse_config + AMD + COLAMD + BTF + KLU compiled as C with `NTIMER`, guarded by a source-count check), `mna_core` (static library from every `src/**/*.cpp`, Eigen with `EIGEN_MPL2_ONLY` and `EIGEN_DONT_PARALLELIZE`), `_core` (nanobind module, `STABLE_ABI NB_STATIC`, from every `bindings/*.cpp`, installed into `mna_simulation/`), and `mna_core_tests` (doctest, every `tests/*.cpp`, registered with ctest).
-- Options: `MNA_BUILD_TESTS`, `MNA_BUILD_PYTHON_MODULE` (`AUTO`/`ON`/`OFF`; forced on under scikit-build), `MNA_ENABLE_SANITIZERS` (ASan + UBSan), `MNA_ENABLE_COVERAGE`, `MNA_NATIVE_ARCH` (never for wheels). Warnings `/W4` or `-Wall -Wextra -Wpedantic` on project targets only.
+- Targets: `klu_vendored` (SuiteSparse_config + AMD + COLAMD + BTF + KLU compiled as C with `NTIMER` into a static library, guarded by a source-count check), `mna_core` (static library from every `src/**/*.cpp`, Eigen with `EIGEN_MPL2_ONLY` and `EIGEN_DONT_PARALLELIZE`), `_core` (nanobind module, `STABLE_ABI NB_STATIC`, from every `bindings/*.cpp`, installed into `mna_simulation/`), and `mna_core_tests` (doctest, every `tests/*.cpp`, registered with ctest).
+- Options: `MNA_BUILD_TESTS`, `MNA_BUILD_PYTHON_MODULE` (`AUTO`/`ON`/`OFF`; forced on under scikit-build), `MNA_ENABLE_SANITIZERS` (ASan + UBSan), `MNA_ENABLE_COVERAGE`, `MNA_NATIVE_ARCH` (never for wheels). Warnings `/W4` or `-Wall -Wextra -Wpedantic` on project targets only; no fast-math anywhere.
 
-### `cpp/include/mna/error.hpp`, `cpp/src/error.cpp`
-- `mna::Error` (a `std::runtime_error`) with an `ErrorCode` whose names mirror the Python core's codes (`NETLIST_FATAL`, `NR_CONVERGENCE`, `JACOBIAN_SINGULAR`, `HB_ERROR`, ...), so errors translate 1:1 to Python.
+### `cpp/include/mna/` and `cpp/src/`
 
-### `cpp/include/mna/version.hpp`, `cpp/src/build_info.cpp`
-- Version `0.70.0-dev` and `BuildInfo` (compiler and version, C++ standard, build type, thread implementation, hardware concurrency, Eigen/SuiteSparse/KLU versions, platform, sanitizer/coverage/native-arch/debug-assert flags).
+Headers are listed relative to `include/mna/`; each `x.hpp` with an implementation has a matching `src/x.cpp` (the assembly lives in `src/devices/assembly.cpp`).
 
-### `cpp/include/mna/threads.hpp`
-- Header-only `std::thread` parallel loop: `parallel_for` / `parallel_for_chunks` over at most 256 chunks whose boundaries depend only on the item count (bitwise-identical reductions for every thread count), `num_threads <= 1` runs inline, the first worker exception is rethrown after all threads join.
-- `effective_threads(requested)` clamps a request to `[1, hardware_threads()]`. No global state: the thread count is an argument of every call.
+- **Errors** (`error.hpp`, `src/error.cpp`): `mna::Error` (a `std::runtime_error`) with an `ErrorCode` whose names mirror the Python codes (`NETLIST_FATAL`, `NR_CONVERGENCE`, `JACOBIAN_SINGULAR`, `TRAN_ERROR`, `AC_ERROR`, `HB_ERROR`, ...), so errors translate 1:1 to Python.
+- **Version** (`version.hpp`, `src/build_info.cpp`): version `0.70.0-dev` and `BuildInfo` (compiler, C++ standard, build type, thread implementation, hardware concurrency, Eigen/SuiteSparse/KLU versions, platform, sanitizer/coverage/native-arch/debug-assert flags).
+- **Threads** (`threads.hpp`, header-only): `parallel_for` / `parallel_for_chunks` on per-call `std::thread` workers over at most 256 chunks whose boundaries depend only on the item count (bitwise-identical reductions for every thread count); `num_threads <= 1` runs inline; the first worker exception is rethrown after all threads join; `effective_threads(requested)` clamps to `[1, hardware_threads()]`. No global state.
+- **Circuit** (`circuit/circuit.hpp`): the compiled circuit: union CSC pattern of `G`, `C`, the unit gmin stamps, and every device Jacobian footprint; static values in pattern order; structure-of-arrays device tables (diodes, Level-1 MOS and BJT, behavioral programs) with their pattern slots; the assembly map. `g_effective(gmin)` forms `G + gmin * stamps` for any gmin without a rebuild; since P3b the gmin pattern also holds one node-to-ground stamp per node unknown (`node_count()`, never branch rows), and `junctions()` lists the exponential junctions (diodes, BJT base-emitter and base-collector) for junction limiting.
+- **Devices** (`devices/diode.hpp`, `devices/mos_level1.hpp`, `devices/bjt_level1.hpp`, `devices/fp_contract.hpp`, header-only): Shockley diode (`V_T = 0.025`, no clipping), Level-1 MOS (bit-identical to the Python equations), Level-1 BJT (`vt = 0.02585`; since P3b the exponential continues linearly beyond `|v/vt| = 80`, value and slope continuous); `MNA_NO_FP_CONTRACT` turns off fused multiply-add on Clang so the kernels round like the reference.
+- **Assembly** (`assembly.hpp`): device currents `f(x, t)` and Jacobian values in two phases (per-device scratch in parallel, then a gather in fixed device order through the assembly map); bitwise identical for every thread count.
+- **Expressions** (`expr/program.hpp`): postfix bytecode of FUNC, `B`, and nonlinear-row expressions (produced by `native/expressions.py`) with scalar, batch, and forward-mode dual-number evaluators; NumPy float64 semantics (`mod`, `minimum`/`maximum`, `select`, division by zero).
+- **Linear algebra** (`linear/`): `linear_solver.hpp` (CSC pattern, the `LinearSolver` interface, and the dense-vs-KLU policy; `kDenseMaxN = 0`, so every circuit solve uses KLU), `klu_solver.hpp` (`KluSolver` real and `KluSolverZ` complex: `analyze` once per pattern, `factor`, `refactor` reusing the pivot order with a fallback, `solve`), `dense_solver.hpp` (Eigen `PartialPivLU`, real and complex, with an explicit singularity rule), `sparse.hpp` (CSR view and SpMV, row-parallel from 4096 rows), `classify.hpp` (general, symmetric, or positive definite by the sparse rule; Cholesky only for n <= 256), `krylov.hpp` (GMRES(restart), MINRES/CR, and CG, real and complex, with the reference routing, the kernel regimes below and above n = 64, the acceptance rule, and the `info` keys).
+- **Analyses** (`analyses/`): `time_grid.hpp` (bitwise port of the fixed-step grid and its `TRAN_ERROR`s), `newton.hpp` (damped Newton shared by `.op` and `.tran`; device evaluation threaded only from 2048 devices; since P3b the junction strategy after a failed or stalled damping loop), `limiting.hpp` (SPICE3 `pnjlim` and `limit_junctions`, P3b), `op.hpp` (`.op` on `G + gmin * stamps`: one linear solve or Newton, then gmin continuation from 1e-2 after a failed solve, P3b), `transient.hpp` (Backward Euler, factorization reused while the step is unchanged, Krylov path, progress callback), `ac.hpp` (complex sweep with frequencies split over the threads; the lowest singular frequency is reported), `hb.hpp` (harmonic balance: block-sparse `Y_bar`, dense `K x K` device blocks, `BtfSolver`, the memory policy `N <= 1e6` and stored entries <= `max_nnz` (default 3e7) checked before allocating, reconstruction; since P3b a damped Newton (`HbDamping`: `OnFailure` default, `Always`, `Off`) and the experimental, default-off Fourier-sum Jacobian).
+- **MOR** (`mor/`): `krylov_basis.hpp` (rational Krylov basis on sparse operands, KLU per shift, Gram-Schmidt twice), `projection.hpp` (`V^T A V` without a dense `A`), `reduced_ac.hpp` and `reduced_transient.hpp` (reduced frequency and step loops), `safe_solve.hpp` (LU, then least squares, then regularized least squares), `pod.hpp` (POD basis with `BDCSVD`), `tpwl.hpp` (training indexes, local models, reduced TPWL loop).
 
-### `cpp/include/mna/linear/klu_solver.hpp`, `cpp/src/linear/klu_solver.cpp`
-- RAII `KluSolver` over real KLU with 32-bit indices: `analyze(n, Ap, Ai)` once per pattern, `factor(Ax)`, `refactor(Ax)` reusing the pivot order with a full-factor fallback (`FactorPath`), in-place `solve(b)`; validated `CscPattern`.
-- Errors: `NETLIST_FATAL` for malformed input or calls out of order, `JACOBIAN_SINGULAR` for a zero pivot, `std::bad_alloc` on memory exhaustion.
+### `cpp/bindings/`
+- `module.cpp`: `NB_MODULE(_core)`: `CoreError` (a `RuntimeError` with `.code` and `.message`, translated from `mna::Error`), `version()`, `build_info()`, `effective_threads()`, `klu_solve(Ap, Ai, Ax, b)`, and `parallel_row_sums(a, num_threads)` (deterministic threaded smoke kernel); then calls every unit registered through `registry.hpp`.
+- `registry.hpp`: self-registration of binding units: each `bind_<unit>.cpp` defines `bind_<unit>(nanobind::module_&)` and a static `Registrar{"<unit>", &bind_<unit>}`, so new units never edit `module.cpp` or CMake.
+- One file per unit. Every heavy call releases the GIL for its whole native region; arrays cross as NumPy (float64, complex128, int32/int64) and 2-D results are Fortran-ordered.
 
-### `cpp/bindings/module.cpp`
-- Defines `NB_MODULE(_core)`: `CoreError` (a `RuntimeError` with `.code` and `.message`, translated from `mna::Error`), `version()`, `build_info()`, `effective_threads()`, `klu_solve(Ap, Ai, Ax, b)` (CSC int32, GIL released), and `parallel_row_sums(a, num_threads)` (deterministic threaded smoke kernel).
-- Then calls every unit registered through `registry.hpp`.
-
-### `cpp/bindings/registry.hpp`
-- Self-registration scheme for binding units: each `bindings/bind_<unit>.cpp` defines `bind_<unit>(nanobind::module_&)` and a static `Registrar{"<unit>", &bind_<unit>}`; the registry is a function-local static, so new units never edit `module.cpp` or CMake.
-
-### `cpp/bindings/bind_meta.cpp`
-- Example registered unit; exposes `binding_units()` (names of the registered units in registration order).
+| File | Exports |
+| --- | --- |
+| `bind_meta.cpp` | `binding_units()` (names of the registered units) |
+| `bind_circuit.cpp` | `Circuit` (`n`, `nnz`, `pattern()`, `values()`, `g_effective()`, `to_dense()`, `device_counts()`, `device_slots()`, ...), `build_circuit(spec)` |
+| `bind_expr.cpp` | `Program`, `expr_opcodes`, `compile_program`, `evaluate_program`, `evaluate_program_batch`, `evaluate_program_gradient` |
+| `bind_devices.cpp` | `evaluate_devices` (into caller buffers), `device_f`, `device_jacobian_dense`, `device_f_jacobian_dense`, `eval_mos_level1`, `eval_bjt_level1`, `operating_points`, region-name tables |
+| `bind_linear.cpp` | `classify_matrix`, `direct_solve`, `krylov_solve`, `LinearSolver`; constants `DENSE_MAX_N`, `PARALLEL_SPMV_MIN_N`, `SCIPY_ENGINE_MIN_N`, `CHOLESKY_MAX_N`, `REFACTOR_RCOND_FLOOR` |
+| `bind_analyses_basic.cpp` | `transient_time_points`, `time_source_vector`, `solve_op`, `solve_transient` (the progress callback re-acquires the GIL only for the call); `PARALLEL_DEVICE_MIN_COUNT` |
+| `bind_ac.cpp` | `ac_sweep`, `linearized_g` |
+| `bind_hb.cpp` | `hb_solve` (with `damping="on_failure"`/`"always"`/`"off"`), `hb_reconstruct`, `hb_fourier_matrices`, `hb_time_points`, test hooks `hb_jacobian_block` and `btf_solve`; `HB_MAX_DIMENSION`, `HB_DEFAULT_MAX_NNZ`, `BTF_DENSE_MAX_SMALL`, `BTF_DENSE_FRACTION` |
+| `bind_mor.cpp` | `mor_krylov_basis`, `mor_project`, `mor_reduced_ac`, `mor_reduced_transient`, `mor_pod_basis`, `mor_training_indexes`, `mor_tpwl_models`, `mor_tpwl_simulate`, `mor_dense_operands`, `mor_safe_solve`; `MOR_PARALLEL_MIN_UNKNOWNS` |
 
 ### `cpp/tests/`
-- doctest unit tests built as `mna_core_tests` and run by ctest: `main.cpp` (doctest main), `test_build_info.cpp` (version and library versions), `test_klu_solver.cpp` (known systems, several right-hand sides, refactor and its fallback, singular matrices, 1x1, n = 0, malformed input, move semantics), `test_threads.cpp` (chunk tiling, clamping, coverage, inline execution, bitwise-identical reductions, exception propagation).
+- doctest unit tests built as `mna_core_tests` and run by ctest (`main.cpp` is the doctest main), one file per unit: `test_build_info.cpp`, `test_threads.cpp` (chunk tiling, clamping, determinism, exception propagation), `test_circuit.cpp`, `test_devices.cpp` (model region boundaries), `test_assembly.cpp`, `test_expr.cpp`, `test_klu_solver.cpp` and `test_klu_z.cpp` (known systems, refactor and its fallback, singular matrices, 1x1, n = 0, malformed input), `test_dense_solver.cpp`, `test_spmv.cpp`, `test_classify.cpp`, `test_krylov.cpp`, `test_time_grid.cpp`, `test_newton.cpp`, `test_pnjlim.cpp` (junction limiting and the P3b strategies), `test_transient.cpp`, `test_ac.cpp`, `test_hb.cpp`, `test_mor_basis.cpp`, `test_mor_reduced.cpp`, `test_mor_tpwl.cpp`.
+- CI runs them on Linux (Ninja + GCC) and Windows (Visual Studio), under ASan + UBSan, and with coverage (`.github/workflows/ci.yml`).
 
 ### `cpp/third_party/`
 - Vendored, unmodified upstream code so a build needs no downloads: `eigen/` (Eigen 3.4.0 headers), `suitesparse/` (SuiteSparse 7.8.3: SuiteSparse_config, AMD, COLAMD, BTF, KLU sources and headers), `doctest/` (2.5.0, tests only).
@@ -351,11 +385,29 @@ The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel a
 - Behaviour specification of the current core on edge cases (empty and single-node circuits, singular G, zero/negative values, parser conflicts, conditioning, time grid, non-convergence, `init_condition`, probes and decimation, Krylov, MOR, HB, AC, `show_matrix`), pinning exception classes, codes, and numbers.
 - `EDGE_CASES.md` lists every pinned case with a "looks intentional?" verdict and the highlights flagged as likely unintended; the rulings live in `CPP_MIGRATION_PLAN.md` section 2.4.1.
 
-### `tests/test_native_convergence.py`
-- P3b convergence improvements (`CPP_MIGRATION_PLAN.md` 2.4.1): junction limiting on a diode across an ideal source, unchanged reference iterations on the 1 ohm series versions, the transient junction strategy, gmin continuation on 4/6/8-stage CMOS chains, node-to-ground gmin on a floating island, BJT exponent extrapolation continuity, damped HB iteration counts and restart, and 1 vs 4 thread determinism on these paths.
+### Native binding and facade tests: `tests/test_native_*.py`
+Each module exercises one native unit through its binding and its Python facade, against the frozen oracle where one exists, including shapes, dtypes, invalid input, error codes, GIL release, and 1 vs 4 thread bitwise determinism:
+- `test_native_smoke.py`: version and build info, `klu_solve` against NumPy, `CoreError` codes for singular and malformed input, deterministic `parallel_row_sums`.
+- `test_native_expressions.py`: the expression compiler and bytecode VM against SymPy `lambdify` on every expression form used in the repository (10 000 random points at 1e-13), dual-number gradients against SymPy derivatives.
+- `test_native_circuit.py`: the COO-triplet builder bit for bit against the reference builder (dense and CSR `G`/`C`, sources, expression strings, labels, metadata) and the compiled circuit (gmin-free `G`, `C`, unit gmin stamps, node-to-ground stamps).
+- `test_native_devices.py`: compiled `f`/`J` against `compile_nl_functions` of the oracle at 1000 random states per nonlinear corpus case (Level-1 MOS bit-identical, exponentials 1e-13, BJT inside the clip), the `_level1_*` facades, thread determinism of `evaluate_devices`, and the opt-in (`perf`) SRAM evaluation speedup.
+- `test_native_linalg.py`: `classify_krylov_matrix`, `krylov_solve_linear`, `solve_linear` on the Krylov test matrices and on `G + C/h` / `G + j omega C` of every linear corpus case, the `direct_solve`/`krylov_solve`/`classify_matrix`/`LinearSolver` bindings, parallel SpMV determinism.
+- `test_native_newton.py`: every nonlinear corpus `.op` against the oracle, error parity of `solve_dc_nr`, `init_condition` handling, Krylov stats, compile-once gmin stepping with numerical-only retries.
+- `test_native_transient.py`: the bitwise time grid, every corpus `.tran` waveform, the cached factorization of linear constant-step runs, the progress callback, the P3 rulings at the facade level.
+- `test_native_ac.py`: every corpus full `.ac` sweep, `points` 1 and 2, `f_start = 0`, singular systems (`AC_ERROR`, lowest frequency for every thread count), Krylov stats.
+- `test_native_hb.py`: Fourier helpers bitwise, every corpus `hb` analysis within 1e-6 (the 205-harmonic mixer included), analytic RC phasor, the `MNA_HB_MAX_NNZ` memory policy, the `harmonics <= 0` ruling, Krylov metadata.
+- `test_native_mor.py`: every corpus MOR analysis (basis sizes and reduced outputs), `_safe_solve` stages, the POD rank rule, training indexes, the TPWL loop and LRU cache, orthonormal bases on the former noise cases.
+- `test_native_convergence.py`: the P3b convergence improvements (`CPP_MIGRATION_PLAN.md` 2.4.1): junction limiting on a diode across an ideal source, unchanged reference iterations on the 1 ohm series versions, the transient junction strategy, gmin continuation on 4/6/8-stage CMOS chains, node-to-ground gmin on a floating island, BJT exponent extrapolation continuity, damped HB iteration counts and restart, and 1 vs 4 thread determinism on these paths.
+- `test_native_leaks.py`: 200 SRAM 10x10 `.op` solves and 50 SRAM transients through the service after a warm-up of 20 each; peak RSS (`resource.getrusage`) and, on Linux, current RSS (`/proc/self/statm`) may grow by less than 20 MB. Skipped on Windows unless `psutil` is importable.
 
-### `tests/test_native_smoke.py`
-- Smoke tests of `_core`: version and build info, `klu_solve` against NumPy, `CoreError` codes for singular and malformed input, deterministic `parallel_row_sums`.
+### `tests/test_determinism.py`
+- Every corpus analysis through `SimulationService.run_request` at `num_threads` 1 and 4 (a private 4-thread `ThreadBudget`): the whole response must be bitwise identical (floats compared by bit pattern), except the metadata that reports the thread grant, timings, or memory (`threads_requested`, `threads_used`, `elapsed_ms`, `memory_bytes`, keys ending in `_ms`/`_seconds`). Analyses that raise on both runs are skipped after checking that the errors agree; the NumPy RNG is reseeded and the TPWL cache cleared before every run.
+
+### `tests/test_front_end_fast_path.py`
+- The P6a parser/builder front end against the oracle: equal `CircuitIR` for every corpus case and workload, bitwise `G`/`C`/`b_dc`/`b_ac` at gmin 0 and 1e-9, the native circuit's pattern and tables, `parse_value` on ~200 literals, and malformed netlists (same exception class, code, and message).
+
+### `tests/test_option_coercion.py`
+- Strict request-option coercion in `PythonBackend.build_options` (2.4.1): booleans, integers, metric-suffix numbers, `init_condition` forms; every rejection is a tagged plain `ValueError` (HTTP 400); `TRAN_ERROR` is a `NetlistError`.
 
 ### `tests/test_thread_budget.py`
 - `ThreadBudget` grants (explicit, `auto` fair share), blocking and release, timeouts, `MNA_NUM_THREADS` parsing, `coerce_num_threads` validation, and reference-counted BLAS pinning.
@@ -398,8 +450,9 @@ The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel a
 - Covers output selectors, auto/manual MOR order, backend option parsing, linear AC/transient accuracy, Level-1 `.op` linearization before MOR, TPWL cache reuse, display subset validation, and `.op`/`.hb` fallback metadata.
 
 ### `tests/perf/`
-- `test_perf_harness.py` (always runs): the registry lists every unit of `CPP_MIGRATION_PLAN.md` section 5, every reference callable runs once on smoke inputs, available native units match the reference (direct solves within 1e-9 at full size), the JSON schema and Markdown table, `--strict`, and `compare_backends.py --list` in a subprocess.
-- `test_perf_gate.py` (marker `perf`, needs `--run-perf`): speedup floors per unit id at one core thread with the `--quick` methodology (device evaluation 20x, assembly 10x, RLC direct solve 10x, `.op` SRAM 5x, SRAM/BJT transients 5x, RLC transients 10x, RLC AC 5x, HB 2x, Krylov 1x, MOR basis and TPWL 2x) plus RLC AC 4-thread scaling >= 1.5x on machines with >= 4 CPUs; units without a native side are skipped without timing the reference; failures print both timings.
+- `test_perf_harness.py` (always runs): the registry lists every unit of `CPP_MIGRATION_PLAN.md` section 5, every reference callable runs once on smoke inputs, available native units match the reference, the JSON schema and Markdown table, `--strict`, and `compare_backends.py --list` in a subprocess.
+- `test_perf_gate.py` (marker `perf`, needs `--run-perf`): speedup floors per unit id at one core thread with the `--quick` methodology (`FLOORS`: device evaluation 20x for the SRAM, 3x and 1x for the tiny BJT and diode nets; Jacobian assembly 10x; circuit build 7.5x/9x and SRAM parse 1.7x; RLC direct solves 10x, SRAM direct solves 1.5x; Krylov 1x; `.op` SRAM 5x; SRAM and BJT transients 5x, RLC transients 10x; RLC AC 5x; HB 2x; MOR basis 15x, TPWL training 75x, reduced AC 19x, reduced transient 37x) plus RLC AC 4-thread scaling >= 1.5x on machines with >= 4 CPUs; failures print both timings.
+- `test_concurrent_requests.py`: the P6 exit criterion through `benchmarks/concurrent_requests.py`. The `perf` test asserts that 4 concurrent SRAM 10x10 `.tran` requests (`num_threads="auto"`, in-process ASGI, best of 3 interleaved batches) take at most 1.5x the wall time of one; it currently fails (about 4x, `PERFORMANCE_PLAN.md` section 10). An always-on smoke test drives the same path on a 2x2 SRAM.
 
 ## Benchmarks: `benchmarks/`
 
@@ -413,12 +466,16 @@ The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel a
 - Wall-clock table (optionally with cProfile hot spots) for the workloads referenced by `PERFORMANCE_PLAN.md`.
 
 ### `benchmarks/blas_contention.py`
-- Runs concurrent simulations under different `OPENBLAS_NUM_THREADS` settings to show the multithreaded-BLAS oversubscription collapse.
+- Runs concurrent simulations in separate processes under different `OPENBLAS_NUM_THREADS` settings to show the multithreaded-BLAS oversubscription collapse.
+
+### `benchmarks/concurrent_requests.py`
+- Sends N identical SRAM 10x10 `.tran 6n 0.25n` requests to `POST /api/simulate` at once (`asyncio.gather` over `httpx`) and reports the best and median batch wall time per N, `ratio(N) = best(N) / best(1)`, and each response's `threads_used` and `elapsed_ms`.
+- `--server asgi` (default: the app in this process through `httpx.ASGITransport`, lifespan entered) or `--server uvicorn` (a uvicorn subprocess on a free port, real HTTP); `--n`, `--batches` (3), `--num-threads` (`auto`), `--step`, `--json`, `--max-ratio` (exit 1 above it). `measure()` and `render()` are used by `tests/perf/test_concurrent_requests.py`.
 
 ### `benchmarks/perf_units.py`
-- Registry of Python-vs-C++ comparison units (24, categories `device_eval`, `assembly`, `linear_solve`, `krylov`, `newton`, `transient`, `ac`, `hb`, `mor`) with the workload sizes of `PERFORMANCE_PLAN.md` 4.1.
+- Registry of Python-vs-C++ comparison units (27, categories `device_eval`, `assembly`, `linear_solve`, `krylov`, `newton`, `transient`, `ac`, `hb`, `mor`) with the workload sizes of `PERFORMANCE_PLAN.md` 4.1.
 - Each `Unit` has `id`, `category`, `size`, `setup(smoke=False)`, `reference(inputs)` (a frozen `mna_reference` callable), optional `core_setup(inputs)`, `core(inputs, num_threads)`, `parity(ref_out, core_out)` (max relative error or MOR subspace distance), `phase`, and `tolerance`.
-- Native side today: `direct_solve_rlc_1035` and `direct_solve_sram_248` through `_core.klu_solve` (CSC int32 of `G + C/h`); every other `_core_<unit id>` function raises `UnitUnavailable("lands in P<n>: ...")` until its phase replaces the body.
+- Every unit has a native side (the live facades or `_core` calls); `UnitUnavailable` remains for units added before their implementation.
 - The HB H=64 unit uses the mixer with tones on a 20 MHz grid, because the close-tone mixer forces H >= 201.
 
 ### `benchmarks/compare_backends.py`
@@ -427,7 +484,7 @@ The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel a
 - Writes JSON `schema_version` 1 (host with platform, CPUs, versions, `core_version`/`build_info`, git commit, load average and a warning above 0.5; methodology; per-unit timings, speedups, parity) and prints a Markdown table (`n/a (P<n>)` for units without a native side).
 
 ### `benchmarks/results/`
-- Output directory of `compare_backends.py`; run files are git-ignored, only `baseline-linux.json` and `baseline-windows.json` are meant to be committed (refreshed deliberately from the Perf workflow artifacts at release time, idle machines only). `README.md` documents the format and the policy.
+- Output directory of `compare_backends.py`; run files are git-ignored. Committed: `baseline-shared-machine.json` and `.md`, an interim full run (`--threads 1,4`, 7 repetitions) on a shared 4-CPU Linux VM at commit `04c46a3` (before P3b), with the load warning recorded; to be replaced by idle-machine `baseline-linux.json` / `baseline-windows.json` from the Perf workflow. `README.md` documents the format and the policy.
 
 ### `benchmarks/prototypes/`
 - Research prototypes behind the plan: vectorized NumPy, Numba, and pybind11 C++ Level-1 MOS kernels, a kernel comparison harness, and a cached sparse-LU versus dense solve benchmark. Not imported by the package.
@@ -436,10 +493,10 @@ The C++17 sources of `mna_simulation._core`, built by scikit-build-core (wheel a
 
 ### `.github/workflows/ci.yml`
 - On push, pull request, and manual dispatch: `pip install -e ".[dev]"` (builds the extension) and `pytest` on Ubuntu and Windows with Python 3.12 and 3.13, then the C++ doctest suite through CMake + ctest (Ninja + GCC on Linux, Visual Studio on Windows).
-- ASan + UBSan job and a C++ coverage job (gcovr XML uploaded as an artifact) on Linux.
+- ASan + UBSan job and a C++ coverage job (gcovr XML uploaded as an artifact) on Linux; both cover the ctest suite only.
 
 ### `.github/workflows/wheels.yml`
-- On `v*` tags and manual dispatch: cibuildwheel builds one abi3 `cp312` wheel per platform (64-bit, no musllinux), smoke-imports `_core`, repairs Windows wheels with `delvewheel`, and uploads them.
+- On `v*` tags, manual dispatch, and pushes to `dev`/`main` that change `cpp/**`, `pyproject.toml`, or the workflow: cibuildwheel builds one abi3 `cp312` wheel per platform (64-bit, no musllinux), smoke-imports `_core`, repairs Windows wheels with `delvewheel`, and uploads them. The test suite is not run against the wheels.
 
 ### `.github/workflows/perf.yml`
 - Weekly schedule and manual dispatch, Ubuntu and Windows, Python 3.13: runs `benchmarks/compare_backends.py --quick`, appends the Markdown table to the job summary, and uploads `perf-results.json` and `perf-table.md`; `continue-on-error` so it never blocks.

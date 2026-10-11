@@ -1,9 +1,10 @@
 # Performance Review, Multithreading Plan, and C++ Migration Research
 
-Status: proposal based on measurements taken on 2026-10-11 against commit `3754bb6`
-(v0.60). Nothing in the simulation path has been changed by this document; the
-scripts that produced every number live under `benchmarks/` so they can be re-run
-as the code evolves.
+Status: sections 1-9 are the proposal, based on measurements taken on 2026-10-11 against
+commit `3754bb6` (v0.60), and are kept as written; the scripts that produced every number
+live under `benchmarks/` so they can be re-run as the code evolves. Option C of section 7
+was carried out as `CPP_MIGRATION_PLAN.md`: section 10 records what landed, the measured
+speedups, the concurrent-request finding, the known limitations, and what is left.
 
 ## 1. Summary
 
@@ -489,3 +490,134 @@ existing test suite must stay green at every step.
    streaming `.dyn`).
 5. Decide B versus C with the section 8 targets in hand; if C, start with C0
    and C1, which already deliver the largest measured win.
+
+## 10. Status after the C++ migration (2026-10-11)
+
+Option C of section 7 was chosen and carried out, with a wider scope than the five-call kernel
+of 7.4: every analysis, the Krylov solvers, HB, and MOR run in the mandatory extension
+`mna_simulation._core` (`CPP_MIGRATION_PLAN.md`, status at its top). The pure-Python core is
+kept only as the test oracle `tests/reference/mna_reference`.
+
+All numbers in this section are **shared machine, interim**: a 4-CPU Linux VM (Python 3.13.16,
+NumPy 2.5.4, SciPy 1.18.1, GCC 13.3 Release build) that another worker was using at the same
+time (load average 4-5 during the baseline run, 0.7-4 during the request measurements).
+`benchmarks/results/baseline-shared-machine.md` / `.json` hold the full comparison
+(`python benchmarks/compare_backends.py --threads 1,4`, one warm-up plus 7 repetitions, median,
+BLAS pinned to one thread), measured at commit `04c46a3` (P5 and P6a, before P3b). An
+idle-machine baseline will replace them; ratios are more stable than absolute times.
+
+### 10.1 What landed, per phase
+
+Reference = the frozen Python core on the same inputs; core = the native path at one thread
+unless stated.
+
+| Phase | What moved | Measured, reference -> core (speedup) |
+| --- | --- | --- |
+| P0 | frozen oracle, corpus, differential and edge-case tests, `cpp/` scaffold with vendored Eigen/KLU, CI, `klu_solve` | RLC 1035 direct solve 34.1 -> 0.88 ms (39x); SRAM 248 direct solve 1.13 -> 0.26 ms (4.4x) |
+| P1 | expression bytecode VM, compiled circuit (union CSC pattern, SoA device tables), device kernels with deterministic two-phase assembly | SRAM 622-MOS device evaluation 2.57 -> 0.088 ms (29x); SRAM Jacobian assembly 3.09 -> 0.11 ms (28x); BJT stage 7.1x; one-diode mixer 2.2x |
+| P2 | real and complex KLU, dense LU, GMRES/MINRES/CR/CG, damped Newton, `.op` | SRAM `.op` 52.0 -> 3.6 ms (14x); complex RLC direct solve 84.7 -> 1.06 ms (80x); Krylov on the RLC operator 3.4-3.8x (SciPy's kernels were already compiled) |
+| P3 | Backward-Euler transient (factorization reuse), AC sweep parallel over frequencies, operating points, the 2.4.1 rulings | SRAM `.tran 6n 0.25n` 841 -> 6.8 ms (123x); BJT `.tran` 2000 steps 1494 -> 4.2 ms (354x); RLC `.tran` 40 steps 2224 -> 8.2 ms (272x), Krylov path 656 -> 13.4 ms (49x); RLC `.ac` 100 points 9592 -> 55 ms (174x) and 18.3 ms at 4 threads (3.0x scaling); BJT `.ac` 400 points 11.9x |
+| P4 | harmonic balance with block-sparse `Y_bar` and dense device blocks | close-tone mixer H = 205 4427 -> 706 ms (6.3x; 693 ms at 4 threads); mixer H = 64 312 -> 33 ms (9.6x) |
+| P5 | rational Krylov basis, projections, reduced AC/transient loops, TPWL training and run | MOR basis 232 -> 7.8 ms (30x); TPWL training 894 -> 6.8 ms (131x); reduced AC 336 -> 7.2 ms (47x); reduced transient 778 -> 9.7 ms (80x) |
+| P6a | parser and builder fast path (still Python) | SRAM circuit build 173 -> 8.7 ms (20x); RLC build 147 -> 7.4 ms (20x); SRAM parse 11.4 -> 3.3 ms (3.5x) |
+| P6 | thread budget, `num_threads`, UI control, metadata, CLI `--threads`, comparison harness and perf gate, determinism and leak tests | every perf-gate floor met on the interim baseline; every corpus analysis bitwise identical at 1 and 4 threads; RSS flat within 1 MB over 1000 SRAM `.op` and over 1000 SRAM `.tran` runs after the first 100 |
+| P3b | junction limiting (pnjlim), gmin continuation in `.op`, node-to-ground gmin, BJT exponent extrapolation, damped HB Newton | convergence, not speed: the strategies engage only where the reference iteration fails or stalls, so runs that converged before are unchanged (not part of the interim baseline) |
+
+Against the "with native kernel" column of section 8:
+
+| Metric | Target | Measured (shared machine, interim) |
+| --- | ---: | --- |
+| SRAM 10x10 `.tran 6n/0.25n` | <= 0.03 s | 6.8 ms in the core; about 26 ms for the whole service request (10.2) |
+| RLC 23x23 `.tran` 40 steps | <= 0.02 s | 8.2 ms |
+| RLC 23x23 `.ac` 100 points | <= 0.1 s | 55 ms; 18 ms at 4 threads |
+| BJT 3-stage `.tran` 2001 steps | <= 0.05 s | 4.2 ms |
+| HB mixer H = 205 | <= 0.5 s (matrix-free) | 0.69-0.71 s with dense device blocks; matrix-free HB not done (10.4) |
+| 4 concurrent SRAM runs, batch wall | <= 1.2 s | 0.12-0.18 s, but 3.8-5.0x the time of one run (10.2) |
+| `pytest` | <= 4 s | not comparable: the default suite now also runs the differential corpus and the binding tests: 2909 passed and 62 skipped in 156 s after P3b |
+
+### 10.2 Concurrent requests in one server process
+
+The P6 exit criterion "four concurrent SRAM requests finish within 1.5x of one" is not met.
+`benchmarks/concurrent_requests.py` sends N identical SRAM 10x10 `.tran 6n 0.25n` requests at
+once and compares the best batch wall time with the best single request:
+
+| Setup | 1 request | 4 concurrent | Ratio |
+| --- | ---: | ---: | ---: |
+| in-process ASGI, `num_threads="auto"`, best of 3 | 36 ms | 150 ms | 4.1x |
+| in-process ASGI, `num_threads=1`, best of 5 | 30 ms | 138 ms | 4.6x |
+| uvicorn subprocess (real HTTP), `"auto"`, best of 5 | 31 ms | 119 ms | 3.8x |
+| `tests/perf/test_concurrent_requests.py` (ASGI, `"auto"`, best of 3), load 0.7 | 30 ms | 143 ms | 4.8x |
+| the same test after P3b, load 1.2 | 37 ms | 154 ms | 4.2x |
+| the script after P3b (ASGI, `"auto"`, best of 3), load 0.7 | 35 ms | 175 ms | 5.0x |
+
+Where one SRAM `.tran` request spends its time (medians of 15 runs): parse 3.2 ms, MNA build
+about 9-11 ms (Python, including the native circuit compile), the native `.op` and transient
+(`solvers.solve_transient`) 3.3 ms, the device operating-point table 4.0 ms (622 Python dicts,
+one native call per transistor), and response conversion about 7 ms; about 26 ms in total, of
+which roughly an eighth runs without the GIL. Two mechanisms follow:
+
+1. **The GIL.** `CPP_MIGRATION_PLAN.md` 2.5 chose a thread pool because "the heavy work no longer
+   holds the GIL". For a circuit this size the native part is now the small part, so concurrent
+   requests take turns at the Python part: with `num_threads=1` four requests overlap their
+   native calls but each one's backend time (`elapsed_ms`) grows from 17 ms to 93 ms. The native transient alone
+   overlaps (`solvers.solve_transient` four times in threads: 3.25 -> 6.6 ms, 2.0x on the loaded
+   machine), and the same request in a 4-process pool runs 21.8 -> 47.6 ms (2.2x).
+2. **The `auto` lease.** `ThreadBudget` gives an `auto` request that finds no active run
+   `total // 1` threads, i.e. the whole budget, so simultaneous `auto` requests hold their leases
+   one after another (every response reports `threads_used = 4`).
+
+Options, roughly in order of effort: batch the operating-point table through the existing
+`_core.operating_points` binding and build the response arrays without per-element Python work
+(about 11 ms of the 26); give `auto` a smaller share when the circuit has no parallel work (below
+the 2048-device, 4096-row, and 2048-unknown thresholds the threads are idle anyway); run
+`/api/simulate` in a process pool (the tier-0 proposal of 5.3, measured 2.2x here, but the thread
+budget would have to become machine-wide across processes and responses would be pickled); or
+restate the criterion as the absolute batch time, which is 7-10x under the 1.2 s target of
+section 8.
+
+### 10.3 Known limitations
+
+- **gmin in the builder versus the service.** Since P3b gmin stepping also stamps gmin from every
+  node unknown to ground. The node stamps live in the compiled circuit's gmin pattern and reach
+  `G_sparse` only through `problem_at_gmin` (`backends/python_backend.py`), which the service's
+  gmin loop uses. `build_mna_problem(circuit, gmin > 0)` called directly still puts only the
+  device-terminal gmin into `G`/`G_sparse`, while the native analyses of that problem form
+  `G + gmin * stamps` from the compiled pattern, node stamps included; the fallback for a circuit
+  whose native compile was deferred rebuilds without them. A caller of the builder therefore sees
+  a `G` that differs from the one the native analyses use at the same gmin.
+- **Concurrent requests** in one process serialize (10.2).
+- **HB mixer time.** 0.69-0.71 s on the shared machine against the 0.5 s target of P4; it does
+  not scale with threads (706 vs 693 ms) because its largest BTF diagonal block is a dense
+  411 x 411 block, factored on one thread in each of the 38 Newton iterations.
+- **Damped HB is off by default.** `hb_solve(damping="always")` cuts the mixer from 38 to 11
+  Newton iterations but stops at a different iterate inside the 1e-6 tolerance, so the default is
+  `"on_failure"` (damping only after the undamped reference iteration breaks down).
+- **Small circuits gain nothing from threads** and pay for them where a unit forces them: each
+  parallel region starts its own `std::thread` workers, so SRAM device evaluation takes 0.95 ms
+  at 4 threads against 0.088 ms at 1 (the analyses avoid this through their thresholds).
+- **Leftovers.** `solvers._nmos_level1_forward` has no callers; a comment in
+  `api/service.py` above `core_backend` still says "Still the Python solvers"; the in-app Help
+  (`app/web/src/lib/userGuide.ts`) still carries the pre-migration Threads paragraph and lacks the
+  "What Changed With The Native Core" section of `USER_GUIDE.md`.
+
+### 10.4 Follow-ups (P7 candidates)
+
+- **FFT-based, matrix-free HB** (phase B of `CPP_MIGRATION_PLAN.md` 2.6): GMRES with a
+  block-diagonal per-harmonic preconditioner instead of dense `K x K` device blocks. P3b removed
+  the blocker: with damping the O(K^2) Fourier-sum Jacobian converges on the mixer.
+- **Always-damped HB behind a retuned tolerance**: make `damping="always"` the default once the HB
+  tolerance (or the oracle comparison of the `hb` corpus cases) is revisited, for the 3.5x fewer
+  mixer iterations.
+- **Parallel dense LU for the HB blocks**: a blocked, threaded factorization of the large dense
+  BTF diagonal blocks (411 x 411 on the mixer), which today take one thread each.
+- **Lazy `f_str` in the builder**: the Level-1 device terms of the display vector `f_str` are
+  rendered on every build although only `.show_matrix` reads them (the solvers use
+  `solver_f_str` and the compiled device tables); in a cProfile of five SRAM requests the 3110 MOS
+  template renders took 17 of the 123 ms spent in the builder.
+- **Persistent thread pool**: reuse worker threads across calls to remove the per-call thread
+  start, then lower the parallel thresholds (2048 devices, 4096 SpMV rows, 2048 MOR unknowns) so
+  mid-size circuits use their threads; the chunking by item count keeps results deterministic.
+- **Request overheads** from 10.2: the operating-point table through `_core.operating_points`,
+  leaner response conversion, a different `auto` share, or a process pool.
+- From the original P7 list: dense-vs-KLU threshold tuning (`kDenseMaxN` is 0, so every circuit
+  solve uses KLU) and adaptive time stepping (section 6).
