@@ -55,7 +55,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
         return
     skip_perf = pytest.mark.skip(reason="perf test: pass --run-perf to run")
     for item in items:
-        if "perf" in item.keywords:
+        # The marker, not ``"perf" in item.keywords``: keywords also hold parent node
+        # names, so every test under tests/perf/ would match the directory name.
+        if item.get_closest_marker("perf") is not None:
             item.add_marker(skip_perf)
 
 

@@ -20,6 +20,12 @@ __pycache__/
 *.pyd
 cpp/build*/
 /build-cpp/
+cpp/.cmake/
+cpp/.skbuild-info.json
+
+# Perf comparison runs (benchmarks/compare_backends.py); only committed baselines are tracked
+benchmarks/results/*.json
+!benchmarks/results/baseline-*.json
 
 # Coverage
 .coverage*

@@ -1,0 +1,60 @@
+name: Perf
+
+# Frozen Python reference vs C++ core (benchmarks/compare_backends.py).
+# Informational only: it never blocks a merge. Shared CI runners are noisy, so
+# treat the numbers as a trend; committed baselines (benchmarks/results/) are
+# refreshed deliberately from these artifacts at release time.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1"  # Mondays 04:23 UTC
+
+permissions:
+  contents: read
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    name: ${{ matrix.os }} / Python 3.13
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install package (builds the C++ extension)
+        run: python -m pip install -e ".[dev]"
+
+      - name: Compare backends
+        run: python benchmarks/compare_backends.py --quick --json perf-results.json --markdown perf-table.md
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f perf-table.md ]; then
+            cat perf-table.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "compare_backends.py produced no table; see the job log." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: perf-${{ matrix.os }}
+          path: |
+            perf-results.json
+            perf-table.md
+          if-no-files-found: warn
