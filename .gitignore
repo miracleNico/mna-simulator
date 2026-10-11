@@ -39,3 +39,6 @@ app/web/.vite/
 # Editors / OS
 .DS_Store
 Thumbs.db
+
+# Claude Code agent worktrees
+.claude/worktrees/
