@@ -38,7 +38,7 @@ Every analysis runs in the mandatory C++17 extension `mna_simulation._core` (`cp
 
 ### `.gitignore`
 - Ignores Python bytecode and tool caches, packaging outputs (anchored to the root: `/build/`, `/dist/`, `/wheelhouse/`, `*.whl`, `*.egg-info/`), native extension artefacts (`*.so`, `*.pyd`, `cpp/build*/`, `/build-cpp/`), coverage outputs, and Vite caches.
-- Ignores perf comparison runs (`benchmarks/results/*.json`) except the committed baselines (`!benchmarks/results/baseline-*.json`, e.g. `baseline-shared-machine.json`); the Markdown tables next to them are not ignored.
+- Ignores perf comparison runs (`benchmarks/results/*.json`) except the committed baselines (`!benchmarks/results/baseline-*.json`, e.g. `baseline-linux.json`); the Markdown tables next to them are not ignored.
 - `app/web/node_modules` and `app/web/dist` remain tracked.
 
 ### `PERFORMANCE_PLAN.md`
@@ -484,7 +484,7 @@ Each module exercises one native unit through its binding and its Python facade,
 - Writes JSON `schema_version` 1 (host with platform, CPUs, versions, `core_version`/`build_info`, git commit, load average and a warning above 0.5; methodology; per-unit timings, speedups, parity) and prints a Markdown table (`n/a (P<n>)` for units without a native side).
 
 ### `benchmarks/results/`
-- Output directory of `compare_backends.py`; run files are git-ignored. Committed: `baseline-shared-machine.json` and `.md`, an interim full run (`--threads 1,4`, 7 repetitions) on a shared 4-CPU Linux VM at commit `04c46a3` (before P3b), with the load warning recorded; to be replaced by idle-machine `baseline-linux.json` / `baseline-windows.json` from the Perf workflow. `README.md` documents the format and the policy.
+- Output directory of `compare_backends.py`; run files are git-ignored. Committed: `baseline-linux.json` and `.md`, a full run (`--threads 1,4`, 7 repetitions) on an idle 4-CPU Linux VM at commit `057478f` (after P3b); `baseline-windows.json` is pending an idle Windows machine. `README.md` documents the format and the policy.
 
 ### `benchmarks/prototypes/`
 - Research prototypes behind the plan: vectorized NumPy, Numba, and pybind11 C++ Level-1 MOS kernels, a kernel comparison harness, and a cached sparse-LU versus dense solve benchmark. Not imported by the package.
