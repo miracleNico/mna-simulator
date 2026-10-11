@@ -1115,11 +1115,19 @@ def test_hb_harmonics_smaller_than_needed_are_expanded_to_needed_plus_4() -> Non
     assert _svc(netlist, "hb", harmonics=3).metadata["harmonics"] == 3
 
 
-def test_hb_harmonics_zero_or_unset_means_8() -> None:
+def test_hb_harmonics_unset_means_8_and_non_positive_is_an_error() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: only None means unset. Was: 0 became 8 (`or 8`)
+    # and a negative count was silently expanded to needed + 4.
     netlist = "V1 a 0 SIN 1 1k\nR1 a 0 1k\n"
-    assert _svc(netlist, "hb", harmonics=0).metadata["harmonics"] == 8
     assert _svc(netlist, "hb").metadata["harmonics"] == 8
     assert _svc(netlist + ".hb\n", "hb").metadata["harmonics"] == 16  # the directive default differs
+    for harmonics in (0, -3):
+        with pytest.raises(SolverConvergenceError) as exc:
+            _svc(netlist, "hb", harmonics=harmonics)
+        _assert_error(exc, SolverConvergenceError, "HB_ERROR", f"harmonics must be a positive integer, got {harmonics}.")
+    with pytest.raises(SolverConvergenceError) as directive_exc:
+        _svc(netlist + ".hb 0\n", "hb")
+    _assert_error(directive_exc, SolverConvergenceError, "HB_ERROR", "harmonics must be a positive integer, got 0.")
 
 
 def test_hb_directive_parameters() -> None:

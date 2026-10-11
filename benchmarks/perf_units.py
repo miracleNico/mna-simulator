@@ -854,12 +854,44 @@ def _core_ac_bjt_3stage(core_inputs: Any, num_threads: int) -> Any:
 # P4: harmonic balance.
 
 
+def _core_setup_advanced(inputs: dict[str, Any]) -> dict[str, Any]:
+    """The live ``MnaProblem`` (native circuit included) and ``AnalysisOptions`` of an HB unit (untimed)."""
+
+    import dataclasses
+
+    from mna_simulation import mna_builder, netlist
+    from mna_simulation.api import contracts
+
+    _native()
+    reference_options = inputs["options"]
+    live_fields = {item.name for item in dataclasses.fields(contracts.AnalysisOptions)}
+    values = {
+        item.name: getattr(reference_options, item.name)
+        for item in dataclasses.fields(reference_options)
+        if item.name != "mode" and item.name in live_fields
+    }
+    options = contracts.AnalysisOptions(mode=contracts.AnalysisMode(reference_options.mode.value), **values)
+    problem = mna_builder.build_mna_problem(netlist.parse_netlist_text(inputs["netlist"]))
+    return {"problem": problem, "options": options}
+
+
+def _core_advanced(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    """Live ``core_advanced.run_advanced_analysis`` (native ``hb_solve``) with ``num_threads`` workers."""
+
+    import dataclasses
+
+    from mna_simulation.core_advanced import run_advanced_analysis
+
+    options = dataclasses.replace(core_inputs["options"], num_threads=int(num_threads))
+    return run_advanced_analysis(core_inputs["problem"], options)
+
+
 def _core_hb_mixer_h205(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P4: native harmonic balance")
+    return _core_advanced(core_inputs, num_threads)
 
 
 def _core_hb_mixer_h64(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P4: native harmonic balance")
+    return _core_advanced(core_inputs, num_threads)
 
 
 # P5: model-order reduction.
@@ -1155,6 +1187,7 @@ _register(
     setup=_setup_basic("mixer_h205", "hb", {"hb_harmonics": 205, "max_iter": 100, "f_tol": 1e-6}, {"hb_harmonics": 8}),
     reference=_ref_advanced,
     core=_core_hb_mixer_h205,
+    core_setup=_core_setup_advanced,
     parity=parity_analysis,
     phase="P4",
     tolerance=TOL_HB,
@@ -1167,6 +1200,7 @@ _register(
     setup=_setup_basic("mixer_h64", "hb", {"hb_harmonics": 64, "max_iter": 100, "f_tol": 1e-6}, {"hb_harmonics": 8}),
     reference=_ref_advanced,
     core=_core_hb_mixer_h64,
+    core_setup=_core_setup_advanced,
     parity=parity_analysis,
     phase="P4",
     tolerance=TOL_HB,

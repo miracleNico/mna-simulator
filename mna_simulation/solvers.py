@@ -885,47 +885,152 @@ def solve_ac(
     )
 
 
+# ---------------------------------------------------------------------------
+# Harmonic balance: native core (cpp/include/mna/analyses/hb.hpp). The dense
+# Kronecker formulation lives only in the frozen oracle.
+# ---------------------------------------------------------------------------
+
+HB_MAX_NNZ_ENV = "MNA_HB_MAX_NNZ"
+
+
+def hb_max_nnz(environ: dict[str, str] | None = None) -> int:
+    """Bound on the entries a harmonic-balance run may store (memory policy of ``hb_solve``).
+
+    ``MNA_HB_MAX_NNZ`` (a positive number such as ``3e7``) overrides the core
+    default (``_core.HB_DEFAULT_MAX_NNZ``, 3e7). Anything else is ignored with a
+    ``RuntimeWarning``.
+    """
+
+    import os
+    import warnings
+
+    default = int(_native_core().HB_DEFAULT_MAX_NNZ)
+    raw = (os.environ if environ is None else environ).get(HB_MAX_NNZ_ENV)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(str(raw).strip())
+    except ValueError:
+        value = float("nan")
+    if not np.isfinite(value) or value < 1:
+        warnings.warn(
+            f"Ignoring {HB_MAX_NNZ_ENV}={raw!r}: expected a positive number; using {default}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return default
+    return int(min(value, float(2**62)))
+
+
 def create_fourier_matrices(n_harmonics: int, time_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Return DFT and inverse DFT matrices for real-valued harmonics."""
+    """Return DFT and inverse DFT matrices for real-valued harmonics.
 
-    S = 2 * n_harmonics + 1
-    K = len(time_points)
-    Gamma = np.zeros((S, K))
-    Gamma_inv = np.zeros((K, S))
+    ``Gamma`` (``S x K``, ``S = 2H + 1``, ``K = len(time_points)``) and
+    ``Gamma_inv`` (``K x S``) built by the native core with the reference
+    formulas: angle ``2 * pi * h * k / K``, rows/columns ``1``, ``cos``,
+    ``sin`` and the ``1/K``, ``2/K`` scalings.
+    """
 
-    for k in range(K):
-        Gamma_inv[k, 0] = 1.0
-        for h in range(1, n_harmonics + 1):
-            angle = 2 * np.pi * h * k / K
-            Gamma_inv[k, 2 * h - 1] = np.cos(angle)
-            Gamma_inv[k, 2 * h] = np.sin(angle)
-
-    Gamma[0, :] = 1.0 / K
-    for h in range(1, n_harmonics + 1):
-        for k in range(K):
-            angle = 2 * np.pi * h * k / K
-            Gamma[2 * h - 1, k] = (2.0 / K) * np.cos(angle)
-            Gamma[2 * h, k] = (2.0 / K) * np.sin(angle)
-
-    return Gamma, Gamma_inv
+    count = len(time_points)
+    if count == 0:
+        raise ZeroDivisionError("float division by zero")
+    return _native_core().hb_fourier_matrices(int(n_harmonics), int(count))
 
 
-def reconstruct_time_domain(x_bar: np.ndarray, num_vars: int, H: int, omega_0: float, t_array: np.ndarray) -> np.ndarray:
-    """Reconstruct time-domain waveform from harmonic coefficients."""
+def reconstruct_time_domain(
+    x_bar: np.ndarray,
+    num_vars: int,
+    H: int,
+    omega_0: float,
+    t_array: np.ndarray,
+    *,
+    num_threads: int = 1,
+) -> np.ndarray:
+    """Reconstruct time-domain waveform from harmonic coefficients.
 
-    freq_dim = 2 * H + 1
-    results = np.zeros((num_vars, len(t_array)))
-    reshaped = x_bar.reshape((num_vars, freq_dim))
+    Returns ``(num_vars, len(t_array))``: ``x[i, 0] + sum_h (a_h cos(h w0 t) +
+    b_h sin(h w0 t))`` accumulated in the reference order by the native core,
+    parallel over time points (identical for every ``num_threads``).
+    """
 
-    for i in range(num_vars):
-        values = np.full_like(t_array, reshaped[i, 0], dtype=float)
-        for h in range(1, H + 1):
-            a_h = reshaped[i, 2 * h - 1]
-            b_h = reshaped[i, 2 * h]
-            values += a_h * np.cos(h * omega_0 * t_array) + b_h * np.sin(h * omega_0 * t_array)
-        results[i, :] = values
+    coefficients = np.ascontiguousarray(np.asarray(x_bar, dtype=float).reshape(-1))
+    times = np.ascontiguousarray(np.asarray(t_array, dtype=float).reshape(-1))
+    return _native_core().hb_reconstruct(coefficients, int(num_vars), int(H), float(omega_0), times, int(num_threads))
 
-    return results
+
+def _hb_time_sources(b_time_str_vector: np.ndarray) -> tuple[np.ndarray, list[object]]:
+    """``(rows, programs)`` of the non-"0" rows of ``b_time_str`` (as ``compile_time_source_func`` compiles them)."""
+
+    from .native.expressions import compile_expression
+
+    rows: list[int] = []
+    programs: list[object] = []
+    for row, expr_str in enumerate(np.asarray(b_time_str_vector, dtype=object).reshape(-1)):
+        text = str(expr_str)
+        if text == "0":
+            continue
+        rows.append(row)
+        programs.append(compile_expression(text, time_dependent=True, n_unknowns=0).handle)
+    return np.asarray(rows, dtype=np.int64), programs
+
+
+def _hb_krylov_info(
+    entry: dict[str, object],
+    dimension: int,
+    requested_method: str,
+    resolved_rank: int,
+    rank_mode: str,
+    max_iter: int,
+) -> dict[str, object]:
+    """The ``krylov_stats`` entry ``solve_linear`` records, from one native HB Krylov attempt.
+
+    Same keys and values as ``native.linalg.krylov_solve_linear`` plus
+    ``used_direct_fallback``; the operator is the assembled sparse HB matrix,
+    so ``operator_storage`` is ``"csr"`` and ``matrix_nnz`` counts its nonzero
+    values (``np.count_nonzero`` of the dense matrix the reference built).
+    """
+
+    nnz = int(entry["matrix_nnz"])
+    density = float(nnz / (dimension * dimension)) if dimension > 0 else 0.0
+    route = str(entry["route"])
+    info: dict[str, object] = {"method": entry["method"], "engine": "mna_core"}
+    if entry["scipy_semantics"]:
+        info.update(
+            {
+                "operator_storage": "csr",
+                "matrix_nnz": nnz,
+                "matrix_density": density,
+                "converged": bool(entry["converged"]),
+                "iterations": int(entry["iterations"]),
+                "relative_residual": float(entry["relative_residual"]),
+                "iteration_budget": int(entry["iteration_budget"]),
+                "effective_restart": entry["effective_restart"],
+                "exit_code": int(entry["exit_code"]),
+            }
+        )
+    else:
+        info.update(
+            {
+                "converged": bool(entry["converged"]),
+                "iterations": int(entry["iterations"]),
+                "relative_residual": float(entry["relative_residual"]),
+            }
+        )
+    info["requested_method"] = requested_method
+    info["matrix_kind"] = entry["matrix_kind"]
+    info["route"] = route
+    info["matrix_dimension"] = dimension
+    info["matrix_nnz"] = info.get("matrix_nnz", nnz)
+    info["matrix_density"] = info.get("matrix_density", density)
+    info["operator_storage"] = info.get("operator_storage", "csr")
+    info["resolved_rank"] = resolved_rank
+    info["rank_mode"] = rank_mode
+    info["iteration_budget"] = info.get("iteration_budget", int(max_iter) if route == "general" else resolved_rank)
+    if route == "general":
+        info["effective_restart"] = info.get("effective_restart", min(resolved_rank, dimension))
+    info["threads_used"] = int(entry["threads_used"])
+    info["used_direct_fallback"] = bool(entry["used_direct_fallback"])
+    return info
 
 
 def solve_harmonic_balance(
@@ -941,117 +1046,90 @@ def solve_harmonic_balance(
     krylov_rank: int | str | None = "auto",
     krylov_method: str = "auto",
     krylov_stats: list[dict[str, object]] | None = None,
+    *,
+    num_threads: int = 1,
+    max_nnz: int | None = None,
+    hb_stats: dict[str, object] | None = None,
 ) -> np.ndarray:
-    """Solve the harmonic balance system."""
+    """Solve the harmonic balance system (native ``_core.hb_solve`` on ``problem.native``).
 
-    num_vars = problem.G.shape[0]
-    freq_dim = 2 * H + 1
-    total_dim = num_vars * freq_dim
+    Same algorithm, unknown ordering (``x_bar[i * K + s]``, ``K = 2H + 1``) and
+    error texts as the reference: undamped Newton from zero on
+    ``Y_bar x + Gamma f(Gamma_inv x) - b_bar`` with ``Y_bar = G kron I + C kron
+    Omega`` assembled block-sparse (dense ``K x K`` device-Jacobian blocks only
+    on the device pattern) and solved through the BTF/KLU direct solver; a
+    linear circuit is one solve. With ``use_krylov`` each solve tries the
+    native Krylov kernel first (``solve_linear``'s acceptance and fallback
+    rule) and appends the same ``krylov_stats`` entries. ``num_threads``
+    parallelizes the per-sample device evaluation and the block
+    factorizations (results identical for every count). ``max_nnz`` bounds the
+    stored entries (default ``hb_max_nnz()``); larger systems raise
+    ``HB_ERROR: HB system too large (...)`` before allocating. ``hb_stats``
+    receives the solver statistics (dimension, nonzeros, iterations, timings).
+    Returns ``x_bar`` as an ``(n K, 1)`` array.
+    """
 
-    G_bar = np.kron(problem.G, np.eye(freq_dim))
-    C_bar = np.kron(problem.C, np.eye(freq_dim))
-
-    Omega_block = np.zeros((freq_dim, freq_dim))
-    for h in range(1, H + 1):
-        w_h = h * omega_0
-        idx_cos = 2 * h - 1
-        idx_sin = 2 * h
-        Omega_block[idx_cos, idx_sin] = w_h
-        Omega_block[idx_sin, idx_cos] = -w_h
-
-    Omega_bar = np.kron(np.eye(num_vars), Omega_block)
-    Y_bar = G_bar + (C_bar @ Omega_bar)
-
-    K_samples = 2 * H + 1
-    period = 2 * np.pi / omega_0
-    t_points = np.linspace(0, period, K_samples, endpoint=False)
-    Gamma, Gamma_inv = create_fourier_matrices(H, t_points)
-
-    b_bar = np.zeros((total_dim, 1))
-    for index in range(num_vars):
-        base = index * freq_dim
-        b_bar[base] = problem.b_dc[index]
-
-    b_time_func = compile_time_source_func(problem.b_time_str)
-    b_time_matrix = np.zeros((num_vars, K_samples))
-    for k, t_value in enumerate(t_points):
-        b_time_matrix[:, k] = b_time_func(float(t_value)).flatten()
-    for index in range(num_vars):
-        base = index * freq_dim
-        b_bar[base : base + freq_dim, 0] += Gamma @ b_time_matrix[index, :]
+    core = _native_core()
+    num_vars = int(np.asarray(problem.b_dc).shape[0])
+    harmonics = int(H)
+    freq_dim = 2 * harmonics + 1
+    rows, programs = _hb_time_sources(problem.b_time_str)
 
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
     level1_devices = problem.level1_mos_devices
     level1_bjt_devices = problem.level1_bjt_devices
-    if not is_nonlinear(solver_f_str) and not level1_devices and not level1_bjt_devices:
-        try:
-            return solve_linear(
-                Y_bar,
-                b_bar,
-                use_krylov=use_krylov,
-                krylov_tol=krylov_tol,
-                krylov_max_iter=krylov_max_iter,
-                krylov_restart=krylov_restart,
-                krylov_rank=krylov_rank,
-                krylov_method=krylov_method,
-                krylov_stats=krylov_stats,
-            )
-        except np.linalg.LinAlgError as exc:
-            error_handler("HB_ERROR: Linear harmonic solve failed.")
-            raise exc
+    nonlinear = is_nonlinear(solver_f_str) or bool(level1_devices) or bool(level1_bjt_devices)
+    circuit = problem.native
+    if circuit is None:
+        # The builder leaves ``native`` unset only when a behavioral expression
+        # cannot be compiled; compiling the nonlinear functions raises the
+        # reference's error for it.
+        compile_nl_functions(
+            solver_f_str,
+            num_vars,
+            level1_mos_devices=level1_devices,
+            level1_bjt_devices=level1_bjt_devices,
+        )
+        error_handler("NETLIST_FATAL: harmonic balance needs the compiled circuit (problem.native).")
 
-    f_func, Jf_func = compile_nl_functions(
-        solver_f_str,
-        num_vars,
-        level1_mos_devices=level1_devices,
-        level1_bjt_devices=level1_bjt_devices,
-    )
-    x_bar = np.zeros((total_dim, 1))
+    resolved_rank, rank_mode = int(krylov_restart), "manual"
+    if use_krylov:
+        resolved_rank, rank_mode = resolve_krylov_rank(
+            num_vars * freq_dim, krylov_restart if krylov_rank is None else krylov_rank, krylov_restart
+        )
+        _krylov_route("general", krylov_method)  # unknown methods raise ValueError up front
 
-    for _ in range(max_iter):
-        x_reshaped = x_bar.reshape((num_vars, freq_dim))
-        x_time = x_reshaped @ Gamma_inv.T
+    b_dc = np.ascontiguousarray(np.asarray(problem.b_dc, dtype=float).reshape(-1))
+    try:
+        x_bar, stats = core.hb_solve(
+            circuit,
+            float(omega_0),
+            harmonics,
+            b_dc,
+            rows,
+            programs,
+            gmin=float(problem.gmin),
+            nonlinear=bool(nonlinear),
+            max_iter=int(max_iter),
+            tol=float(tol),
+            use_krylov=bool(use_krylov),
+            krylov_method=str(krylov_method),
+            krylov_tol=float(krylov_tol),
+            krylov_max_iter=int(krylov_max_iter),
+            krylov_rank=int(resolved_rank),
+            num_threads=int(num_threads),
+            max_nnz=hb_max_nnz() if max_nnz is None else int(max_nnz),
+        )
+    except core.CoreError as exc:
+        error_handler(f"{exc.code}: {exc.message}")
+        raise
 
-        i_nl_time = np.zeros((num_vars, K_samples))
-        G_nl_time = np.zeros((num_vars, num_vars, K_samples))
-
-        for k in range(K_samples):
-            v_inst = x_time[:, k]
-            i_nl_time[:, k] = np.asarray(f_func(*v_inst), dtype=float).flatten()
-            G_nl_time[:, :, k] = np.asarray(Jf_func(*v_inst), dtype=float)
-
-        f_bar = (i_nl_time @ Gamma.T).reshape((total_dim, 1))
-        residual = (Y_bar @ x_bar) + f_bar - b_bar
-
-        if np.linalg.norm(residual) < tol:
-            return x_bar
-
-        J_nonlinear = np.zeros((total_dim, total_dim))
-        for r in range(num_vars):
-            for c in range(num_vars):
-                g_waveform = G_nl_time[r, c, :]
-                weighted = g_waveform[:, None] * Gamma_inv
-                block = Gamma @ weighted
-                r_idx = r * freq_dim
-                c_idx = c * freq_dim
-                J_nonlinear[r_idx : r_idx + freq_dim, c_idx : c_idx + freq_dim] = block
-
-        try:
-            delta_x = solve_linear(
-                Y_bar + J_nonlinear,
-                -residual,
-                use_krylov=use_krylov,
-                krylov_tol=krylov_tol,
-                krylov_max_iter=krylov_max_iter,
-                krylov_restart=krylov_restart,
-                krylov_rank=krylov_rank,
-                krylov_method=krylov_method,
-                krylov_stats=krylov_stats,
-            )
-        except np.linalg.LinAlgError as exc:
-            error_handler("HB_ERROR: Singular HB Jacobian.")
-            raise exc
-
-        x_bar = x_bar + delta_x
-
-    error_handler("HB_ERROR: Harmonic balance solver did not converge within limit.")
+    if krylov_stats is not None:
+        dimension = num_vars * freq_dim
+        krylov_stats.extend(
+            _hb_krylov_info(entry, dimension, krylov_method, resolved_rank, rank_mode, krylov_max_iter)
+            for entry in stats["krylov"]
+        )
+    if hb_stats is not None:
+        hb_stats.update(stats)
+    return x_bar.reshape(-1, 1)

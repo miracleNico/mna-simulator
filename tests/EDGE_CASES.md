@@ -225,7 +225,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | No SIN/COS source; SIN at 0 Hz | `SCE` `HB_ERROR` "No sinusoidal sources found." | `test_hb_without_a_usable_sinusoidal_source` | yes |
 | Tone below the 1e-5 Hz GCD resolution | `HB_ERROR` "Could not determine HB base frequency." | `test_hb_source_frequency_below_the_gcd_resolution` | yes |
 | `harmonics` smaller than needed (1 kHz + 3 kHz, H=2) | Expanded to needed+4 = 7. H=3 is kept. `base_frequency_hz` is `1000.0000000000001` (integer GCD times the 1e-5 resolution) | `test_hb_harmonics_smaller_than_needed_are_expanded_to_needed_plus_4` | expansion: yes; float artifact: unclear |
-| `harmonics=0` / unset | 8 (`or 8`). A bare `.hb` directive gives 16 | `test_hb_harmonics_zero_or_unset_means_8` | 0: no; 8 vs 16: unclear |
+| `harmonics=0` / negative / unset | `harmonics <= 0` (option or `.hb 0`) is `SCE` `HB_ERROR` "harmonics must be a positive integer, got <n>."; unset (`None`) gives 8. A bare `.hb` directive gives 16. Was: 0 became 8 (`or 8`) and a negative count was expanded to needed+4 | `test_hb_harmonics_unset_means_8_and_non_positive_is_an_error` | decided: only `None` means unset, `<= 0` is `HB_ERROR` (2.4.1); 8 vs 16: unclear |
 | `.hb`, `.hb 5`, `.hb 1m`, `.hb 5 1m`, `.hb 2.5 1m` | `{H:16}`, `{5}`, `{16, window 1m}`, `{5, 1m}`, `{2, 1m}` (2.5 truncated) | `test_hb_directive_parameters` | yes |
 
 ### AC sweep
