@@ -767,12 +767,9 @@ def parse_netlist_text(netlist_text: str) -> CircuitIR:
 
     for raw_line in netlist_text.splitlines():
         line = raw_line.strip()
-        if not line:
+        if not line or line.startswith("*") or line.startswith("#"):
             continue
-        first = line[0]
-        if first == "*" or first == "#":
-            continue
-        if first == ".":
+        if line[0] == ".":  # only such a line can lower() to ".end"
             if line.lower() == ".end":
                 break
             directives.append(parse_directive(line))

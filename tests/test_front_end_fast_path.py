@@ -515,3 +515,11 @@ def test_malformed_netlists_raise_like_the_reference(netlist: str) -> None:
     _, current_error = _outcome(run, parse_netlist_text, build_mna_problem)
     assert reference_error is not None and current_error is not None
     assert _error_view(current_error) == _error_view(reference_error)
+
+
+@pytest.mark.parametrize("value", [b"R1 a 0 1k\n", None, ["R1 a 0 1k"], 42])
+def test_non_text_netlists_raise_like_the_reference(value) -> None:
+    _, reference_error = _outcome(reference_parse, value)
+    _, current_error = _outcome(parse_netlist_text, value)
+    assert reference_error is not None and current_error is not None
+    assert (type(current_error), str(current_error)) == (type(reference_error), str(reference_error))
