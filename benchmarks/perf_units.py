@@ -631,24 +631,55 @@ def _core_assembly_jacobian_sram_248(core_inputs: Any, num_threads: int) -> Any:
 # P2: complex KLU, Krylov solvers, Newton .op.
 
 
-def _core_direct_solve_complex_rlc_1035(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P2: complex KLU (LinearSolver kind='complex_klu')")
+def _core_setup_csc_any(inputs: dict[str, Any]) -> dict[str, Any]:
+    """CSC int32 arrays (real or complex) of the reference operator for ``_core.direct_solve``."""
+
+    from mna_simulation.native import linalg
+
+    _native()
+    op = linalg.to_csc_arrays(inputs["A"])
+    return {"op": op, "b": np.ascontiguousarray(inputs["b"])}
 
 
-def _core_direct_solve_complex_sram_248(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P2: complex KLU (LinearSolver kind='complex_klu')")
+def _core_direct_solve_csc(core_inputs: dict[str, Any], num_threads: int) -> np.ndarray:
+    op = core_inputs["op"]
+    return _native().direct_solve(op.col_ptr, op.row_idx, op.values, core_inputs["b"])
 
 
-def _core_krylov_gmres_rlc_1035(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P2: native GMRES (krylov_solve)")
+def _core_direct_solve_complex_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> np.ndarray:
+    return _core_direct_solve_csc(core_inputs, num_threads)
 
 
-def _core_krylov_minres_rlc_1035(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P2: native MINRES (krylov_solve)")
+def _core_direct_solve_complex_sram_248(core_inputs: dict[str, Any], num_threads: int) -> np.ndarray:
+    return _core_direct_solve_csc(core_inputs, num_threads)
 
 
-def _core_krylov_cg_rlc_1035(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P2: native CG (krylov_solve)")
+def _core_krylov(core_inputs: dict[str, Any], num_threads: int) -> tuple[np.ndarray, dict[str, Any]]:
+    """Native ``krylov_solve_linear`` with the reference's call shape (same conversions timed)."""
+
+    from mna_simulation.native import linalg
+
+    return linalg.krylov_solve_linear(
+        core_inputs["A"],
+        core_inputs["b"],
+        tol=core_inputs["tol"],
+        max_iter=core_inputs["max_iter"],
+        restart=core_inputs["restart"],
+        method=core_inputs["method"],
+        num_threads=num_threads,
+    )
+
+
+def _core_krylov_gmres_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_krylov(core_inputs, num_threads)
+
+
+def _core_krylov_minres_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_krylov(core_inputs, num_threads)
+
+
+def _core_krylov_cg_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_krylov(core_inputs, num_threads)
 
 
 def _core_op_sram_248(core_inputs: Any, num_threads: int) -> Any:
@@ -834,6 +865,7 @@ _register(
     setup=_setup_direct_solve_complex_rlc,
     reference=_ref_direct_solve,
     core=_core_direct_solve_complex_rlc_1035,
+    core_setup=_core_setup_csc_any,
     parity=parity_array,
     phase="P2",
     tolerance=TOL_LINEAR,
@@ -846,6 +878,7 @@ _register(
     setup=_setup_direct_solve_complex_sram,
     reference=_ref_direct_solve,
     core=_core_direct_solve_complex_sram_248,
+    core_setup=_core_setup_csc_any,
     parity=parity_array,
     phase="P2",
     tolerance=TOL_LINEAR,
