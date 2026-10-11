@@ -80,7 +80,7 @@ def test_service_metadata_for_explicit_threads() -> None:
     assert metadata["threads_requested"] == 2
     assert metadata["threads_used"] == 2
     assert metadata["thread_budget_total"] == 4
-    assert metadata["core_backend"] == "python"  # flips to "cpp" at the C++ cut-overs
+    assert metadata["core_backend"] == "cpp"  # every analysis runs in the native core since P5
     assert metadata["core_version"] == core_version()
     assert isinstance(metadata["elapsed_ms"], float) and metadata["elapsed_ms"] >= 0.0
     # The backend sees the grant, not the raw request.

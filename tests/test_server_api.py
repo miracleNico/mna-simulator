@@ -81,7 +81,7 @@ def test_simulate_op_reports_threads(client: TestClient) -> None:
     assert metadata["threads_requested"] == 1
     assert metadata["threads_used"] == 1
     assert metadata["thread_budget_total"] >= 1
-    assert metadata["core_backend"] == "python"  # flips to "cpp" at the C++ cut-overs
+    assert metadata["core_backend"] == "cpp"  # every analysis runs in the native core since P5
     assert metadata["core_version"] == core_version()
     assert metadata["elapsed_ms"] >= 0
 

@@ -86,7 +86,7 @@ class SimulationService:
                 "thread_budget_total": budget.total,
                 # Which implementation produced the numbers. Still the Python solvers; each
                 # C++ cut-over (CPP_MIGRATION_PLAN.md section 6) switches its analyses to "cpp".
-                "core_backend": "python",
+                "core_backend": "cpp",
                 "core_version": _core_version(),
                 "elapsed_ms": round(elapsed_ms, 3),
             }
