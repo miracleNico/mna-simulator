@@ -11,12 +11,12 @@ migration), `tests/EDGE_CASES.md` (behaviour specification of the current core),
 | --- | --- |
 | Scope | `.op`, `.tran`, `.ac`, `.hb`, all Krylov solvers, model-order reduction (linear Krylov basis, TPWL training), HB reconstruction, and any other compute-heavy module move to C++. Parser, schematic pipeline, FastAPI app, CLI, and the React app stay in Python/TypeScript. |
 | Extension | Mandatory. Once a unit reaches parity its Python implementation leaves the runtime package. There is no Python numerical fallback. |
-| Sparse direct solver | SuiteSparse KLU (with AMD, COLAMD, BTF, SuiteSparse_config) vendored and statically linked. Eigen for dense linear algebra, complex arithmetic, and SVD. |
+| Sparse direct solver | SuiteSparse KLU (with AMD, COLAMD, BTF, SuiteSparse_config) vendored as copied sources. Statically linked in phase 0; from phase 2 (when it becomes load-bearing) built as a shared library inside the wheel (`auditwheel`/`delvewheel`) so the LGPL relinking requirement is met cleanly. Eigen for dense linear algebra, complex arithmetic, and SVD. |
 | Test oracle | Today's Python numerical core is frozen as `tests/reference/mna_reference` (test-only, not shipped) and used for differential tests forever, including randomized circuits. |
 | Platforms | Linux and Windows (the web app is used on Windows). CI builds and tests both; wheels for CPython 3.12+ (stable ABI). |
 | Thread control | Explicit end-user control: a `num_threads` request option, a UI control in the simulation panel, and `threads_used` in result metadata. The service enforces a machine-wide budget (`MNA_NUM_THREADS`, default = CPU count) so concurrent requests never oversubscribe; "auto" lets the service pick. |
 | Performance comparison | `benchmarks/compare_backends.py` (frozen Python vs C++ at 1, 2, 4, N threads, per migrated unit) plus a `perf`-marked pytest gate with generous floors, skipped unless `--run-perf`. |
-| Bindings and build | nanobind (stable ABI, static libnanobind), scikit-build-core, CMake >= 3.26, C++17, OpenMP (MSVC `/openmp` is OpenMP 2.0, so loops use signed indices and per-call `num_threads(k)` clauses). |
+| Bindings and build | nanobind (stable ABI, static libnanobind), scikit-build-core, CMake >= 3.26, C++17. Threads come from an internal `std::thread` pool created per call, not OpenMP: MSVC only offers OpenMP 2.0 and every OpenMP runtime would have to be bundled into the wheel. |
 | Orchestration | Coordinator and auditor reviews every change against the differential suite before it is committed; workers implement one unit at a time behind existing facades (strangler pattern). |
 
 ## 2. Target architecture
@@ -69,19 +69,25 @@ keep working.
 
 FUNC time sources and `B` behavioral sources are arbitrary expressions today
 (SymPy `sympify` + `lambdify`). SymPy stays as a compile-time tool on the
-Python side: `mna_simulation/exprc.py` sympifies the expression with the same
-locals as `solvers._sympy_locals`, differentiates behavioral expressions with
-respect to each referenced unknown, and lowers both to a postfix bytecode with
-the operator set the current core accepts: `+ - * / **`, unary minus, `sin cos
+Python side: `mna_simulation/native/expressions.py` sympifies the expression
+with the same locals as `solvers._sympy_locals` and lowers the tree to a postfix
+bytecode with the operator set the current core accepts: `+ - * / **`, unary minus, `sin cos
 exp sqrt log abs`, `Heaviside(x, h0)`, `Piecewise`, `Mod`, `Min`, `Max`,
 comparisons, `And/Or/Not`, constants, symbols `t` and `x_i`. The C++ evaluator
 (`cpp/src/expr/`) executes the bytecode with a small value stack. Parity rules:
 `Heaviside(0, h0) = h0` (the current core passes `1`), `Piecewise` takes the
 first true branch, `Mod` follows SymPy sign semantics, division by zero yields
-inf as NumPy does. Time-source programs are evaluated once per time point for
-the whole grid (vectorized in C++), behavioral programs inside every Newton
-evaluation. Diodes stop being expressions and become a native model
-(Shockley with `V_T = 0.025`, no clipping, exactly as today).
+inf as NumPy does; `Piecewise` with no true branch yields NaN like
+`numpy.select`. Derivatives of behavioral sources are not generated as strings:
+the evaluator runs the same program on forward-mode dual numbers over the set
+of unknowns the expression references (discovered at parse time), which also
+removes the latent lambdify failure for `Heaviside` derivatives. Time-source
+programs are evaluated per grid point inside the core (so the same path serves
+transient, HB samples and future adaptive stepping); behavioral programs run
+inside every Newton evaluation. Unsupported SymPy nodes fail at build time
+with `NETLIST_FATAL` naming the component. Programs are cached per expression
+string. Diodes stop being expressions and become a native model (Shockley
+with `V_T = 0.025`, no clipping, exactly as today).
 
 ### 2.3 Kernel API (nanobind surface)
 
@@ -101,7 +107,7 @@ back as plain structs of arrays.
 | `ac_sweep(circuit, x_op, frequencies, options) -> (magnitudes, stats)` | linearize at the operating point, complex KLU per frequency, frequency-parallel |
 | `hb_solve(circuit, omega0, H, options) -> (x_bar, stats)` and `hb_reconstruct(x_bar, n, H, omega0, t)` | 2.6 |
 | `mor_linear_basis(...)`, `mor_project(...)`, `mor_reduced_ac/transient(...)`, `tpwl_train(...)`, `tpwl_run(...)` | 2.7 |
-| `version()`, `build_info()` | diagnostics (compiler, OpenMP, KLU, Eigen versions) |
+| `version()`, `build_info()` | diagnostics (compiler, threads implementation and hardware concurrency, KLU, Eigen versions) |
 
 Errors are raised as `mna_simulation._core.CoreError` with a `.code`
 attribute using the existing code set (`NETLIST_FATAL`, `NR_CONVERGENCE`,
@@ -116,8 +122,12 @@ exception classes so `pytest.raises(SolverConvergenceError)` keeps working.
   residual norm, otherwise the best trial; convergence when `||F|| < f_tol` or
   `||dx|| < v_tol`; `NR_CONVERGENCE` when no scale reduces the residual or
   `max_iter` is exhausted; `JACOBIAN_SINGULAR` on a singular factorization.
-- Gmin stepping stays in `PythonBackend.run` (rebuild and retry over
-  `DEFAULT_GMIN_STEPS` on any exception); `build_circuit` is cheap enough.
+- Gmin stepping stays in `PythonBackend.run` over `DEFAULT_GMIN_STEPS`, but
+  the circuit is compiled once: the builder records a unit `gmin` stamp pattern
+  and the core forms `G_eff = G + gmin * gmin_pattern`. Retries happen only for
+  numerical codes (`NR_CONVERGENCE`, `JACOBIAN_SINGULAR`, `AC_ERROR`, numerical
+  `HB_ERROR`); structural errors such as a zero-valued resistor are raised once.
+  The final error after exhausting the steps is unchanged.
 - Time grid: `_transient_time_points` semantics (fixed step, snap to `t_stop`
   with the 1e-9 relative tolerance, `TRAN_ERROR` codes).
 - Level-1 MOS/BJT equations, `vt = 0.02585`, exp clipping at +/-80 for BJT,
@@ -136,13 +146,20 @@ the base class. Each change updates the differential expectation explicitly.
 
 ### 2.5 Multithreading design
 
-- Mechanism: OpenMP with an explicit `num_threads(k)` clause on every parallel
-  region, k from the call argument; never `omp_set_num_threads` or other global
-  state, so concurrent Python callers do not interfere (verified).
-- Device evaluation: devices are partitioned statically across threads; each
-  thread writes its devices' Jacobian values into a per-device triplet buffer
-  (fixed slots, no atomics); a final pass sums triplets into CSR slots in
-  device order. Result is bitwise identical for any thread count.
+- Mechanism: an internal `std::thread` pool (`cpp/include/mna/threads.hpp`)
+  created per analysis call with `k - 1` workers plus the caller and joined at
+  the end; `k = 1` runs inline with zero overhead. No global state, so
+  concurrent Python callers never interfere. Chunk boundaries of `parallel_for`
+  depend only on the item count, never on `k`. No OpenMP anywhere (MSVC OpenMP
+  2.0 limits, and bundling libgomp/vcomp into wheels is a known hazard).
+  Parallel device evaluation is enabled above ~2048 devices; below that the
+  serial loop (about 12 ns per device) is faster than any dispatch.
+- Device evaluation is two-phase: phase 1 writes each device's contributions
+  into per-device scratch slots in parallel over device chunks; phase 2 gathers
+  into CSR slots and residual rows through a precomputed assembly map in fixed
+  device order (parallel over slots/rows, no atomics). Result is bitwise
+  identical for any thread count. Flags: no fast-math, `-ffp-contract=off`,
+  `/fp:precise`; the serial path calls the same chunk function.
 - AC sweep and HB sample evaluation: one output slot per frequency/sample,
   trivially deterministic; each thread owns its own KLU numeric object.
 - Transient stepping is sequential; parallelism inside a step is device
@@ -193,9 +210,9 @@ cpp/bindings/module.cpp       nanobind module
 cpp/tests/...                 doctest unit tests (ctest)
 cpp/third_party/              eigen/, suitesparse/{SuiteSparse_config,AMD,COLAMD,BTF,KLU}, doctest/, LICENSES/
 mna_simulation/_core*.so|pyd  built extension (mandatory)
-mna_simulation/native.py      import guard and build info
-mna_simulation/exprc.py       SymPy -> bytecode compiler
-mna_simulation/runtime.py     thread budget, BLAS pinning
+mna_simulation/native/        import guard and build info (__init__), circuit.py (tables -> build_circuit),
+                              expressions.py (SymPy -> bytecode), analyses.py (wrappers, error translation,
+                              timings), linalg.py (Krylov/direct facades), threads.py (ThreadBudget, MNA_NUM_THREADS)
 mna_simulation/{mna_builder,solvers,core_basic,core_advanced,mor}/  facades over _core
 tests/reference/mna_reference frozen oracle (not shipped)
 tests/corpus.py               differential corpus and random generators
@@ -258,18 +275,39 @@ uploads the JSON as an artifact; it never blocks a merge.
 
 ## 6. Phases, deliverables, exit criteria
 
-| Phase | Deliverables | Exit criteria |
-| --- | --- | --- |
-| P0 Foundations | frozen reference, `conftest.py`, corpus, differential tests (reference vs current), edge-case spec, `.gitignore` and index cleanup, `cpp/` skeleton with vendored Eigen/KLU/doctest, `_core` with `version/build_info/klu_solve/parallel_row_sums`, `pyproject` on scikit-build-core, CI (Linux + Windows, sanitizers, coverage, wheels), smoke tests, this document | `pip install -e .` builds on Linux; CI green on both platforms; all existing tests plus differential and smoke tests pass; `ctest` passes |
-| P1 Circuit and devices | `exprc.py`, `build_circuit`, device tables, static stamps, CSR pattern with slots, `evaluate`, `to_dense`, native diode/MOS/BJT/behavioral models, `mna_builder` facade with `native` handle | dense `G`, `C`, `b_dc`, `b_ac` equal to the reference to 1e-15 relative on the whole corpus; `f` and `J` equal to the reference's `compile_nl_functions` at random states; doctest coverage of every model boundary |
-| P2 Linear algebra and basic analyses | KLU/Eigen `LinearSolver`, complex KLU, Krylov methods and classification, `newton_op`, `transient` (cached factorization, progress callback), `ac_sweep`; facades `solve_dc_nr`, `solve_transient`, `solve_ac`, `solve_linear`, `krylov_solve_linear`, `classify_krylov_matrix`; `.dyn` streaming from the progress callback | differential suite passes for `.op`, `.tran`, `.ac` on the whole corpus; metadata parity for Krylov fields; `perf` floors met for these units |
-| P3 HB and MOR, runtime removal | `hb_solve`/`hb_reconstruct` (block-structured), MOR basis/projection/reduced runs, TPWL training/run; `core_advanced` and `mor/*` facades; Python numerical implementations deleted from `mna_simulation` (kept only in the frozen reference) | differential suite passes for `.hb` and MOR cases; `mna_simulation` no longer imports SymPy at solve time (only in `exprc.py`) nor NumPy linear-algebra solvers; wheel contains no dead code |
-| P4 Threads, control, performance | parallel device evaluation with deterministic reduction, frequency/sample/shift parallelism, `runtime.ThreadBudget`, `num_threads` request option, UI control and metadata, determinism and resource tests, `compare_backends.py`, perf gate, committed baselines, Windows wheel validation, README/STRUCT/USER_GUIDE updates | determinism tests pass; four concurrent SRAM requests finish within 1.5x of one; perf gate passes on Linux CI; Windows wheel passes the full suite |
-| P5 Stretch (not required for completion) | HB phase B (FFT, matrix-free GMRES), adaptive time stepping, trapezoidal/Gear-2 | separate plan |
+| Phase | Weeks | Deliverables | Exit criteria |
+| --- | ---: | --- | --- |
+| P0 Freeze and scaffold | 1 | frozen reference, `conftest.py`, corpus, differential tests (reference vs current), edge-case spec and `EDGE_CASES.md`, `.gitignore` and index cleanup, `cpp/` skeleton with vendored Eigen/KLU/doctest, `_core` with `version/build_info/klu_solve/parallel_row_sums`, `pyproject` on scikit-build-core, CI (Linux + Windows, sanitizers, coverage, wheels), smoke tests, this document, `dev` integration branch | `pip install -e .` builds on Linux; CI green on both platforms; all existing tests plus differential and smoke tests pass; `ctest` passes |
+| P1 Expressions and devices | 2 | `native/expressions.py` + expression VM with dual numbers, `build_circuit` (COO triplets, union pattern, per-device slots, gmin pattern), MOS/BJT/diode/behavioral kernels with deterministic gather, `to_dense`, facades `compile_nl_functions`, `_level1_*`, `DeviceSet` bindings | dense `G`, `C`, `b_dc`, `b_ac` equal to the reference to 1e-15 relative on the whole corpus; `f` and `J` equal to the reference at 1000 random states to 1e-13; `test_physical_sram.py` and `test_netlist_extensions.py` pass through the facades; doctest coverage of every model boundary |
+| P2 Linear algebra and `.op` | 2 | `KluSolver` real/complex with cached symbolic analysis and refactor, dense Eigen solver, GMRES/CR/MINRES/CG with classification and the legacy info keys (including the `minres` naming rule at n >= 64), Newton driver ported verbatim, `.op` cut over, `solve_linear`/`krylov_solve_linear`/`classify_krylov_matrix` facades, KLU as a shared library in the wheel | `.op` differential green on the whole corpus; `test_krylov_solvers.py` passes unedited; SRAM `.op` at least 5x faster than the reference |
+| P3 Transient, AC, operating points | 2 | transient driver (Backward Euler, cached factorization for constant-step linear runs, Krylov path, progress callback for `.dyn`), AC sweep parallel over frequencies, `OperatingPointTable`, lazy dense `G`/`C` for `.show_matrix`, gmin scalar passthrough with retry only on numerical codes, metadata additions | `.tran`/`.ac` differential green including the 1035-unknown mesh; thread-determinism test green; `test_service.py` and `test_mor.py` still green |
+| P4 Harmonic balance | 2 | block-sparse `Y_bar`, dense `K x K` device-Jacobian blocks only on the device pattern, Fourier matrices, Newton, reconstruction, memory policy (`HB_ERROR` with sizes), `core_advanced` facade | HB differential green (mixer H=205 within 1e-6); `test_harmonic_balance.py` green; mixer under 0.5 s |
+| P5 MOR | 2 | rational Krylov basis through KLU/complex KLU shifted solves and block Gram-Schmidt, projections, reduced AC/transient, validation path, TPWL training (full transient, `BDCSVD`, reduced local models) and simulation; Python LRU cache holds handles | MOR differential green; `test_mor.py` green unedited |
+| P6 Cut-over and hardening | 1.5 | Python numerics deleted from the runtime package (reference only), `CoreBackend`, `ThreadBudget` + `num_threads` option + UI control + metadata, `compare_backends.py`, perf gate and committed baselines, leak and determinism tests, sanitizer/coverage/wheels workflows final, README/STRUCT/USER_GUIDE/PERFORMANCE_PLAN updates, CLI `--threads` | wheels for Linux and Windows pass the full suite on 3.12 and 3.13; perf floors met; ASan/UBSan clean; four concurrent SRAM requests finish within 1.5x of one |
+| P7 Optional | 2-3 | matrix-free HB (FFT products, GMRES with block-diagonal per-harmonic preconditioner), dense-vs-KLU threshold tuning, adaptive time stepping | separate plan |
 
-Order of work inside each phase: C++ unit with doctest tests, binding and
-binding tests, facade switch behind the public function, differential run,
-audit, commit. The suite is green at every commit.
+Each cut-over (P2 to P5) lands behind an environment toggle `MNA_CORE_UNIT`
+for one merge window so the differential suite can run both paths in CI,
+then the toggle is removed. Order of work inside each phase: C++ unit with
+doctest tests, binding and binding tests, facade switch behind the public
+function, differential run, audit, commit. The suite is green at every commit.
+
+### 6.1 Load-bearing quirks of the current core (parity checklist)
+
+| Quirk | Where | Port decision |
+| --- | --- | --- |
+| Symmetric Krylov route reports `minres` when n >= 64 (SciPy engine) and `conjugate_residual` below 64 or for complex matrices | `solvers.py:425-511` | port both and keep the threshold in the routing table |
+| Sparse classification: symmetry if `max abs(A - A^H) <= 1e-10`, Cholesky attempted only when n <= 256; a `1x1 [[1e-3]]` is `positive_definite` | `solvers.py:88-120` | use the sparse rule everywhere |
+| Non-converged Krylov answer accepted when `relative_residual <= max(10 tol, 1e-8)`, otherwise direct fallback with `used_direct_fallback = True` | `solvers.py:593-599` | keep exactly |
+| Damped Newton accepts the first trial with `trial_norm <= current_norm`, 28 halvings, best strictly smaller trial tracked, `step_scale == 0` raises, `norm(delta) < v_tol` exits, residual checked before the first solve | `solvers.py:1022-1051, 1108-1151` | port verbatim |
+| Transient initial op uses `b_dc + b_time(0)`; AC linearizes with `b_dc` only; `op_used` is True only with Level-1 devices and no `init_condition` | `core_basic.py:435-471` | keep both call shapes, do not "fix" `op_used` |
+| Time grid accumulates `current + t_step` then snaps the last point | `solvers.py:992-1013` | identical operation order, bitwise grids |
+| `init_condition == "RANDOM"` uses NumPy's global RNG | `solvers.py:1102` | RNG stays in Python; the core always receives `x0` |
+| `PythonBackend.run` retries any exception nine times and rebuilds everything | `backends/python_backend.py:180-197` | retry numerical codes only, compile once |
+| HB metadata allocates a dense `(nK)^2` matrix only to classify it | `core_advanced.py:83-89` | classify from dimension instead |
+| Tests use `problem.G[c, c]`, `len(problem.G)`, `G_sparse + C_sparse / h`, `.nnz`, `matrix_storage == "dense+csr"`, `krylov_operator_storage == "csr"` | `test_netlist_extensions.py:459`, `test_krylov_solvers.py:237-255, 337` | keep SciPy CSR fields, lazy dense `G`/`C`, report `csr` for the row-permuted operator view |
+| `_level1_*`, `compile_nl_functions`, `_transient_time_points`, `solve_linear`, `krylov_solve_linear`, `classify_krylov_matrix`, `resolve_krylov_rank` are imported by tests or by `core_basic`/`mor` | `tests/*`, `core_basic.py` | keep as facades with identical signatures |
+| Expression grammar in use: `Piecewise`, `sin cos exp sqrt`, `Max/Min`, `np.heaviside(x, 1)`, `np.mod(t, T)`, `pi`, relations, `t`, `x[i]`; `np.`/`sp.` prefixes stripped | `device_models.py`, `solvers.py:645-693` | defines the VM opcode set |
 
 ## 7. Risks and mitigations
 
@@ -277,8 +315,8 @@ audit, commit. The suite is green at every commit.
 | --- | --- |
 | Numerical drift versus the oracle (pivoting order, summation order) | tolerances per class; bitwise checks only where the algorithm is identical (device evaluation, time grid); investigate every tolerance widening before accepting it |
 | Behavioural quirks of the current core that are accidental | `tests/EDGE_CASES.md` decides preserve vs change case by case before P2 |
-| Windows/MSVC differences (OpenMP 2.0, `long` size, `/fp` model, DLL loading) | signed loop indices, `int64_t`/`double` only in interfaces, `/fp:precise`, static linking, CI on `windows-latest` from P0 |
-| KLU and BTF are LGPL-2.1+ and statically linked | license texts shipped; the project is open source so relinking from source is possible; switch to a shared library inside the wheel (`delvewheel`/`auditwheel`) if closed-source distribution is ever needed |
+| Windows/MSVC differences (`long` size, `/fp` model, libm last-bit differences, DLL loading) | `int64_t`/`double` only in interfaces, `/fp:precise`, `std::thread` instead of OpenMP, `delvewheel` for the KLU shared library, tolerances and determinism asserted per platform, CI on `windows-latest` from P0 |
+| KLU and BTF are LGPL-2.1+ | license texts shipped; static link only during phase 0-1; shared `mna_suitesparse` library inside the wheel from phase 2 so relinking is possible without rebuilding the extension |
 | HB memory and time at large n | block-structured assembly (2.6); document the limit (`nnz(G+J) * K^2` doubles); phase B if needed |
 | Expression evaluator parity with SymPy | the compiler and evaluator are tested against SymPy-evaluated vectors for every function in the allowed set, including `Heaviside(0)` and `Piecewise` ordering |
 | SymPy remains a dependency | only `exprc.py` imports it, at circuit-build time; acceptable |
