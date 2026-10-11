@@ -136,8 +136,12 @@ class ThreadBudget:
         with self._cond:
             return {"total": self._total, "free": self._free, "active": self._active}
 
-    def acquire(self, requested: object = None, *, timeout: float | None = _UNSET) -> int:
-        """Block until a thread is free, then take a grant; prefer :meth:`lease`."""
+    def acquire(self, requested: object = None, *, cap: int | None = None, timeout: float | None = _UNSET) -> int:
+        """Block until a thread is free, then take a grant; prefer :meth:`lease`.
+
+        ``cap`` bounds an ``"auto"`` grant (see :func:`useful_threads`); an explicit
+        integer request is the caller's own upper limit and ignores it.
+        """
 
         normalized = coerce_num_threads(requested)
         wait = self.wait_timeout if timeout is _UNSET else timeout
@@ -152,6 +156,8 @@ class ThreadBudget:
                 granted = min(normalized, self._free, self._total)
             else:
                 granted = min(self._free, max(1, self._total // (self._active + 1)))
+                if cap is not None:
+                    granted = min(granted, max(1, int(cap)))
             granted = max(1, granted)
             self._free -= granted
             self._active += 1
@@ -166,10 +172,12 @@ class ThreadBudget:
             self._cond.notify_all()
 
     @contextmanager
-    def lease(self, requested: object = None, *, timeout: float | None = _UNSET) -> Iterator[int]:
-        """Hold ``min(requested, free, total)`` threads (or a fair share for ``"auto"``)."""
+    def lease(
+        self, requested: object = None, *, cap: int | None = None, timeout: float | None = _UNSET
+    ) -> Iterator[int]:
+        """Hold ``min(requested, free, total)`` threads (or a fair share for ``"auto"``, at most ``cap``)."""
 
-        granted = self.acquire(requested, timeout=timeout)
+        granted = self.acquire(requested, cap=cap, timeout=timeout)
         try:
             yield granted
         finally:
@@ -178,6 +186,35 @@ class ThreadBudget:
     def __repr__(self) -> str:
         state = self.snapshot()
         return f"ThreadBudget(total={state['total']}, free={state['free']}, active={state['active']})"
+
+
+# ``"auto"`` leases only what an analysis can use (the core's own thresholds):
+# device evaluation and the Newton/transient drivers run on one thread below this
+# many devices (``kParallelDeviceMinCount`` in cpp/include/mna/analyses/newton.hpp),
+# the AC sweep spreads frequencies over at most ``points // 2`` threads, and
+# harmonic balance of a small circuit is dominated by one serial dense LU.
+PARALLEL_DEVICE_MIN_COUNT = 2048
+HB_PARALLEL_MIN_NODES = 64
+
+
+def useful_threads(mode: object, *, devices: int, nodes: int, ac_points: int | None = None) -> int | None:
+    """Upper bound on the threads an ``"auto"`` request of ``mode`` can put to use.
+
+    ``None`` means "no bound" (the fair share of the budget). ``mode`` is an
+    ``AnalysisMode`` or its string value (``"op"``, ``"tran"``, ``"ac"``, ``"hb"``).
+    Concurrent small requests then run side by side instead of waiting for one
+    another's lease; an explicit ``num_threads`` is never capped.
+    """
+
+    kind = str(getattr(mode, "value", mode)).lower()
+    if kind in ("op", "tran"):
+        return 1 if devices < PARALLEL_DEVICE_MIN_COUNT else None
+    if kind == "ac":
+        points = 100 if ac_points is None else int(ac_points)
+        return max(1, points // 2)
+    if kind == "hb":
+        return 1 if nodes < HB_PARALLEL_MIN_NODES else None
+    return None
 
 
 _default_budget: ThreadBudget | None = None

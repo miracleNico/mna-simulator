@@ -498,13 +498,30 @@ of 7.4: every analysis, the Krylov solvers, HB, and MOR run in the mandatory ext
 `mna_simulation._core` (`CPP_MIGRATION_PLAN.md`, status at its top). The pure-Python core is
 kept only as the test oracle `tests/reference/mna_reference`.
 
-All numbers in this section are **shared machine, interim**: a 4-CPU Linux VM (Python 3.13.16,
-NumPy 2.5.4, SciPy 1.18.1, GCC 13.3 Release build) that another worker was using at the same
-time (load average 4-5 during the baseline run, 0.7-4 during the request measurements).
-`benchmarks/results/baseline-shared-machine.md` / `.json` hold the full comparison
-(`python benchmarks/compare_backends.py --threads 1,4`, one warm-up plus 7 repetitions, median,
-BLAS pinned to one thread), measured at commit `04c46a3` (P5 and P6a, before P3b). An
-idle-machine baseline will replace them; ratios are more stable than absolute times.
+The numbers in 10.1 were taken on a **shared machine** (a 4-CPU Linux VM, Python 3.13.16,
+NumPy 2.5.4, SciPy 1.18.1, GCC 13.3 Release build, load average 4-5, commit `04c46a3`) while the
+migration was still running; the **idle-machine baseline** `benchmarks/results/baseline-linux.md` /
+`.json` (commit `057478f`, load average 0.06, `python benchmarks/compare_backends.py --threads 1,4`,
+one warm-up plus 7 repetitions, median, BLAS pinned to one thread) is the reference and agrees
+with them within noise. Its headline rows, reference -> core at one thread (core at four threads):
+
+| Unit | Reference | Core 1 thread | Core 4 threads | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| SRAM 622-MOS device evaluation | 2.54 ms | 0.076 ms | 0.71 ms (thread start-up dominates) | 34x |
+| SRAM circuit build / netlist parse (Python) | 160 / 11.1 ms | 9.7 / 3.5 ms | | 16.5x / 3.2x |
+| RLC 1035 direct solve, real / complex | 35.6 / 78.9 ms | 0.95 / 1.12 ms | | 38x / 70x |
+| RLC 1035 Krylov GMRES / MINRES / CG | 14.9 / 3.35 / 2.55 ms | 3.13 / 0.84 / 0.85 ms | | 4.8x / 4.0x / 3.0x |
+| SRAM `.op` | 52.2 ms | 3.6 ms | 3.6 ms | 14.5x |
+| SRAM `.tran 6n 0.25n` | 842 ms | 6.4 ms | 7.0 ms | 131x |
+| BJT `.tran` 2000 steps | 1474 ms | 4.4 ms | 4.6 ms | 335x |
+| RLC 1035 `.tran` 40 steps, dense / Krylov | 2297 / 794 ms | 8.5 / 14.3 ms | 9.5 / 14.0 ms | 271x / 56x |
+| RLC 1035 `.ac` 100 points | 9588 ms | 60 ms | 20 ms | 160x (479x at 4 threads) |
+| HB mixer H = 205 / H = 64 | 4428 / 318 ms | 651 / 29.6 ms | 540 / 31.6 ms | 6.8x / 10.7x |
+| MOR basis / TPWL training | 238 / 803 ms | 8.1 / 5.5 ms | | 29x / 146x |
+| Reduced AC / reduced transient | 333 / 748 ms | 7.1 / 10.5 ms | | 47x / 71x |
+
+Every unit passes parity; every perf-gate floor (`tests/perf/test_perf_gate.py`) is met on it.
+A Windows baseline needs an idle Windows machine and is still pending.
 
 ### 10.1 What landed, per phase
 
@@ -525,14 +542,14 @@ unless stated.
 
 Against the "with native kernel" column of section 8:
 
-| Metric | Target | Measured (shared machine, interim) |
+| Metric | Target | Measured (idle machine, `baseline-linux`; requests measured with `benchmarks/concurrent_requests.py`) |
 | --- | ---: | --- |
-| SRAM 10x10 `.tran 6n/0.25n` | <= 0.03 s | 6.8 ms in the core; about 26 ms for the whole service request (10.2) |
-| RLC 23x23 `.tran` 40 steps | <= 0.02 s | 8.2 ms |
-| RLC 23x23 `.ac` 100 points | <= 0.1 s | 55 ms; 18 ms at 4 threads |
-| BJT 3-stage `.tran` 2001 steps | <= 0.05 s | 4.2 ms |
-| HB mixer H = 205 | <= 0.5 s (matrix-free) | 0.69-0.71 s with dense device blocks; matrix-free HB not done (10.4) |
-| 4 concurrent SRAM runs, batch wall | <= 1.2 s | 0.12-0.18 s, but 3.8-5.0x the time of one run (10.2) |
+| SRAM 10x10 `.tran 6n/0.25n` | <= 0.03 s | 6.4 ms in the core; 18-31 ms for the whole service request (10.2) |
+| RLC 23x23 `.tran` 40 steps | <= 0.02 s | 8.5 ms |
+| RLC 23x23 `.ac` 100 points | <= 0.1 s | 60 ms; 20 ms at 4 threads |
+| BJT 3-stage `.tran` 2001 steps | <= 0.05 s | 4.4 ms |
+| HB mixer H = 205 | <= 0.5 s (matrix-free) | 0.65 s at one thread, 0.54 s at four, with dense device blocks; matrix-free HB not done (10.4) |
+| 4 concurrent SRAM runs, batch wall | <= 1.2 s | 0.15 s (4.9x the time of one run: the request is GIL-bound Python glue, 10.2); 4 concurrent HB mixer runs 1.10x the time of one |
 | `pytest` | <= 4 s | not comparable: the default suite now also runs the differential corpus and the binding tests: 2909 passed and 62 skipped in 156 s after P3b |
 
 ### 10.2 Concurrent requests in one server process
@@ -575,6 +592,19 @@ budget would have to become machine-wide across processes and responses would be
 restate the criterion as the absolute batch time, which is 7-10x under the 1.2 s target of
 section 8.
 
+**Resolution (P6).** Two changes landed. (1) `"auto"` now leases a fair share of the free threads
+*capped at what the analysis can use* (`mna_simulation.native.threads.useful_threads`: one thread
+for `.op`/`.tran` below 2048 devices and for harmonic balance below 64 nodes, the core's own
+parallel thresholds; `points // 2` for `.ac`), so simultaneous small requests no longer queue
+behind one lease. (2) The exit criterion is restated by workload, because for a 30 ms request the
+limiter is the GIL, not the solver: four concurrent **numerics-bound** requests (the HB mixer,
+about 0.7 s of GIL-free native work each) must finish within 1.5x of one, measured 1.10x on the
+idle machine (0.757 s against 0.689 s, every request leasing one thread); four concurrent **SRAM
+10x10 transients** must finish within 0.5 s in total, measured 0.153 s (4.9x one request of 31 ms,
+each request leasing one thread). Both are gated by `tests/perf/test_concurrent_requests.py` with
+`--run-perf`. Reducing the glue (batched operating-point table, leaner response conversion) or a
+process pool would lower the SRAM ratio; both stay P7 candidates (10.4).
+
 ### 10.3 Known limitations
 
 - **gmin in the builder versus the service.** Since P3b gmin stepping also stamps gmin from every
@@ -586,7 +616,7 @@ section 8.
   whose native compile was deferred rebuilds without them. A caller of the builder therefore sees
   a `G` that differs from the one the native analyses use at the same gmin.
 - **Concurrent requests** in one process serialize (10.2).
-- **HB mixer time.** 0.69-0.71 s on the shared machine against the 0.5 s target of P4; it does
+- **HB mixer time.** 0.65 s at one thread and 0.54 s at four on the idle machine against the 0.5 s target of P4; it does
   not scale with threads (706 vs 693 ms) because its largest BTF diagonal block is a dense
   411 x 411 block, factored on one thread in each of the 38 Newton iterations.
 - **Damped HB is off by default.** `hb_solve(damping="always")` cuts the mixer from 38 to 11

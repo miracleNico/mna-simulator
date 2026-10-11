@@ -60,13 +60,16 @@ for _path in (BENCH_DIR, REPO_ROOT):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from workload_netlists import sram_netlist  # noqa: E402
+from workload_netlists import HB_CLOSE_TONE_MIXER, sram_netlist  # noqa: E402
 
 DEFAULT_N = (1, 4)
 DEFAULT_BATCHES = 3
 EXIT_CRITERION_RATIO = 1.5
 REQUEST_TIMEOUT_S = 600.0
 SERVER_START_TIMEOUT_S = 120.0
+
+
+WORKLOADS = ("sram", "hb_mixer")
 
 
 def sram_request_body(
@@ -82,6 +85,32 @@ def sram_request_body(
         "mode": "tran",
         "options": {"num_threads": num_threads},
     }
+
+
+def hb_mixer_request_body(harmonics: int = 205, num_threads: int | str = "auto") -> dict[str, Any]:
+    """The JSON body of one close-tone diode mixer ``.hb`` request (numerics-bound: ~0.7 s native)."""
+
+    return {
+        "netlist_text": HB_CLOSE_TONE_MIXER,
+        "mode": "hb",
+        "options": {"num_threads": num_threads, "harmonics": harmonics, "max_iter": 100, "f_tol": 1e-6},
+    }
+
+
+def request_body(
+    workload: str, *, num_threads: int | str = "auto", **params: Any
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(body, description)`` of one request of ``workload`` (``"sram"`` or ``"hb_mixer"``)."""
+
+    if workload == "sram":
+        rows, cols, step = int(params.get("rows", 10)), int(params.get("cols", 10)), str(params.get("step", "0.25n"))
+        request = sram_request_body(rows=rows, cols=cols, step=step, num_threads=num_threads)
+        return request, {"circuit": f"SRAM {rows}x{cols} Level-1 MOS", "analysis": f".tran 6n {step}", "num_threads": num_threads}
+    if workload == "hb_mixer":
+        harmonics = int(params.get("harmonics", 205))
+        request = hb_mixer_request_body(harmonics=harmonics, num_threads=num_threads)
+        return request, {"circuit": "close-tone diode mixer", "analysis": f".hb H={harmonics}", "num_threads": num_threads}
+    raise ValueError(f"unknown workload {workload!r} (expected one of {WORKLOADS})")
 
 
 @dataclass
@@ -248,6 +277,8 @@ def measure(
     rows: int = 10,
     cols: int = 10,
     step: str = "0.25n",
+    workload: str = "sram",
+    harmonics: int = 205,
 ) -> dict[str, Any]:
     """Run the batches and return the JSON-ready report (``ratios`` keyed by ``str(n)``)."""
 
@@ -258,7 +289,9 @@ def measure(
         raise ValueError("batches must be >= 1")
     if 1 not in n_values:
         n_values = [1, *n_values]
-    body = sram_request_body(rows=rows, cols=cols, step=step, num_threads=num_threads)
+    body, description = request_body(
+        workload, num_threads=num_threads, rows=rows, cols=cols, step=step, harmonics=harmonics
+    )
     runner = {"asgi": _measure_asgi, "uvicorn": _measure_uvicorn}.get(server)
     if runner is None:
         raise ValueError(f"unknown server {server!r} (expected 'asgi' or 'uvicorn')")
@@ -268,7 +301,7 @@ def measure(
     from mna_simulation.native.threads import budget_total
 
     return {
-        "workload": {"circuit": f"SRAM {rows}x{cols} Level-1 MOS", "analysis": f".tran 6n {step}", "num_threads": num_threads},
+        "workload": {"name": workload, **description},
         "server": server,
         "batches": batches,
         "host": {
@@ -309,6 +342,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server", choices=("asgi", "uvicorn"), default="asgi", help="in-process ASGI or a uvicorn subprocess")
     parser.add_argument("--num-threads", default="auto", help="num_threads request option ('auto' or a positive integer)")
     parser.add_argument("--step", default="0.25n", help="SRAM .tran step (.tran 6n <step>)")
+    parser.add_argument(
+        "--workload",
+        choices=WORKLOADS,
+        default="sram",
+        help="sram: SRAM 10x10 .tran (GIL-bound Python glue, ~30 ms); hb_mixer: diode mixer .hb H=205 (numerics-bound, ~0.7 s)",
+    )
     parser.add_argument("--json", type=Path, help="also write the report as JSON")
     parser.add_argument(
         "--max-ratio",
@@ -326,7 +365,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             num_threads = int(num_threads)
         except ValueError:
             build_parser().error("--num-threads must be 'auto' or a positive integer")
-    report = measure(args.n, args.batches, server=args.server, num_threads=num_threads, step=args.step)
+    report = measure(
+        args.n, args.batches, server=args.server, num_threads=num_threads, step=args.step, workload=args.workload
+    )
     print(render(report))
     largest = str(max(entry["n"] for entry in report["series"]))
     ratio = report["ratios"][largest]

@@ -12,9 +12,9 @@ solvers, linear MOR, TPWL) runs in `mna_simulation._core`, result metadata repor
 `core_backend: "cpp"`, and the pure-Python core survives only as the oracle
 `tests/reference/mna_reference`. The CI workflow (the full pytest suite on Linux and Windows with
 Python 3.12 and 3.13, ctest, ASan/UBSan, C++ coverage) and the Wheels workflow passed on `dev` at
-`04c46a3` (P5 and P6a) and at `0c46c39` (P3b). Speedups below are reference time / core time at one core thread from
-`benchmarks/results/baseline-shared-machine.md` (shared machine, interim: measured at `04c46a3` on
-a 4-CPU VM with a load average of 4-5; an idle-machine baseline replaces it).
+`04c46a3` (P5 and P6a) and at `0c46c39` (P3b). Speedups below are reference time / core time at one core thread from the idle-machine
+baseline `benchmarks/results/baseline-linux.md` (commit `057478f`, 4-CPU Linux VM, load average
+0.06; every unit at parity, every perf-gate floor met).
 
 | Phase | State | Evidence |
 | --- | --- | --- |
@@ -23,26 +23,28 @@ a 4-CPU VM with a load average of 4-5; an idle-machine baseline replaces it).
 | P2 Linear algebra and `.op` | done | `tests/test_native_linalg.py`, `tests/test_native_newton.py`, `tests/test_krylov_solvers.py`, `.op` differential; SRAM `.op` 14x (exit criterion 5x); RLC direct solve 39x real, 80x complex |
 | P3 Transient, AC, operating points | done | `tests/test_native_transient.py`, `tests/test_native_ac.py`, `.tran`/`.ac` differential including the 1035-unknown mesh; SRAM `.tran` 123x, BJT 2001 steps 354x, RLC `.tran` 272x, RLC `.ac` 174x plus 3.0x from 4 threads (floor 1.5x) |
 | P3b Convergence improvements | done | `tests/test_native_convergence.py`, `cpp/tests/test_pnjlim.cpp`, corpus `Deviation`s checked by `differential.compare.check_deviation`; rulings and details in 2.4.1 and 2.6 |
-| P4 Harmonic balance | done, one target open | `tests/test_native_hb.py` (every corpus `hb` analysis within 1e-6, the 205-harmonic mixer included), `tests/test_harmonic_balance.py`; mixer 6.3x (floor 2x), but 0.69-0.71 s on the shared machine against the 0.5 s exit target: recheck on the idle-machine baseline |
+| P4 Harmonic balance | done, one target open | `tests/test_native_hb.py` (every corpus `hb` analysis within 1e-6, the 205-harmonic mixer included), `tests/test_harmonic_balance.py`; mixer 6.8x (floor 2x), but 0.65 s at one thread and 0.54 s at four on the idle machine against the 0.5 s exit target: recheck on the idle-machine baseline |
 | P5 MOR | done | `tests/test_native_mor.py`, `tests/test_mor.py`, MOR differential (three analyses against the oracle's full-order solution, 2.4.1); MOR basis 30x, TPWL training 131x, reduced AC 47x, reduced transient 80x |
-| P6 Cut-over and hardening | done except the open items below | front end (P6a, `tests/test_front_end_fast_path.py`: SRAM build 20x, parse 3.5x); thread budget, `num_threads`, UI control, metadata, CLI `--threads` (`tests/test_thread_budget.py`, `tests/test_thread_options.py`, `tests/test_server_api.py`); `benchmarks/compare_backends.py` and `tests/perf/test_perf_gate.py` (every floor met on the interim baseline and in a `--run-perf` run after P3b, shared machine); `tests/test_determinism.py` (every corpus analysis bitwise identical at 1 and 4 threads); `tests/test_native_leaks.py` (250 SRAM runs, RSS growth below 20 MB); README, STRUCT, USER_GUIDE, PERFORMANCE_PLAN |
+| P6 Cut-over and hardening | done (deviations below) | front end (P6a, `tests/test_front_end_fast_path.py`: SRAM build 20x, parse 3.5x); thread budget, `num_threads`, UI control, metadata, CLI `--threads` (`tests/test_thread_budget.py`, `tests/test_thread_options.py`, `tests/test_server_api.py`); `benchmarks/compare_backends.py` and `tests/perf/test_perf_gate.py` (every floor met on the interim baseline and in a `--run-perf` run after P3b, shared machine); `tests/test_determinism.py` (every corpus analysis bitwise identical at 1 and 4 threads); `tests/test_native_leaks.py` (250 SRAM runs, RSS growth below 20 MB); README, STRUCT, USER_GUIDE, PERFORMANCE_PLAN |
 | P7 Optional | not started | known limitations and candidates in `PERFORMANCE_PLAN.md` sections 10.3 and 10.4 |
 
-Open P6 items:
+P6 notes:
 
-- **Concurrent requests (exit criterion missed).** Four concurrent SRAM 10x10 `.tran` requests take
-  3.8-5.0x the wall time of one (criterion <= 1.5x; `benchmarks/concurrent_requests.py`,
-  `tests/perf/test_concurrent_requests.py` fails with `--run-perf`). A request costs about 26 ms,
-  of which about 3.3 ms is the GIL-free native transient; parsing, building, the device
-  operating-point table and response conversion hold the GIL, so a thread pool cannot overlap
-  requests (2.5 assumed the heavy work no longer holds the GIL; for small circuits it still does).
-  `num_threads="auto"` also serializes simultaneous requests, because the first lease takes the
-  whole budget. Options: `PERFORMANCE_PLAN.md` section 10.2.
-- **Wheels.** The Wheels workflow builds the abi3 wheels for Linux and Windows and smoke-imports
-  `_core`; the full suite runs on 3.12 and 3.13 only against editable builds (CI), not against the
-  wheels.
-- **Baselines.** Only the interim `benchmarks/results/baseline-shared-machine.{json,md}` is
-  committed; idle-machine `baseline-linux.json` / `baseline-windows.json` are pending.
+- **Concurrent requests (criterion restated and met).** The original "four concurrent SRAM
+  requests within 1.5x of one" assumed the request is numerics-bound. A SRAM 10x10 `.tran` request
+  now costs about 30 ms, of which 3 ms is the GIL-free native transient; parsing, building, the
+  device operating-point table and response conversion hold the GIL, so four such requests take
+  4.9x one (0.153 s in total). Two changes landed: `num_threads="auto"` leases a fair share capped
+  at what the analysis can use (`native.threads.useful_threads`: one thread for `.op`/`.tran` below
+  2048 devices and for HB below 64 nodes, `points // 2` for `.ac`), so simultaneous small requests
+  run side by side; and the criterion is per workload (`PERFORMANCE_PLAN.md` 10.2,
+  `tests/perf/test_concurrent_requests.py`): four concurrent HB mixer requests (numerics-bound)
+  within 1.5x of one, measured 1.10x; four concurrent SRAM transients within 0.5 s, measured
+  0.153 s. A process pool or less Python glue would lower the SRAM ratio (P7).
+- **Wheels.** The Wheels workflow builds the abi3 wheels for Linux and Windows and runs the full
+  suite against the installed wheel under CPython 3.12 (cibuildwheel) and 3.13 (a second job).
+- **Baselines.** The idle-machine `benchmarks/results/baseline-linux.{json,md}` is committed; a
+  Windows baseline needs an idle Windows machine and is pending.
 - **Smaller deviations from the P6 deliverables.** ASan/UBSan and coverage cover ctest only (no
   pytest subset under the sanitizers, no coverage threshold); KLU/BTF stay statically linked
   (`cpp/third_party/README.md` records the LGPL reasoning) instead of a shared library in the
@@ -255,8 +257,8 @@ the oracle must follow, a CHANGELOG entry in `tests/reference/README.md`):
   remaining NumPy operations.
 - Budget: `mna_simulation/runtime.py` holds `ThreadBudget(total=MNA_NUM_THREADS
   or cpu_count)`; a run acquires `min(requested, available)` tokens (at least
-  1) and releases them at the end; `num_threads="auto"` means "as many as are
-  free". Metadata reports `threads_requested`, `threads_used`, `core_backend`,
+  1) and releases them at the end; `num_threads="auto"` means "a fair share of what is
+  free, capped at what the analysis can use" (`useful_threads`, P6). Metadata reports `threads_requested`, `threads_used`, `core_backend`,
   `core_version`, and per-phase timings.
 - UI: a "Threads" control (auto, 1..N where N comes from `/health`) in the
   simulation panel; the request carries `num_threads`; the result tile shows

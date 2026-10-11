@@ -97,10 +97,11 @@ def test_service_metadata_for_auto_and_absent() -> None:
     for options in ({"num_threads": "auto"}, {}):
         metadata = _run(service, options)
         assert metadata["threads_requested"] == "auto"
-        # Nothing else is running, so "auto" gets the whole budget.
-        assert metadata["threads_used"] == 3
+        # "auto" takes what the analysis can use: a small .op runs its devices on one
+        # thread, so the lease is 1 and the other two threads stay free for other requests.
+        assert metadata["threads_used"] == 1
         assert metadata["thread_budget_total"] == 3
-        assert backend.seen[-1].num_threads == 3
+        assert backend.seen[-1].num_threads == 1
 
 
 def test_service_caps_request_at_budget() -> None:
@@ -110,13 +111,55 @@ def test_service_caps_request_at_budget() -> None:
     assert metadata["threads_used"] == 2
 
 
+AC_NETLIST = "V1 in 0 AC 1\nR1 in out 1k\nC1 out 0 1u\n"
+
+
+def _run_ac(service: SimulationService, options: dict, points: int = 100) -> dict:
+    request = AnalysisRequest(
+        netlist_text=AC_NETLIST,
+        mode=AnalysisMode.AC,
+        options={"f_start": 1.0, "f_stop": 1e6, "points": points, **options},
+    )
+    response = service.run_request(request)
+    assert response.status == "ok"
+    return response.metadata
+
+
 def test_service_auto_shares_with_active_run() -> None:
     budget = ThreadBudget(4)
     service = SimulationService(budget=budget)
     with budget.lease(1):
-        metadata = _run(service, {"num_threads": "auto"})
-    # One active run: fair share 4 // 2 = 2.
+        # An AC sweep of 100 points can use up to 50 threads; one active run leaves the
+        # fair share 4 // 2 = 2.
+        metadata = _run_ac(service, {"num_threads": "auto"})
     assert metadata["threads_used"] == 2
+
+
+def test_service_auto_takes_the_whole_budget_when_the_analysis_can_use_it() -> None:
+    service = SimulationService(budget=ThreadBudget(3))
+    assert _run_ac(service, {"num_threads": "auto"})["threads_used"] == 3
+    # Two frequency points spread over at most one thread.
+    assert _run_ac(service, {"num_threads": "auto"}, points=2)["threads_used"] == 1
+    # An explicit count is the caller's upper limit and is never capped by the policy.
+    assert _run(service, {"num_threads": 3})["threads_used"] == 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "kwargs", "expected"),
+    [
+        ("op", {"devices": 622, "nodes": 248}, 1),
+        ("tran", {"devices": 2048, "nodes": 900}, None),
+        ("ac", {"devices": 0, "nodes": 1035, "ac_points": 100}, 50),
+        ("ac", {"devices": 0, "nodes": 3, "ac_points": None}, 50),
+        ("hb", {"devices": 1, "nodes": 3}, 1),
+        ("hb", {"devices": 40, "nodes": 64}, None),
+        (AnalysisMode.OP, {"devices": 1, "nodes": 2}, 1),
+    ],
+)
+def test_useful_threads_policy(mode, kwargs, expected) -> None:
+    from mna_simulation.native.threads import useful_threads
+
+    assert useful_threads(mode, **kwargs) == expected
 
 
 def test_service_uses_process_default_budget() -> None:

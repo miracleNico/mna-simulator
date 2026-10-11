@@ -52,10 +52,10 @@ export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
   {
     title: "Threads",
     items: [
-      "Threads in the Simulation panel sets how many worker threads a run may use. auto (the default) takes as many as the server has free right now; a number is an upper limit. The list goes up to the server's thread budget.",
+      "Threads in the Simulation panel sets how many worker threads a run may use. auto (the default) takes a fair share of what the server has free, but never more than the analysis can use (a small .op/.tran or harmonic-balance run takes one thread, an .ac sweep at most half its point count); a number is an upper limit. The list goes up to the server's thread budget.",
       "The server enforces one machine-wide budget (MNA_NUM_THREADS, default: the CPU count). Concurrent runs share it: a run waits while every thread is in use, so simultaneous requests divide the cores instead of oversubscribing them.",
       "After each run the status line shows the threads granted and the solver time, e.g. TRAN complete (ok) · 4 threads · 412 ms. The thread count changes speed only, never results.",
-      "Analyses use the granted threads as they move to the native core; until then the setting mainly controls how concurrent runs share the machine. NumPy/SciPy BLAS is always kept to one thread per run."
+      "Every analysis runs in the native core and uses the granted threads for device evaluation, frequency sweeps and harmonic-balance assembly; circuits below a few thousand devices gain nothing from extra threads, so auto keeps them free for other runs. NumPy/SciPy BLAS is always kept to one thread per run."
     ]
   },
   {

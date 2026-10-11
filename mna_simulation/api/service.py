@@ -12,7 +12,7 @@ from .contracts import AnalysisRequest, SimulationResponse
 from ..backends.python_backend import PythonBackend
 from ..errors import CircuitSimulatorError
 from ..native import build_info, core_version
-from ..native.threads import ThreadBudget, default_budget, pin_blas_threads
+from ..native.threads import ThreadBudget, default_budget, pin_blas_threads, useful_threads
 from ..schematic_pipeline import schematic_to_circuit_ir
 from ..utils import ndarray_to_list
 
@@ -21,6 +21,23 @@ from ..utils import ndarray_to_list
 # exception stays a plain ValueError (a pinned contract, see tests/EDGE_CASES.md); the note
 # only lets the HTTP layer answer 400 for bad options without catching every ValueError.
 INVALID_OPTION_NOTE = "mna_simulation: invalid request option"
+
+
+_DEVICE_TYPES = frozenset({"D", "B", "QNPN", "QPNP", "NMOS", "PMOS"})
+
+
+def _circuit_size(circuit: object) -> dict[str, int]:
+    """Device and node counts of a parsed ``CircuitIR`` (for the ``"auto"`` thread cap)."""
+
+    devices = 0
+    nodes: set[str] = set()
+    for component in getattr(circuit, "components", ()):
+        if component.type in _DEVICE_TYPES:
+            devices += 1
+        for node in (component.node1, component.node2, component.ctrl_node1, component.ctrl_node2):
+            if node is not None and node != "0":
+                nodes.add(node)
+    return {"devices": devices, "nodes": len(nodes)}
 
 
 def is_invalid_option_error(exc: BaseException) -> bool:
@@ -73,7 +90,10 @@ class SimulationService:
         # count replaces the raw request so the backend reads exactly what it may use.
         budget = self.budget
         threads_requested: int | str = options.num_threads if options.num_threads is not None else "auto"
-        with budget.lease(threads_requested) as threads_used, pin_blas_threads():
+        # "auto" takes at most what this analysis can use (native.threads.useful_threads), so
+        # concurrent small requests run side by side instead of queueing behind one lease.
+        cap = useful_threads(options.mode, ac_points=options.ac_points, **_circuit_size(circuit))
+        with budget.lease(threads_requested, cap=cap) as threads_used, pin_blas_threads():
             options.num_threads = threads_used
             started = time.perf_counter()
             result = self.backend.run(circuit, options)
@@ -84,8 +104,8 @@ class SimulationService:
                 "threads_requested": threads_requested,
                 "threads_used": threads_used,
                 "thread_budget_total": budget.total,
-                # Which implementation produced the numbers. Still the Python solvers; each
-                # C++ cut-over (CPP_MIGRATION_PLAN.md section 6) switches its analyses to "cpp".
+                # Which implementation produced the numbers: every analysis runs in the
+                # native core since the P5 cut-over (CPP_MIGRATION_PLAN.md section 6).
                 "core_backend": "cpp",
                 "core_version": _core_version(),
                 "elapsed_ms": round(elapsed_ms, 3),
