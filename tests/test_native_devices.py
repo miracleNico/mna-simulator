@@ -334,6 +334,7 @@ def test_evaluate_devices_validates_buffers() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.perf  # timing-sensitive: opt in with --run-perf (the perf gate covers the same units)
 def test_sram_device_evaluation_speedup() -> None:
     reference = reference_build(reference_parse(sram_netlist(10, 10)))
     problem = build_mna_problem(reference_parse(sram_netlist(10, 10)))
