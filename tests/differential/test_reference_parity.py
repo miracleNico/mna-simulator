@@ -93,4 +93,5 @@ def test_reference_parity(
         tolerance=tolerance,
         expects_error=case.expects_error,
         context=f"{case.name} {mode} {options} [{tolerance}]",
+        current_error=case.current_error,
     )

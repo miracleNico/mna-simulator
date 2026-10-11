@@ -244,7 +244,12 @@ def test_build_matches_reference(name: str, text: str, monkeypatch: pytest.Monke
         problem, current_error = _outcome(build_mna_problem, current_ir, gmin=gmin)
         if reference_error is not None or current_error is not None:
             assert reference_error is not None and current_error is not None, (reference_error, current_error)
-            assert _error_view(current_error) == _error_view(reference_error)
+            if name == "corpus:zero_resistor":
+                # CPP_MIGRATION_PLAN.md 2.4.1 ruling, applied in the builder (the oracle keeps ZeroDivisionError).
+                assert _error_view(current_error) == ("NetlistError", "NETLIST_FATAL", "'R1' has zero resistance")
+                assert type(reference_error) is ZeroDivisionError
+            else:
+                assert _error_view(current_error) == _error_view(reference_error)
             continue
 
         for field_name in ("G", "C", "b_dc", "b_ac"):

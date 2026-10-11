@@ -565,7 +565,11 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             # present for richer models but defaults to zero.
             stamp_vccs_g(drain, source, -1, source, g_mb)
         elif comp_type == "R":
-            stamp_g(j, k, 1.0 / parse_value(component.value or "0"))
+            resistance = parse_value(component.value or "0")
+            if resistance == 0.0:
+                # CPP_MIGRATION_PLAN.md 2.4.1 (was: ZeroDivisionError "float division by zero").
+                error_handler(f"NETLIST_FATAL: '{component.name}' has zero resistance")
+            stamp_g(j, k, 1.0 / resistance)
         elif comp_type == "C":
             stamp_c(j, k, parse_value(component.value or "0"))
             stamp_gmin(j, k)
@@ -689,6 +693,9 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             c_pi = parse_value(metadata.get("cpi", "8p"))
             c_mu = parse_value(metadata.get("cmu", "3p"))
             c_cs = parse_value(metadata.get("ccs", "0"))
+            if r_pi == 0.0:
+                # The 2.4.1 zero-resistance ruling applies to rpi as well (was: ZeroDivisionError).
+                error_handler(f"NETLIST_FATAL: '{component.name}' has zero resistance (rpi)")
             stamp_g(base, emitter, 1.0 / r_pi)
             if r_o > 0.0:
                 stamp_g(collector, emitter, 1.0 / r_o)

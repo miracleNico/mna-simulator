@@ -24,7 +24,10 @@ What is compared (``assert_responses_match``):
 iteration counts, ...) are deliberately not compared.
 
 Error outcomes (``assert_errors_match``) must have the same exception class
-name and the same ``.code`` attribute (``None`` when absent).
+name and the same ``.code`` attribute (``None`` when absent), except for a
+corpus case with ``current_error`` (an applied 2.4.1 ruling changed the live
+error): the oracle is checked against ``expects_error`` and the live package
+against ``current_error``.
 """
 
 from __future__ import annotations
@@ -327,8 +330,13 @@ def assert_outcomes_match(
     tolerance: str = "linear",
     expects_error: str | None = None,
     context: str = "",
+    current_error: tuple[str, str | None] | None = None,
 ) -> None:
-    """Check the oracle against the case expectation, then current against the oracle."""
+    """Check the oracle against the case expectation, then current against the oracle.
+
+    ``current_error`` (``(class name, code)``, see ``corpus.Case``) replaces the
+    second check for a case whose live error was changed by an applied 2.4.1 ruling.
+    """
 
     suffix = f" ({context})" if context else ""
     if expects_error is not None:
@@ -343,6 +351,16 @@ def assert_outcomes_match(
             f"reference raised unexpectedly {type(ref.error).__name__}"
             f"(code={getattr(ref.error, 'code', None)!r}): {ref.error}{suffix}"
         ) from ref.error
+
+    if current_error is not None:
+        cur_desc = None if cur.error is None else (type(cur.error).__name__, getattr(cur.error, "code", None))
+        if cur_desc != tuple(current_error):
+            raise AssertionError(
+                f"ruling expects current {current_error[0]}(code={current_error[1]!r}) but current "
+                f"{'succeeded' if cur.error is None else f'raised {cur_desc[0]}(code={cur_desc[1]!r}): {cur.error}'}"
+                f"{suffix}"
+            ) from cur.error
+        return
 
     if ref.error is not None or cur.error is not None:
         assert_errors_match(ref.error, cur.error, context)
@@ -359,10 +377,13 @@ def run_and_compare(
     tolerance: str = "linear",
     expects_error: str | None = None,
     context: str = "",
+    current_error: tuple[str, str | None] | None = None,
 ) -> tuple[Outcome, Outcome]:
     """Convenience wrapper: run both packages and assert parity."""
 
     ref = run_request(reference_pkg, netlist_text, mode, options)
     cur = run_request(current_pkg, netlist_text, mode, options)
-    assert_outcomes_match(ref, cur, tolerance=tolerance, expects_error=expects_error, context=context)
+    assert_outcomes_match(
+        ref, cur, tolerance=tolerance, expects_error=expects_error, context=context, current_error=current_error
+    )
     return ref, cur

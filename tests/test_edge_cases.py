@@ -198,13 +198,33 @@ def test_inductor_only_loop_is_singular_at_dc_for_op_and_tran(netlist: str) -> N
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("value", ["0", "0.0", "0k", "1e-999"])
-def test_zero_resistor_raises_zero_division_error(value: str) -> None:
+@pytest.mark.parametrize("value", ["0", "0.0", "0k", "1e-999", "-0"])
+def test_zero_resistor_raises_netlist_fatal_from_the_builder(value: str, monkeypatch) -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1. Was: ZeroDivisionError 'float division by zero'.
+    from mna_simulation.backends import python_backend
+
+    builds: list[float] = []
+    real_build = python_backend.build_mna_problem
+
+    def counting_build(circuit, gmin=0.0):
+        builds.append(gmin)
+        return real_build(circuit, gmin=gmin)
+
+    monkeypatch.setattr(python_backend, "build_mna_problem", counting_build)
     netlist = f"V1 a 0 DC 1\nR1 a b {value}\nR2 b 0 1k\n"
     for mode in ("op", "show_matrix"):
-        with pytest.raises(ZeroDivisionError) as exc:
+        builds.clear()
+        with pytest.raises(NetlistError) as exc:
             _svc(netlist, mode)
-        _assert_error(exc, ZeroDivisionError, None, "float division by zero")
+        _assert_error(exc, NetlistError, "NETLIST_FATAL", "'R1' has zero resistance")
+        assert builds == [0.0]  # raised once: structural, no gmin retries
+    with pytest.raises(NetlistError) as direct:
+        build_mna_problem(parse_netlist_text(netlist))
+    _assert_error(direct, NetlistError, "NETLIST_FATAL", "'R1' has zero resistance")
+    # The small-signal BJT base resistance divides the same way (rpi = 0).
+    with pytest.raises(NetlistError) as bjt:
+        build_mna_problem(parse_netlist_text("V1 a 0 DC 1\nQ1 c a 0 20m 0\nR1 c 0 1k\n"))
+    _assert_error(bjt, NetlistError, "NETLIST_FATAL", "'Q1' has zero resistance (rpi)")
 
 
 def test_zero_capacitor_is_silently_skipped() -> None:

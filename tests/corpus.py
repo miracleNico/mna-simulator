@@ -52,7 +52,14 @@ NL_MAX_ITER = 200
 
 @dataclass(frozen=True)
 class Case:
-    """One corpus circuit and the analyses that apply to it."""
+    """One corpus circuit and the analyses that apply to it.
+
+    ``expects_error`` is the exception class the frozen oracle raises. When an
+    applied ``CPP_MIGRATION_PLAN.md`` 2.4.1 ruling changes the error of the live
+    package, ``current_error`` is ``(class name, code)`` of the new error; the
+    oracle is not edited, so the harness then checks each side against its own
+    expectation instead of comparing the two errors.
+    """
 
     name: str
     netlist_text: str
@@ -60,6 +67,7 @@ class Case:
     tolerance: str = "linear"
     expects_error: str | None = None
     tags: tuple[str, ...] = ()
+    current_error: tuple[str, str | None] | None = None
 
     def __post_init__(self) -> None:
         if self.tolerance not in TOLERANCE_CLASSES:
@@ -1468,12 +1476,15 @@ def _error_and_gmin_cases() -> list[Case]:
             expects_error="NetlistError",
             tags=X + ("error", "parser"),
         ),
+        # 2.4.1 ruling "R = 0": the live builder raises NETLIST_FATAL "'R1' has zero
+        # resistance" (once, no gmin retries); the oracle keeps ZeroDivisionError.
         Case(
             "zero_resistor",
             "V1 a 0 DC 1\nR1 a b 0\nR2 b 0 1k\n.op\n",
             [op(), show()],
             expects_error="ZeroDivisionError",
             tags=X + ("error",),
+            current_error=("NetlistError", "NETLIST_FATAL"),
         ),
         Case(
             "floating_resistor_island",

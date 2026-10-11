@@ -63,6 +63,11 @@ def test_builder_matches_reference_on_corpus(case, gmin: float) -> None:
     except Exception as exc:  # noqa: BLE001
         with pytest.raises(Exception) as current_exc:
             build_mna_problem(ir, gmin=gmin)
+        if case.current_error is not None:
+            # An applied 2.4.1 ruling changed the live error (corpus.Case.current_error).
+            raised = current_exc.value
+            assert (type(raised).__name__, getattr(raised, "code", None)) == case.current_error
+            return
         assert type(current_exc.value).__name__ == type(exc).__name__
         assert str(current_exc.value) == str(exc)
         return

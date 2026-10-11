@@ -23,7 +23,7 @@ Notation: *basic* = `core_basic.build_and_run_basic` at gmin=0. *service* =
 and reports the gmin that worked in `metadata["gmin"]`. Since P3 the circuit is compiled once
 and only numerical failures are retried (`NR_CONVERGENCE`, `JACOBIAN_SINGULAR`, `AC_ERROR`,
 `LU_CONVERGENCE`, numerical `HB_ERROR`, raw `LinAlgError`); structural errors (`NETLIST_FATAL`,
-`TRAN_ERROR`, `MOR_CONFIG`, `ZeroDivisionError`, ...) are raised at once. The error after the last
+`TRAN_ERROR`, `MOR_CONFIG`, a zero resistor, ...) are raised at once. The error after the last
 step is unchanged (decided: 2.4 / 2.4.1). Was: retried on **any** exception, rebuilding everything.
 `SCE` = `SolverConvergenceError`, `CSE` = `CircuitSimulatorError` (base class).
 Test ids are functions in `tests/test_edge_cases.py`.
@@ -58,6 +58,8 @@ Test ids are functions in `tests/test_edge_cases.py`.
    `init_condition` into a float column array. R=0 and the singular transient step are
    P2/P3 items. **Decided (2.4.1), applied for the transient step (P3):** a singular linear
    transient step is `NR_CONVERGENCE` naming the step time; gmin stepping still applies.
+   **Decided (2.4.1), applied for R=0:** the builder raises `NETLIST_FATAL` "'<name>' has zero
+   resistance" (also for a small-signal BJT with `rpi = 0`), once.
 6. **Non-finite results come back as `status="ok"`.** `V1 a 0 DC 1e999` returns
    `[nan, -inf]`, and `FUNC 0 nan` returns an all-NaN waveform.
    **Decided (2.4.1), applied for `.op` and `.tran` (P3):** `NR_CONVERGENCE` "non-finite solution"
@@ -108,7 +110,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
-| R = `0`, `0.0`, `0k`, `1e-999` (underflows to 0) | Raw `ZeroDivisionError` "float division by zero" (`.op` and `show_matrix`), no `.code` | `test_zero_resistor_raises_zero_division_error` | no |
+| R = `0`, `0.0`, `0k`, `1e-999` (underflows to 0), `-0`; small-signal BJT `rpi = 0` | `NetlistError` `NETLIST_FATAL` "'R1' has zero resistance" (BJT: "'Q1' has zero resistance (rpi)") from `build_mna_problem`, raised once by the service (structural, no gmin retries; `.op` and `show_matrix`). Was: raw `ZeroDivisionError` "float division by zero", no `.code` (the oracle still raises it; corpus case `zero_resistor` declares the new error in `current_error`) | `test_zero_resistor_raises_netlist_fatal_from_the_builder` (was `test_zero_resistor_raises_zero_division_error`) | decided: NETLIST_FATAL from the builder (2.4.1) |
 | C = 0 | Silently skipped (`add_entry` drops 0.0). A node reached only through C=0 floats, giving singular `NR_CONVERGENCE` | `test_zero_capacitor_is_silently_skipped` | unclear |
 | L = 0 | Branch row and `I(L1)` label kept, C entry dropped, so it acts as a 0 V source (a short) | `test_zero_inductor_keeps_its_branch_and_acts_as_a_short` | yes |
 | Negative R | Accepted: divider 1k/-2k gives V(b) = 2 V | `test_negative_resistor_is_accepted` | unclear (no validation) |

@@ -230,6 +230,26 @@ def test_expected_error_is_checked_against_the_oracle(op_response) -> None:
         assert_outcomes_match(wrong, wrong)
 
 
+def test_ruling_error_is_checked_against_the_current_package(op_response) -> None:
+    from mna_simulation.errors import NetlistError as CurNetlistError
+
+    ruling = ("NetlistError", "NETLIST_FATAL")
+    ref = Outcome(error=ZeroDivisionError("float division by zero"))
+    new = Outcome(error=CurNetlistError("'R1' has zero resistance"))
+    assert_outcomes_match(ref, new, expects_error="ZeroDivisionError", current_error=ruling)
+    with pytest.raises(AssertionError, match="ruling expects current NetlistError"):
+        assert_outcomes_match(ref, ref, expects_error="ZeroDivisionError", current_error=ruling)
+    with pytest.raises(AssertionError, match="current succeeded"):
+        assert_outcomes_match(ref, Outcome(response=op_response), expects_error="ZeroDivisionError", current_error=ruling)
+    with pytest.raises(AssertionError, match="ruling expects current"):
+        assert_outcomes_match(
+            ref, Outcome(error=CurNetlistError("x", code="PARSE_ERROR")), expects_error="ZeroDivisionError", current_error=ruling
+        )
+    # The oracle is still checked against its own expectation.
+    with pytest.raises(AssertionError, match="corpus expects ZeroDivisionError"):
+        assert_outcomes_match(Outcome(error=ValueError("x")), new, expects_error="ZeroDivisionError", current_error=ruling)
+
+
 # ---------------------------------------------------------------------------
 # Corpus rules
 # ---------------------------------------------------------------------------
