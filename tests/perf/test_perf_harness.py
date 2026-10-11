@@ -187,10 +187,16 @@ def test_default_json_path_is_timestamped_under_results() -> None:
 def test_json_and_markdown_outputs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     json_path = tmp_path / "perf.json"
     md_path = tmp_path / "perf.md"
+    # One available unit and one whose native side has not landed yet (dynamic, so the test
+    # keeps working as phases land; skipped once every unit is available).
+    pending_units = [unit for unit in perf_units.UNITS.values() if _is_unavailable(unit)]
+    if not pending_units:
+        pytest.skip("every unit has a native implementation")
+    pending_unit = pending_units[0]
     status = compare_backends.main(
         [
             "--units",
-            "direct_solve_sram_248,device_eval_sram_mos_622",
+            f"direct_solve_sram_248,{pending_unit.id}",
             "--smoke",
             "--reps",
             "1",
@@ -216,7 +222,7 @@ def test_json_and_markdown_outputs(tmp_path: Path, capsys: pytest.CaptureFixture
     assert method["threads"] == [1, 2] and method["smoke"] is True
 
     records = {record["id"]: record for record in document["units"]}
-    assert list(records) == ["direct_solve_sram_248", "device_eval_sram_mos_622"]
+    assert list(records) == ["direct_solve_sram_248", pending_unit.id]
     for record in records.values():
         for key in ("id", "category", "size", "available", "unavailable_reason", "reference_s", "core_s", "speedup", "parity"):
             assert key in record, key
@@ -230,8 +236,8 @@ def test_json_and_markdown_outputs(tmp_path: Path, capsys: pytest.CaptureFixture
     assert solve["speedup"]["1"] == pytest.approx(solve["reference_s"]["median"] / solve["core_s"]["1"]["median"])
     assert solve["parity"]["ok"] is True and solve["parity"]["max_rel_error"] <= 1e-9
 
-    pending = records["device_eval_sram_mos_622"]
-    assert pending["available"] is False and "P1" in pending["unavailable_reason"]
+    pending = records[pending_unit.id]
+    assert pending["available"] is False and pending_unit.phase in pending["unavailable_reason"]
     assert pending["core_s"] == {} and pending["speedup"] == {}
     assert pending["parity"]["max_rel_error"] is None and pending["parity"]["ok"] is None
 
@@ -239,7 +245,7 @@ def test_json_and_markdown_outputs(tmp_path: Path, capsys: pytest.CaptureFixture
     header = "| unit | size | reference ms | core ms (1t) | core ms (2t) | speedup 1t | best speedup | parity |"
     assert header in markdown and header in stdout
     rows = {line.split("|")[1].strip(): line for line in markdown.splitlines() if line.startswith("| `")}
-    assert "n/a (P1)" in rows["`device_eval_sram_mos_622`"]
+    assert f"n/a ({pending_unit.phase})" in rows[f"`{pending_unit.id}`"]
     assert re.search(r"\| \d+(\.\d+)?x \|", rows["`direct_solve_sram_248`"])
     assert " ok |" in rows["`direct_solve_sram_248`"]
     assert "Native core:" in markdown and "Commit:" in markdown

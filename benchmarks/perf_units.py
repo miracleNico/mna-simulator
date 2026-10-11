@@ -643,6 +643,7 @@ def _core_setup_kernel(inputs: dict[str, Any]) -> dict[str, Any]:
     col_ptr, row_idx = circuit.pattern()
     n = problem.G.shape[0]
     out = {
+        "core": _native(),  # resolved once; a per-call import lookup would dominate a 10 us kernel
         "circuit": circuit,
         "x": np.ascontiguousarray(inputs["x"], dtype=float),
         "f_out": np.zeros(n),
@@ -660,7 +661,7 @@ def _core_setup_kernel(inputs: dict[str, Any]) -> dict[str, Any]:
 
 def _core_kernel_f_and_j(core_inputs: dict[str, Any], num_threads: int) -> KernelJacobian:
     c = core_inputs
-    _native().evaluate_devices(c["circuit"], c["x"], 0.0, num_threads, c["f_out"], c["j_out"])
+    c["core"].evaluate_devices(c["circuit"], c["x"], 0.0, num_threads, c["f_out"], c["j_out"])
     return KernelJacobian(c["f_out"], c["j_out"], c["col_ptr"], c["row_idx"], c["n"])
 
 
@@ -694,7 +695,7 @@ def _core_assembly_jacobian_sram_248(core_inputs: dict[str, Any], num_threads: i
     """Newton matrix values G + J(x) in the CSC pattern: kernel evaluation plus one vector add."""
 
     c = core_inputs
-    _native().evaluate_devices(c["circuit"], c["x"], 0.0, num_threads, c["f_out"], c["j_out"])
+    c["core"].evaluate_devices(c["circuit"], c["x"], 0.0, num_threads, c["f_out"], c["j_out"])
     np.add(c["g_vals"], c["j_out"], out=c["a_out"])
     return KernelJacobian(c["f_out"], c["a_out"], c["col_ptr"], c["row_idx"], c["n"])
 
