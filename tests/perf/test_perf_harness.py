@@ -284,8 +284,24 @@ def test_render_table_marks_unavailable_and_failed_units() -> None:
     assert len(problems) == 3
 
 
+def _is_unavailable(unit) -> bool:
+    try:
+        inputs = unit.setup(smoke=True)
+        core_inputs = unit.core_setup(inputs) if unit.core_setup is not None else inputs
+        unit.core(core_inputs, 1)
+    except perf_units.UnitUnavailable:
+        return True
+    except Exception:  # noqa: BLE001 - any other failure means the unit exists but broke
+        return False
+    return False
+
+
 def test_strict_fails_when_a_unit_is_unavailable(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    args = ["--units", "device_eval_diode_mixer", "--smoke", "--reps", "1", "--threads", "1", "--json", str(tmp_path / "s.json")]
+    # Pick a unit whose native side has not landed yet (skips once every unit is available).
+    unavailable = [unit.id for unit in perf_units.UNITS.values() if _is_unavailable(unit)]
+    if not unavailable:
+        pytest.skip("every unit has a native implementation")
+    args = ["--units", unavailable[0], "--smoke", "--reps", "1", "--threads", "1", "--json", str(tmp_path / "s.json")]
     assert compare_backends.main(args) == 0
     assert compare_backends.main([*args, "--strict"]) == 1
     capsys.readouterr()

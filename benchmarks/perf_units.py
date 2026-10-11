@@ -604,28 +604,99 @@ def _core_direct_solve_sram_248(core_inputs: dict[str, Any], num_threads: int) -
 # P1: expression VM, circuit builder, device kernels.
 
 
-def _core_device_eval_sram_mos_622(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P1: Level-1 MOS DeviceSet kernel (f and dense J via to_dense)")
+class KernelJacobian:
+    """f and device-Jacobian values written by ``_core.evaluate_devices`` into caller buffers.
+
+    The timed unit never materializes a dense matrix; ``dense()`` (used only by the untimed
+    parity check) scatters the CSC values into an (n, n) array.
+    """
+
+    def __init__(self, f: np.ndarray, values: np.ndarray, col_ptr: np.ndarray, row_idx: np.ndarray, n: int) -> None:
+        self.f, self.values, self.col_ptr, self.row_idx, self.n = f, values, col_ptr, row_idx, n
+
+    def dense(self) -> np.ndarray:
+        import scipy.sparse as sps
+
+        return sps.csc_matrix((self.values, self.row_idx, self.col_ptr), shape=(self.n, self.n)).toarray()
+
+    def as_f_and_j(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.f.reshape(self.n, 1), self.dense()
 
 
-def _core_device_eval_bjt_3stage(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P1: Level-1 BJT DeviceSet kernel (f and dense J)")
+def parity_kernel_f_and_j(ref_out: Any, core_out: Any) -> float:
+    return parity_f_and_j(ref_out, core_out.as_f_and_j() if isinstance(core_out, KernelJacobian) else core_out)
 
 
-def _core_device_eval_diode_mixer(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P1: expression VM with dual numbers (diode f and dense J)")
+def parity_kernel_matrix(ref_out: Any, core_out: Any) -> float:
+    return parity_array(ref_out, core_out.dense() if isinstance(core_out, KernelJacobian) else core_out)
 
 
-def _core_circuit_build_sram_248(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P1: build_circuit (G, C, b_dc, b_ac via to_dense)")
+def _core_setup_kernel(inputs: dict[str, Any]) -> dict[str, Any]:
+    """Compile the circuit natively (untimed) and preallocate the kernel's output buffers."""
+
+    from mna_simulation.mna_builder import build_mna_problem
+
+    _native()
+    w = inputs["workload"]
+    problem = build_mna_problem(w.circuit)
+    circuit = problem.native
+    col_ptr, row_idx = circuit.pattern()
+    n = problem.G.shape[0]
+    out = {
+        "circuit": circuit,
+        "x": np.ascontiguousarray(inputs["x"], dtype=float),
+        "f_out": np.zeros(n),
+        "j_out": np.zeros(circuit.nnz),
+        "col_ptr": np.asarray(col_ptr),
+        "row_idx": np.asarray(row_idx),
+        "n": n,
+    }
+    if "G" in inputs:
+        # G values in pattern order; the assembly unit adds the device Jacobian to them.
+        out["g_vals"] = np.ascontiguousarray(circuit.values("G"), dtype=float)
+        out["a_out"] = np.zeros(circuit.nnz)
+    return out
 
 
-def _core_circuit_build_rlc_1035(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P1: build_circuit (G, C, b_dc, b_ac via to_dense)")
+def _core_kernel_f_and_j(core_inputs: dict[str, Any], num_threads: int) -> KernelJacobian:
+    c = core_inputs
+    _native().evaluate_devices(c["circuit"], c["x"], 0.0, num_threads, c["f_out"], c["j_out"])
+    return KernelJacobian(c["f_out"], c["j_out"], c["col_ptr"], c["row_idx"], c["n"])
 
 
-def _core_assembly_jacobian_sram_248(core_inputs: Any, num_threads: int) -> Any:
-    raise UnitUnavailable("lands in P1: Jacobian assembly into the CSR value array (dense via to_dense)")
+def _core_device_eval_sram_mos_622(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_kernel_f_and_j(core_inputs, num_threads)
+
+
+def _core_device_eval_bjt_3stage(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_kernel_f_and_j(core_inputs, num_threads)
+
+
+def _core_device_eval_diode_mixer(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_kernel_f_and_j(core_inputs, num_threads)
+
+
+def _core_circuit_build(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    from mna_simulation.mna_builder import build_mna_problem
+
+    return build_mna_problem(core_inputs["circuit"])
+
+
+def _core_circuit_build_sram_248(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_circuit_build(core_inputs, num_threads)
+
+
+def _core_circuit_build_rlc_1035(core_inputs: dict[str, Any], num_threads: int) -> Any:
+    return _core_circuit_build(core_inputs, num_threads)
+
+
+def _core_assembly_jacobian_sram_248(core_inputs: dict[str, Any], num_threads: int) -> KernelJacobian:
+    """Newton matrix values G + J(x) in the CSC pattern: kernel evaluation plus one vector add."""
+
+    c = core_inputs
+    _native().evaluate_devices(c["circuit"], c["x"], 0.0, num_threads, c["f_out"], c["j_out"])
+    np.add(c["g_vals"], c["j_out"], out=c["a_out"])
+    return KernelJacobian(c["f_out"], c["a_out"], c["col_ptr"], c["row_idx"], c["n"])
 
 
 # P2: complex KLU, Krylov solvers, Newton .op.
@@ -763,7 +834,8 @@ _register(
     setup=_setup_device_eval_mos,
     reference=_ref_device_eval_mos,
     core=_core_device_eval_sram_mos_622,
-    parity=parity_f_and_j,
+    core_setup=_core_setup_kernel,
+    parity=parity_kernel_f_and_j,
     phase="P1",
     tolerance=TOL_KERNEL,
     description="f and dense J of the 622 Level-1 MOS devices of the 10x10 SRAM (solvers._evaluate_level1_mos_devices)",
@@ -775,7 +847,8 @@ _register(
     setup=_setup_device_eval_bjt,
     reference=_ref_compiled_f_and_j,
     core=_core_device_eval_bjt_3stage,
-    parity=parity_f_and_j,
+    core_setup=_core_setup_kernel,
+    parity=parity_kernel_f_and_j,
     phase="P1",
     tolerance=TOL_KERNEL,
     description="f and J of the three-stage BJT amplifier (compile_nl_functions)",
@@ -787,7 +860,8 @@ _register(
     setup=_setup_device_eval_diode,
     reference=_ref_compiled_f_and_j,
     core=_core_device_eval_diode_mixer,
-    parity=parity_f_and_j,
+    core_setup=_core_setup_kernel,
+    parity=parity_kernel_f_and_j,
     phase="P1",
     tolerance=TOL_KERNEL,
     description="f and J of the close-tone diode mixer's symbolic diode net (compile_nl_functions)",
@@ -825,7 +899,8 @@ _register(
     setup=_setup_assembly_sram,
     reference=_ref_assembly,
     core=_core_assembly_jacobian_sram_248,
-    parity=parity_array,
+    core_setup=_core_setup_kernel,
+    parity=parity_kernel_matrix,
     phase="P1",
     tolerance=TOL_KERNEL,
     description="dense Newton Jacobian G + Jf(x) of the 10x10 SRAM (compile_nl_functions)",
