@@ -311,7 +311,10 @@ def test_build_matches_reference(name: str, text: str, monkeypatch: pytest.Monke
         for col in range(size):
             rows = row_idx[col_ptr[col] : col_ptr[col + 1]]
             assert np.all(np.diff(rows) > 0)  # sorted, unique
-        for kind, expected in (("G", g_static), ("C", reference.C), ("gmin", unit_gmin)):
+        # The native gmin pattern also holds one node-to-ground stamp per node unknown (P3b,
+        # CPP_MIGRATION_PLAN.md 2.4.1), which the oracle builder never stamps.
+        node_diagonal = np.diag((np.arange(size) < int(reference.metadata["num_nodes"])).astype(float))
+        for kind, expected in (("G", g_static), ("C", reference.C), ("gmin", unit_gmin + node_diagonal)):
             values = circuit.values(kind)
             _assert_bitwise(_dense_from_pattern(col_ptr, row_idx, values, size), expected, f"{name} native {kind}")
             _assert_bitwise(circuit.to_dense(kind), expected, f"{name} native to_dense {kind}")
