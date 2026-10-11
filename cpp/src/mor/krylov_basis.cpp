@@ -249,11 +249,17 @@ std::int32_t orthogonalize_block(std::vector<double>& basis, std::int32_t n, std
             v[static_cast<Eigen::Index>(i)] = candidate[static_cast<std::size_t>(col) * un + i];
         }
         if (basis_cols > 0) {
-            // vector - basis @ (basis.T @ vector)
+            // Classical Gram-Schmidt twice ("twice is enough"): v - B (B^T v), then the same
+            // projection of the result once more. One pass leaves a rounding residual with an
+            // O(1) component along the basis when v is (numerically) in its span; the second
+            // pass removes it, so an accepted column is orthogonal to the basis to working
+            // precision (CPP_MIGRATION_PLAN.md 2.4.1, "improve, not parity").
             const Eigen::Map<const Eigen::MatrixXd> B(basis.data(), n, basis_cols);
-            coefficients.noalias() = B.transpose() * v;
-            const Eigen::VectorXd projection = B * coefficients;
-            v -= projection;
+            for (int pass = 0; pass < 2; ++pass) {
+                coefficients.noalias() = B.transpose() * v;
+                const Eigen::VectorXd projection = B * coefficients;
+                v -= projection;
+            }
         }
         const double norm_value = std::sqrt(v.squaredNorm());
         if (norm_value <= tolerance) {  // a NaN norm is accepted, as in the Python loop

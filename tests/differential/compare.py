@@ -20,6 +20,10 @@ What is compared (``assert_responses_match``):
 * ``metadata.operating_point`` and ``metadata.device_operating_points`` when
   present: discrete fields equal, numeric fields within tolerance.
 
+For MOR analyses whose oracle reduced values are rounding noise,
+``assert_mor_matches_full_order`` compares everything but those values with the
+oracle's MOR run and the current outputs with the oracle's full-order solution.
+
 ``diagnostics`` and the remaining metadata (timings, cache counters, Krylov
 iteration counts, ...) are deliberately not compared.
 
@@ -251,8 +255,17 @@ def _compare_operating_points(out: _Mismatches, ref_md: dict[str, Any], cur_md: 
                 out.add(f"{where}[{key!r}]", f"{cur_value!r} != reference {ref_value!r}")
 
 
-def assert_responses_match(ref: Any, cur: Any, tolerance: str = "linear", context: str = "") -> None:
-    """Assert two ``SimulationResponse`` objects agree under ``tolerance``."""
+_VALUE_SERIES = frozenset({"values", "magnitudes"})
+
+
+def assert_responses_match(
+    ref: Any, cur: Any, tolerance: str = "linear", context: str = "", *, compare_values: bool = True
+) -> None:
+    """Assert two ``SimulationResponse`` objects agree under ``tolerance``.
+
+    ``compare_values=False`` compares waveform values and spectrum magnitudes by shape only
+    (everything else as usual); see :func:`assert_mor_matches_full_order`.
+    """
 
     rtol, atol = TOLERANCES[tolerance]
     out = _Mismatches(context)
@@ -276,6 +289,11 @@ def assert_responses_match(ref: Any, cur: Any, tolerance: str = "linear", contex
         if list(ref_block.get("labels") or []) != list(cur_block.get("labels") or []):
             out.add(f"{name}.labels", f"{cur_block.get('labels')!r} != reference {ref_block.get('labels')!r}")
         for key in series:
+            if not compare_values and key in _VALUE_SERIES:
+                ref_shape, cur_shape = np.shape(ref_block.get(key)), np.shape(cur_block.get(key))
+                if ref_shape != cur_shape:
+                    out.add(f"{name}.{key}", f"shape {cur_shape} != reference {ref_shape}")
+                continue
             _compare_arrays(out, f"{name}.{key}", ref_block.get(key), cur_block.get(key), rtol, atol)
 
     ref_mat, cur_mat = ref.matrices, cur.matrices
@@ -366,6 +384,63 @@ def assert_outcomes_match(
         assert_errors_match(ref.error, cur.error, context)
         return
     assert_responses_match(ref.response, cur.response, tolerance=tolerance, context=context)
+
+
+#: Analysis options that turn model-order reduction on and configure it.
+MOR_OPTION_KEYS: tuple[str, ...] = ("use_mor", "mor_method", "mor_order", "mor_output_nodes", "mor_validate")
+
+
+def full_order_options(options: dict[str, Any]) -> dict[str, Any]:
+    """The same analysis without model-order reduction."""
+
+    return {key: value for key, value in options.items() if key not in MOR_OPTION_KEYS}
+
+
+def assert_mor_matches_full_order(
+    ref_mor: Outcome,
+    cur_mor: Outcome,
+    ref_full: Outcome,
+    tolerance: str = "mor",
+    context: str = "",
+) -> None:
+    """Check a MOR run whose oracle values are not a valid reference.
+
+    The current MOR outcome must match the oracle MOR outcome in everything but the
+    reduced values (status, labels, grids, shapes, contract metadata, errors), and its
+    selected outputs must match the oracle's FULL-ORDER solution of the same analysis
+    (``ref_full``, run without MOR), restricted to the MOR output labels, under
+    ``tolerance``.
+    """
+
+    suffix = f" ({context})" if context else ""
+    if ref_mor.error is not None or cur_mor.error is not None:
+        assert_errors_match(ref_mor.error, cur_mor.error, context)
+        return
+    if ref_full.error is not None:
+        name = type(ref_full.error).__name__
+        raise AssertionError(f"the oracle's full-order run raised {name}: {ref_full.error}{suffix}")
+    assert_responses_match(
+        ref_mor.response, cur_mor.response, tolerance=tolerance, context=context, compare_values=False
+    )
+    rtol, atol = TOLERANCES[tolerance]
+    out = _Mismatches(f"{context}; current MOR outputs vs the oracle's full-order solution")
+    for name, grid_key, value_key in (("waveform", "time", "values"), ("spectrum", "frequencies", "magnitudes")):
+        cur_block, full_block = getattr(cur_mor.response, name), getattr(ref_full.response, name)
+        if cur_block is None:
+            continue
+        if full_block is None:
+            out.add(name, "missing in the oracle's full-order run")
+            continue
+        _compare_arrays(out, f"{name}.{grid_key}", full_block.get(grid_key), cur_block.get(grid_key), rtol, atol)
+        full_labels = list(full_block.get("labels") or [])
+        missing = [label for label in cur_block.get("labels") or [] if label not in full_labels]
+        if missing:
+            out.add(f"{name}.labels", f"{missing!r} not in the full-order labels")
+            continue
+        full_values = _to_array(full_block.get(value_key))
+        selected = full_values[[full_labels.index(label) for label in cur_block.get("labels") or []]]
+        _compare_arrays(out, f"{name}.{value_key}", selected, cur_block.get(value_key), rtol, atol)
+    out.raise_if_any()
 
 
 def run_and_compare(

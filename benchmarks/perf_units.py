@@ -512,8 +512,10 @@ def _mor_outputs(smoke: bool) -> list[str]:
     Gram-Schmidt accepts the rounding residual of that duplicate (relative size ~1e-16, above
     its absolute 1e-14 threshold) as a basis column. Its basis is then numerically singular
     (cond ~1e15) and every later column, and the reduced outputs, are rounding noise that no
-    other implementation reproduces. With these outputs both bases are orthonormal and equal
-    up to rotation (subspace distance ~1e-13).
+    other implementation reproduces (the native basis uses Gram-Schmidt twice since the
+    CPP_MIGRATION_PLAN.md 2.4.1 ruling and stays orthonormal there, so the two would not be
+    comparable). With these outputs both bases are orthonormal and equal up to rotation
+    (subspace distance ~1e-13).
     """
 
     return ["V(n_2_2)", "V(n_3_3)"] if smoke else ["V(n_11_11)", "V(n_22_22)"]

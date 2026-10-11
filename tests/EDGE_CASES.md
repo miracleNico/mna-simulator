@@ -219,6 +219,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | `tpwl` on `.ac`; `linear` on nonlinear `.tran` | `MOR_CONFIG` with the pinned messages | `test_mor_method_and_mode_mismatches` | yes |
 | `mor_method="xyz"`, `mor_order=0` | Plain `ValueError` (not `MOR_CONFIG`). A non-integral `mor_order` (2.5, `"2.5"`) is "mor_order must be an integer" (2.4.1) | `test_invalid_mor_method_and_order_raise_plain_value_error` | decided: preserve plain ValueError, HTTP 400 (2.4.1) |
 | MOR on `show_matrix` | `mor_used=False`, reason ".show_matrix requires the full MNA system." | `test_mor_on_show_matrix_reports_not_used` | yes |
+| Linear MOR basis on near-dependent seeds (random corpus `rand_rlc_ladder_s2` `.ac`, `rand_rlc_mesh_s1` `.ac`, `rand_rlc_mesh_s2` `.tran`: an output or input direction the Krylov loop reproduces) | The basis is built with classical Gram-Schmidt twice ("twice is enough") and stays orthonormal (`||V^T V - I|| < 1e-12`); the reduced outputs match the full-order solution of the same analysis within 1e-11 of its maximum (measured below 6e-15). `rand_rlc_ladder_s2` keeps 11 basis columns, the other two 12 and 6 (k == n). A rounding residual that survives both passes is still accepted (the 1e-14 threshold stays absolute), as an orthonormal direction. Was: one pass accepted rounding residuals above the absolute 1e-14 threshold (e.g. 3e-13 on a vector of norm 2.6e3) whose direction lay mostly along the basis, the basis became numerically singular (cond 1e18..1e21 with k == n) and the outputs were rounding noise: `rand_rlc_mesh_s2` reached 7e5 V where the full-order solution peaks at 0.33 V; `rand_rlc_ladder_s2` had 13 columns and a 29 % error | `test_linear_mor_basis_stays_orthonormal_on_near_dependent_seeds` | decided: Gram-Schmidt twice, improve not parity (2.4.1) |
 
 ### Harmonic balance
 
@@ -260,6 +261,11 @@ Test ids are functions in `tests/test_edge_cases.py`.
   within its `max_iter` (200 for `ac_nl`), so the oracle and the live core still agree. No
   corpus case uses `f_start=0`, `f_stop=0` or `points <= 0`, so the `.ac` option ruling needs
   no corpus edits either.
+- The three MOR analyses of the Gram-Schmidt ruling (`rand_rlc_ladder_s2-ac-mor`,
+  `rand_rlc_mesh_s1-ac-mor`, `rand_rlc_mesh_s2-tran-mor`) are compared with the oracle's
+  full-order solution of the same analysis (`MOR_FULL_ORDER_REFERENCE` in
+  `tests/differential/test_reference_parity.py`, `mor` tolerance); status, labels, grids,
+  shapes and contract metadata are still compared with the oracle's MOR run.
 - The oracle keeps the old option coercion and raises `TRAN_ERROR` as the base `CSE`. No
   corpus case uses a non-canonical option value (string boolean, non-integral number,
   string time, list `init_condition`) or reaches `TRAN_ERROR`, so the 2.4.1 option and

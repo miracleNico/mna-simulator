@@ -10,6 +10,7 @@
 #include <complex>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "mna/error.hpp"
@@ -67,7 +68,8 @@ void rc_ladder(int n, Matrix& G, Matrix& C) {
     }
 }
 
-// Dense transcription of mor/linear.py::build_linear_krylov_basis (np.linalg.solve -> Eigen LU).
+// Dense transcription of mor/linear.py::build_linear_krylov_basis (np.linalg.solve -> Eigen LU)
+// with the two-pass Gram-Schmidt of the native kernel (CPP_MIGRATION_PLAN.md 2.4.1).
 struct DenseReference {
     Matrix basis;
     int target = 1;
@@ -79,7 +81,7 @@ struct DenseReference {
                 break;
             }
             Eigen::VectorXd v = block.col(col);
-            if (basis.cols() > 0) {
+            for (int pass = 0; pass < 2 && basis.cols() > 0; ++pass) {
                 const Eigen::VectorXd coefficients = basis.transpose() * v;
                 v -= basis * coefficients;
             }
@@ -205,6 +207,238 @@ Matrix unit(int n, int i) {
     Matrix e = Matrix::Zero(n, 1);
     e(i, 0) = 1.0;
     return e;
+}
+
+struct Triplet {
+    int row;
+    int col;
+    double value;
+};
+
+/// A corpus MOR analysis as build_linear_krylov_basis sees it (dense G and C as triplets).
+struct CorpusCase {
+    const char* name;
+    int n;
+    int order;
+    std::vector<Triplet> g;
+    std::vector<Triplet> c;
+    std::vector<double> inputs;  // column-major n x m
+    std::vector<int> outputs;    // the selector's unit rows
+    std::vector<Shift> shifts;
+};
+
+// The three random-corpus analyses whose one-pass (reference) basis is numerically singular
+// (cond 1e18..1e21), generated from tests/corpus.py with the reference builder:
+// rand_rlc_ladder_s2 ac, rand_rlc_mesh_s1 ac, rand_rlc_mesh_s2 tran.
+const std::vector<CorpusCase>& former_noise_cases() {
+    static const std::vector<CorpusCase> cases =
+        {
+            // rand_rlc_ladder_s2 (ac, analysis 4): n = 13, order = 13
+            {
+                "rand_rlc_ladder_s2",
+                13,
+                13,
+                {{0, 0, 0.004088307440719542},
+                 {1, 0, -0.004088307440719542},
+                 {9, 0, 1.0},
+                 {0, 1, -0.004088307440719542},
+                 {1, 1, 0.004088307440719542},
+                 {10, 1, 1.0},
+                 {2, 2, 0.0010993843447669304},
+                 {4, 2, -0.0010993843447669304},
+                 {11, 2, 1.0},
+                 {3, 3, 0.00257201646090535},
+                 {5, 3, -0.00257201646090535},
+                 {12, 3, 1.0},
+                 {2, 4, -0.0010993843447669304},
+                 {4, 4, 0.0010993843447669304},
+                 {10, 4, -1.0},
+                 {3, 5, -0.00257201646090535},
+                 {5, 5, 0.00257201646090535},
+                 {11, 5, -1.0},
+                 {6, 6, 0.002797985450475658},
+                 {7, 6, -0.002797985450475658},
+                 {12, 6, -1.0},
+                 {6, 7, -0.002797985450475658},
+                 {7, 7, 0.004584656881599474},
+                 {8, 7, -0.0017866714311238162},
+                 {7, 8, -0.0017866714311238162},
+                 {8, 8, 0.002033991711828178},
+                 {0, 9, 1.0},
+                 {1, 10, 1.0},
+                 {4, 10, -1.0},
+                 {2, 11, 1.0},
+                 {5, 11, -1.0},
+                 {3, 12, 1.0},
+                 {6, 12, -1.0}},
+                {{4, 4, 6.215e-07},
+                 {5, 5, 5.541e-07},
+                 {6, 6, 6.432e-07},
+                 {7, 7, 1.255e-07},
+                 {8, 8, 2.853e-08},
+                 {10, 10, -0.002247},
+                 {11, 11, -0.0009631},
+                 {12, 12, -0.008398}},
+                {0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.000949,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 1.1952552759678168e-16,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 -1.952,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 0.0,
+                 1.0,
+                 0.0,
+                 0.0,
+                 0.0},  // 4 input columns
+                {8},
+                {{Complex(0.0, 0.0), false},
+                 {Complex(0.0, 198691.765315922), true},
+                 {Complex(0.0, 6283185.307179586), true}},
+            },
+            // rand_rlc_mesh_s1 (ac, analysis 3): n = 12, order = 12
+            {
+                "rand_rlc_mesh_s1",
+                12,
+                12,
+                {{0, 0, 0.10184344503298157},
+                 {1, 0, -0.10184336490477644},
+                 {8, 0, 1.0},
+                 {0, 1, -0.10184336490477644},
+                 {1, 1, 0.11377798341008388},
+                 {2, 1, -0.011934598400763814},
+                 {9, 1, 1.0},
+                 {1, 2, -0.011934598400763814},
+                 {2, 2, 0.02209723316130625},
+                 {3, 2, -0.01016260162601626},
+                 {10, 2, 1.0},
+                 {2, 3, -0.01016260162601626},
+                 {3, 3, 0.010162737477123446},
+                 {11, 3, 1.0},
+                 {4, 4, 0.020885569222917823},
+                 {5, 4, -0.020885547201336674},
+                 {8, 4, -1.0},
+                 {4, 5, -0.020885547201336674},
+                 {5, 5, 0.034076534979400094},
+                 {6, 5, -0.013190871916633689},
+                 {9, 5, -1.0},
+                 {5, 6, -0.013190871916633689},
+                 {6, 6, 0.06301649893869815},
+                 {7, 6, -0.04982561036372696},
+                 {10, 6, -1.0},
+                 {6, 7, -0.04982561036372696},
+                 {7, 7, 0.058643965941825645},
+                 {11, 7, -1.0},
+                 {0, 8, 1.0},
+                 {4, 8, -1.0},
+                 {1, 9, 1.0},
+                 {5, 9, -1.0},
+                 {2, 10, 1.0},
+                 {6, 10, -1.0},
+                 {3, 11, 1.0},
+                 {7, 11, -1.0}},
+                {{0, 0, 9.955e-11},
+                 {1, 1, 5.986e-11},
+                 {2, 2, 9.361e-11},
+                 {3, 3, 8.58e-11},
+                 {4, 4, 6.078e-11},
+                 {5, 5, 7.866e-11},
+                 {6, 6, 9.299e-11},
+                 {7, 7, 2.221e-11},
+                 {8, 8, -3.752e-08},
+                 {9, 9, -4.571e-08},
+                 {10, 10, -5.089e-08},
+                 {11, 11, -1.94e-08}},
+                {0.0,      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0006641, 0.0, 0.0, 0.0, 0.0,
+                 0.002522, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,       0.0, 0.0, 0.0, 0.0,
+                 1.0,      0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,       0.0, 0.0, 0.0, 0.0},  // 3 input columns
+                {7},
+                {{Complex(0.0, 0.0), false},
+                 {Complex(0.0, 198691765.315922), true},
+                 {Complex(0.0, 6283185307.179586), true}},
+            },
+            // rand_rlc_mesh_s2 (tran, analysis 3): n = 6, order = 6
+            {
+                "rand_rlc_mesh_s2",
+                6,
+                6,
+                {{0, 0, 0.010823736712602925},
+                 {1, 0, -0.010823682216690118},
+                 {4, 0, 1.0},
+                 {0, 1, -0.010823682216690118},
+                 {1, 1, 0.010823700810963082},
+                 {5, 1, 1.0},
+                 {2, 2, 0.01972390337302512},
+                 {3, 2, -0.01972386587771203},
+                 {4, 2, -1.0},
+                 {2, 3, -0.01972386587771203},
+                 {3, 3, 0.06385456595404959},
+                 {5, 3, -1.0},
+                 {0, 4, 1.0},
+                 {2, 4, -1.0},
+                 {1, 5, 1.0},
+                 {3, 5, -1.0}},
+                {{0, 0, 6.771e-11},
+                 {1, 1, 3.095e-11},
+                 {2, 2, 7.046e-11},
+                 {3, 3, 4.396e-11},
+                 {4, 4, -2.504e-08},
+                 {5, 5, -9.869e-08}},
+                {0.0, 0.0, 0.0, 0.0001854, 0.0, 0.0, 0.006021, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0,
+                 0.0},  // 3 input columns
+                {3, 0},
+                {{Complex(0.0, 0.0), false}, {Complex(999999999.9999999, 0.0), false}},
+            },
+        };
+    return cases;
+}
+
+Matrix dense_from(const std::vector<Triplet>& t, int n) {
+    Matrix m = Matrix::Zero(n, n);
+    for (const Triplet& e : t) {
+        m(e.row, e.col) = e.value;
+    }
+    return m;
 }
 
 }  // namespace
@@ -350,6 +584,61 @@ TEST_CASE("krylov_basis rejects malformed input") {
         FAIL("expected NETLIST_FATAL");
     } catch (const Error& e) {
         CHECK(e.code() == ErrorCode::NetlistFatal);
+    }
+}
+
+TEST_CASE("orthogonalize_block: two passes keep the basis orthonormal and drop in-span candidates") {
+    // Basis: e0 and q = (e1 + e2 + e3) / sqrt(3) (inexact entries), n = 5.
+    const std::int32_t n = 5;
+    std::vector<double> basis;
+    std::int32_t cols = 0;
+    const double r3 = 1.0 / std::sqrt(3.0);
+    const std::vector<double> seeds = {1, 0, 0, 0, 0, 0, r3, r3, r3, 0};
+    REQUIRE(mna::mor::orthogonalize_block(basis, n, cols, seeds.data(), 2, 5) == 2);
+    // A basis column plus 1e-13 noise along the other column: the twice-orthogonalized
+    // residual is far below 1e-14, the candidate is rejected.
+    std::vector<double> in_span(5);
+    for (int i = 0; i < n; ++i) {
+        in_span[static_cast<std::size_t>(i)] =
+            seeds[5 + static_cast<std::size_t>(i)] + 1e-13 * seeds[static_cast<std::size_t>(i)];
+    }
+    CHECK(mna::mor::orthogonalize_block(basis, n, cols, in_span.data(), 1, 5) == 0);
+    CHECK(cols == 2);
+    // The reference's failure mode: a large duplicate (1e3 * q plus 1e-13 noise) leaves a rounding
+    // residual above the absolute 1e-14 threshold. One pass leaves part of it along the basis;
+    // after two passes an accepted column is orthogonal to the basis to working precision.
+    std::vector<double> duplicate(5);
+    for (int i = 0; i < n; ++i) {
+        duplicate[static_cast<std::size_t>(i)] =
+            1e3 * seeds[5 + static_cast<std::size_t>(i)] + 1e-13 * std::sin(1.0 + i);
+    }
+    mna::mor::orthogonalize_block(basis, n, cols, duplicate.data(), 1, 5);
+    const Eigen::Map<const Matrix> V(basis.data(), n, cols);
+    CHECK((V.transpose() * V - Matrix::Identity(cols, cols)).norm() < 1e-12);
+}
+
+TEST_CASE("krylov_basis: the three former noise cases give orthonormal bases") {
+    for (const CorpusCase& cc : former_noise_cases()) {
+        CAPTURE(cc.name);
+        const Matrix G = dense_from(cc.g, cc.n);
+        const Matrix C = dense_from(cc.c, cc.n);
+        const Operands ops = to_operands(G, C);
+        const auto m = static_cast<Eigen::Index>(cc.inputs.size()) / cc.n;
+        const Matrix inputs = Eigen::Map<const Matrix>(cc.inputs.data(), cc.n, m);
+        Matrix outputs = Matrix::Zero(cc.n, static_cast<Eigen::Index>(cc.outputs.size()));
+        for (std::size_t r = 0; r < cc.outputs.size(); ++r) {
+            outputs(cc.outputs[r], static_cast<Eigen::Index>(r)) = 1.0;
+        }
+        const KrylovBasisResult r = run(ops, inputs, outputs, cc.shifts, cc.order);
+        CHECK(r.columns <= cc.n);
+        const Matrix V = as_matrix(r);
+        CHECK((V.transpose() * V - Matrix::Identity(r.columns, r.columns)).norm() < 1e-12);
+        if (std::string(cc.name) == "rand_rlc_ladder_s2") {
+            CHECK(r.columns == 11);  // the one-pass reference accepted 13 (two of them rounding residuals)
+        }
+        if (std::string(cc.name) == "rand_rlc_mesh_s2") {
+            CHECK(r.columns == 6);
+        }
     }
 }
 

@@ -10,45 +10,35 @@ from __future__ import annotations
 
 from typing import Any
 
-import numpy as np
 import pytest
 
 from corpus import Case, iter_analyses
-from differential.compare import Outcome, assert_outcomes_match, run_request
+from differential.compare import (
+    assert_mor_matches_full_order,
+    assert_outcomes_match,
+    full_order_options,
+    run_request,
+)
 
 pytestmark = pytest.mark.differential
 
-# MOR analyses whose oracle values are rounding noise (P5, CPP_MIGRATION_PLAN.md 2.7). The
-# reference's single-pass classical Gram-Schmidt accepts a candidate whose residual is pure
-# rounding error (relative size ~1e-16, absolute size above the 1e-14 threshold), which leaves
-# its basis numerically singular (cond(V) ~ 1e18..1e21) although k == n. The reduced outputs
-# then depend on the last bits of the LU solves (in the oracle they miss the full-order
-# solution of the same netlist by up to six orders of magnitude), so no port can reproduce
-# them. For these analyses the numeric series (waveform values, spectrum magnitudes) are not
-# compared; status, labels, time/frequency grids, shapes and the contract metadata (mor_used,
-# mor_method, ...) still are. tests/test_native_mor.py::
-# test_noise_dominated_mor_analyses_are_singular_in_the_oracle checks that every entry really
-# has a numerically singular oracle basis.
-NOISE_DOMINATED_MOR: frozenset[str] = frozenset(
+# MOR analyses whose oracle values are rounding noise (CPP_MIGRATION_PLAN.md 2.4.1). The
+# reference's one-pass classical Gram-Schmidt accepts a rounding residual above its absolute
+# 1e-14 threshold and its basis becomes numerically singular (cond(V) ~ 1e18..1e21 with k == n),
+# so its reduced outputs miss the full-order solution of the same netlist (by up to six orders
+# of magnitude). The live basis is built with Gram-Schmidt twice (an "improve, not parity"
+# ruling) and stays orthonormal: for these analyses the live MOR outputs are compared with the
+# oracle's FULL-ORDER solution (same analysis without MOR, restricted to the MOR output labels)
+# under the mor tolerance, and everything else (status, labels, grids, shapes, contract
+# metadata) with the oracle's MOR run. tests/test_native_mor.py::
+# test_former_noise_mor_analyses_oracle_singular_live_orthonormal checks both bases.
+MOR_FULL_ORDER_REFERENCE: frozenset[str] = frozenset(
     {
         "rand_rlc_ladder_s2-ac-mor",
         "rand_rlc_mesh_s1-ac-mor",
         "rand_rlc_mesh_s2-tran-mor",
     }
 )
-
-
-def _without_values(outcome: Outcome) -> Outcome:
-    """The outcome with its waveform values / spectrum magnitudes replaced by zeros of the same shape."""
-
-    if outcome.response is None:
-        return outcome
-    response = outcome.response.model_copy(deep=True)
-    for block_name, key in (("waveform", "values"), ("spectrum", "magnitudes")):
-        block = getattr(response, block_name)
-        if block is not None and block.get(key) is not None:
-            block[key] = np.zeros(np.shape(block[key])).tolist()
-    return Outcome(response=response, error=outcome.error)
 
 
 def _flags(options: dict[str, Any]) -> list[str]:
@@ -85,13 +75,16 @@ def test_reference_parity(
     tolerance = case.tolerance_for(mode, options)
     ref = run_request(reference_pkg, case.netlist_text, mode, options)
     cur = run_request(current_pkg, case.netlist_text, mode, options)
-    if request.node.callspec.id in NOISE_DOMINATED_MOR:
-        ref, cur = _without_values(ref), _without_values(cur)
+    context = f"{case.name} {mode} {options} [{tolerance}]"
+    if request.node.callspec.id in MOR_FULL_ORDER_REFERENCE:
+        full = run_request(reference_pkg, case.netlist_text, mode, full_order_options(options))
+        assert_mor_matches_full_order(ref, cur, full, tolerance=tolerance, context=context)
+        return
     assert_outcomes_match(
         ref,
         cur,
         tolerance=tolerance,
         expects_error=case.expects_error,
-        context=f"{case.name} {mode} {options} [{tolerance}]",
+        context=context,
         current_error=case.current_error,
     )

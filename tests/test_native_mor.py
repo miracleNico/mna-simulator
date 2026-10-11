@@ -3,8 +3,10 @@
 * Every corpus MOR analysis: the native rational Krylov basis accepts as many columns as the
   reference's (same acceptance rules on the same seeds, shifts and order), and the reduced
   outputs of ``solve_ac_mor`` / ``solve_transient_mor`` / ``solve_transient_tpwl`` match the
-  oracle's within the ``mor`` tolerance (the analyses whose oracle values are rounding noise,
-  ``NOISE_DOMINATED_MOR``, are checked for exactly that property instead).
+  oracle's within the ``mor`` tolerance. The analyses whose oracle basis is numerically
+  singular (``MOR_FULL_ORDER_REFERENCE``; the native basis uses Gram-Schmidt twice, ruling
+  2.4.1) are compared with the oracle's full-order solution instead, and their live bases are
+  checked to be orthonormal.
 * ``_safe_solve`` stages: LU, least squares on a singular matrix (minimum-norm, like
   ``np.linalg.lstsq``), and a singular shifted system inside the basis loop.
 * POD rank rule on constructed snapshot matrices (empty, zero, rank-deficient, tiny scale).
@@ -21,8 +23,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from corpus import iter_analyses
-from differential.compare import TOLERANCES
-from differential.test_reference_parity import NOISE_DOMINATED_MOR
+from differential.compare import TOLERANCES, full_order_options, run_request
+from differential.test_reference_parity import MOR_FULL_ORDER_REFERENCE
 from mna_reference.mna_builder import build_mna_problem as reference_build
 from mna_reference.mor import linear as ref_linear
 from mna_reference.mor import metadata as ref_metadata
@@ -159,46 +161,60 @@ def test_corpus_basis_columns_and_reduced_outputs_match_the_reference(case, inde
         np.testing.assert_allclose(live_waveform.values, ref_waveform.values, rtol=MOR_RTOL, atol=MOR_ATOL)
         return
 
+    ruled = _flags_id(case, mode, options) in MOR_FULL_ORDER_REFERENCE
     G, C, inputs, selector, shifts, order = _basis_arguments(ref_problem, mode, options)
     ref_basis = ref_linear.build_linear_krylov_basis(G, C, inputs, selector, shifts, order)
     live_basis = linear.build_linear_krylov_basis(G, C, inputs, selector, shifts, order)
-    assert live_basis.shape == ref_basis.shape
+    if not ruled:  # the ruled cases' one-pass oracle accepted rounding residuals as columns
+        assert live_basis.shape == ref_basis.shape
 
     ref_values, ref_md = _run_mor(ref_linear, ref_problem, mode, options)
     live_values, live_md = _run_mor(linear, live_problem, mode, options)
-    for key in (
-        "mor_used",
-        "mor_method",
-        "mor_reduced_dimension",
-        "mor_resolved_order",
-        "mor_num_inputs",
-        "mor_basis_expansion_points",
-        "op_used",
-        "linearized_device_count",
-    ):
+    keys = ["mor_used", "mor_method", "mor_resolved_order", "mor_num_inputs", "mor_basis_expansion_points"]
+    keys += ["op_used", "linearized_device_count"] + ([] if ruled else ["mor_reduced_dimension"])
+    for key in keys:
         assert live_md.get(key) == ref_md.get(key), key
-    if _flags_id(case, mode, options) in NOISE_DOMINATED_MOR:
-        return  # values are rounding noise in the oracle (see the next test)
+    if ruled:
+        full = _full_order_outputs(case.netlist_text, mode, options, list(live_md["mor_output_nodes"]))
+        np.testing.assert_allclose(live_values, full, rtol=MOR_RTOL, atol=MOR_ATOL)
+        return
     np.testing.assert_allclose(live_values, ref_values, rtol=MOR_RTOL, atol=MOR_ATOL)
 
 
-def test_noise_dominated_mor_analyses_are_singular_in_the_oracle() -> None:
-    """Every NOISE_DOMINATED_MOR entry has a numerically singular oracle basis (cond > 1e15)."""
+def _full_order_outputs(netlist: str, mode: str, options: dict, labels: list[str]) -> np.ndarray:
+    """The oracle's full-order solution of the same analysis (without MOR), restricted to ``labels``."""
+
+    outcome = run_request("mna_reference", netlist, mode, full_order_options(options))
+    assert outcome.ok, outcome.error
+    block = outcome.response.waveform if mode == "tran" else outcome.response.spectrum
+    values = np.asarray(block["values" if mode == "tran" else "magnitudes"], dtype=float)
+    return values[[list(block["labels"]).index(label) for label in labels]]
+
+
+def test_former_noise_mor_analyses_oracle_singular_live_orthonormal() -> None:
+    """Every MOR_FULL_ORDER_REFERENCE entry: the one-pass oracle basis is numerically singular
+    (cond > 1e15 with k == n), the live two-pass basis is orthonormal (||V^T V - I|| < 1e-12)
+    and the live MOR outputs match the oracle's full-order solution to 1e-11 (max-normalized)."""
 
     found = set()
     for case, _index, mode, options in iter_analyses():
         if not options.get("use_mor") or case.expects_error:
             continue
         test_id = _flags_id(case, mode, options)
-        if test_id not in NOISE_DOMINATED_MOR:
+        if test_id not in MOR_FULL_ORDER_REFERENCE:
             continue
         found.add(test_id)
-        ref_problem = reference_build(reference_parse(case.netlist_text))
+        ref_problem, live_problem = _problems(case.netlist_text)
         G, C, inputs, selector, shifts, order = _basis_arguments(ref_problem, mode, options)
         basis = ref_linear.build_linear_krylov_basis(G, C, inputs, selector, shifts, order)
         assert basis.shape[1] == basis.shape[0]  # k == n: an exact reduced model if V were regular
         assert np.linalg.cond(basis) > 1e15, test_id
-    assert found == set(NOISE_DOMINATED_MOR)
+        live = linear.build_linear_krylov_basis(G, C, inputs, selector, shifts, order)
+        assert np.linalg.norm(live.T @ live - np.eye(live.shape[1])) < 1e-12, test_id
+        values, metadata = _run_mor(linear, live_problem, mode, options)
+        full = _full_order_outputs(case.netlist_text, mode, options, list(metadata["mor_output_nodes"]))
+        assert np.max(np.abs(values - full)) <= 1e-11 * np.max(np.abs(full)), test_id
+    assert found == set(MOR_FULL_ORDER_REFERENCE)
 
 
 def test_well_conditioned_basis_equals_the_reference_up_to_rotation() -> None:

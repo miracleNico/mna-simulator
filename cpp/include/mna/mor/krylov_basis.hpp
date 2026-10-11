@@ -9,7 +9,7 @@
 // G + s C, a complex one the complex system G + s C (even when Im s == 0,
 // like numpy.iscomplexobj on the Python shift).
 //
-// Acceptance semantics (identical to the Python loop):
+// Acceptance semantics (the Python loop's, except the second Gram-Schmidt pass):
 //   * target = max(1, min(order, n));
 //   * seeds: the input block (when m > 0), then the output block, each through
 //     the block Gram-Schmidt below;
@@ -24,9 +24,17 @@
 //     otherwise it keeps its previous block;
 //   * complex solutions are split into [Re X, Im X] (all real columns, then all
 //     imaginary ones), Im X only when its Frobenius norm is > 0;
-//   * Gram-Schmidt: classical, one pass, against the whole basis
-//     (v - B (B^T v)), a column is accepted when its norm is > 1e-14 and is
-//     normalized; the block stops early once the basis is full;
+//   * Gram-Schmidt: classical, against the whole basis, applied twice
+//     (v <- v - B (B^T v), two times: "twice is enough"); a column is accepted
+//     when the norm of the twice-orthogonalized vector is > 1e-14 and is
+//     normalized; the block stops early once the basis is full. The Python
+//     loop made one pass: a candidate that lies (numerically) in the span left
+//     a rounding residual above the absolute threshold whose direction had an
+//     O(1) component along the basis, and three random-corpus bases became
+//     numerically singular (cond 1e18..1e21). The second pass is a ruling of
+//     CPP_MIGRATION_PLAN.md 2.4.1 ("improve, not parity"): the basis stays
+//     orthonormal. A residual that survives both passes is still accepted (the
+//     threshold stays absolute), as an orthonormal direction;
 //   * an empty basis at the end becomes the unit vector e_0.
 //
 // Shifted solves: each shift's matrix is factored once with KluSolver (real

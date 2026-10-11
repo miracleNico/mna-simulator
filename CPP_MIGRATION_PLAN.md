@@ -171,6 +171,7 @@ the oracle must follow, a CHANGELOG entry in `tests/reference/README.md`):
 | Unknown `probe_nodes` ignored without MOR; decimation keeps the last sample so it can return `max_points + 1` | preserve (service layer, harmless) | - |
 | Invalid Krylov/MOR option values raise plain `ValueError` even when the feature is off | preserve the validation; the server maps tagged option `ValueError`s to HTTP 400 | applied |
 | `.op` ignores time-dependent sources at `t = 0` while `.tran`'s initial operating point includes them | preserve (parity quirk 5 in 6.1); documented in the user guide | - |
+| Linear MOR basis: one-pass Gram-Schmidt accepts rounding residuals and yields a singular basis on three random RLC cases | change: classical Gram-Schmidt twice; outputs then match the full-order solution within 1e-11; `rand_rlc_ladder_s2` basis has 11 columns instead of 13 | applied |
 
 ### 2.5 Multithreading design
 

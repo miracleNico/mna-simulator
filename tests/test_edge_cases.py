@@ -1108,6 +1108,35 @@ def test_mor_on_show_matrix_reports_not_used() -> None:
     assert md["mor_fallback_reason"] == ".show_matrix requires the full MNA system."
 
 
+@pytest.mark.parametrize(
+    ("case_name", "index", "columns"),
+    # rand_rlc_mesh_s1 accepts two residuals of ~2e-14 (k == n == 12): its count is not pinned.
+    [("rand_rlc_ladder_s2", 4, 11), ("rand_rlc_mesh_s1", 3, None), ("rand_rlc_mesh_s2", 3, 6)],
+)
+def test_linear_mor_basis_stays_orthonormal_on_near_dependent_seeds(
+    case_name: str, index: int, columns: int | None
+) -> None:
+    # Gram-Schmidt twice (2.4.1): the reduced outputs equal the full-order solution (k == n or an
+    # invariant subspace). Was: one pass accepted rounding residuals, a singular basis, outputs off
+    # by up to 2e6x (7e5 V instead of 0.33 V on rand_rlc_mesh_s2).
+    from corpus import get_case
+
+    case = get_case(case_name)
+    mode, options = case.analyses[index]
+    reduced = _svc(case.netlist_text, mode, **options)
+    full_options = {k: v for k, v in options.items() if not k.startswith("mor") and k != "use_mor"}
+    full = _svc(case.netlist_text, mode, **full_options)
+    block, key = ("waveform", "values") if mode == "tran" else ("spectrum", "magnitudes")
+    reduced_block, full_block = getattr(reduced, block), getattr(full, block)
+    rows = [full_block["labels"].index(label) for label in reduced_block["labels"]]
+    expected = np.asarray(full_block[key], dtype=float)[rows]
+    values = np.asarray(reduced_block[key], dtype=float)
+    assert reduced.metadata["mor_used"] is True
+    if columns is not None:
+        assert reduced.metadata["mor_reduced_dimension"] == columns
+    assert np.max(np.abs(values - expected)) <= 1e-11 * np.max(np.abs(expected))
+
+
 # ---------------------------------------------------------------------------
 # Harmonic balance
 # ---------------------------------------------------------------------------

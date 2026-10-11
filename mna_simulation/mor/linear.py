@@ -114,7 +114,9 @@ def build_linear_krylov_basis(
 
     ``G`` and ``C`` are dense arrays or SciPy sparse matrices; they are merged
     into one CSC pattern and every shifted system ``G + s C`` is factored once by
-    the native core (KLU, complex KLU for complex shifts).
+    the native core (KLU, complex KLU for complex shifts). Candidates are
+    orthogonalized with classical Gram-Schmidt twice, so the basis stays
+    orthonormal (CPP_MIGRATION_PLAN.md 2.4.1; the reference made one pass).
     """
 
     operands = native_mor.matrix_operands(G, C)
