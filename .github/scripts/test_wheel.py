@@ -5,7 +5,8 @@ The checkout contains the ``mna_simulation`` source tree without a compiled
 ``_core``; running pytest inside it would shadow the installed wheel (the test
 conftest puts repository paths on ``sys.path``). So this script copies ``tests/``,
 ``benchmarks/`` and ``pyproject.toml`` (pytest configuration) to a temporary
-directory outside the checkout, installs the test dependencies into the current
+directory outside the checkout (plus ``app/server``, which the server tests import
+and which is not part of the wheel), installs the test dependencies into the current
 interpreter (the test venv of cibuildwheel on Windows ships without ``pip.exe``,
 so ``ensurepip`` runs first) and runs pytest there.
 
@@ -44,9 +45,14 @@ def main(argv: list[str]) -> int:
     with tempfile.TemporaryDirectory(prefix="mna-wheel-test-") as tmp:
         root = Path(tmp) / "run"
         root.mkdir()
-        for name in ("tests", "benchmarks"):
+        # tests/ and benchmarks/ (imported by the perf and front-end tests), app/server (the
+        # FastAPI app the server tests import; it is not part of the wheel) and the pytest
+        # configuration. app/web (the UI sources, node_modules) is not needed.
+        for name in ("tests", "benchmarks", "app/server"):
             shutil.copytree(checkout / name, root / name, ignore=shutil.ignore_patterns("__pycache__", ".venv"))
-        shutil.copy2(checkout / "pyproject.toml", root / "pyproject.toml")
+        for name in ("pyproject.toml", "app/__init__.py"):
+            if (checkout / name).is_file():
+                shutil.copy2(checkout / name, root / name)
         env = dict(os.environ)
         env.pop("PYTHONPATH", None)
         # Prove the installed package is the one under test (not the checkout).
