@@ -22,6 +22,8 @@ enum class ErrorCode : int {
     LuConvergence,
     HbError,
     AcError,
+    // Raised as NetlistError on the Python side (an input error, like MorConfig).
+    TranError,
 };
 
 /// The Python-side code string, e.g. "JACOBIAN_SINGULAR".

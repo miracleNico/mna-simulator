@@ -15,6 +15,7 @@ const char* error_code_name(ErrorCode code) noexcept {
         case ErrorCode::LuConvergence: return "LU_CONVERGENCE";
         case ErrorCode::HbError: return "HB_ERROR";
         case ErrorCode::AcError: return "AC_ERROR";
+        case ErrorCode::TranError: return "TRAN_ERROR";
         case ErrorCode::Unknown: break;
     }
     return "UNKNOWN";
