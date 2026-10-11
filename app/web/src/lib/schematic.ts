@@ -264,25 +264,7 @@ function transformPinOffset(offset: PinOffset, component: CanvasComponent): PinO
 export function getPinCoordinates(component: CanvasComponent, pin: string): { x: number; y: number } {
   if (component.type === "SUBCKT") {
     // Distribute pins around a rounded rectangle.
-    const pins = component.pins ?? [];
-    const index = Math.max(0, pins.indexOf(pin));
-    const n = Math.max(1, pins.length);
-    const side = Math.ceil(n / 4);
-    const halfW = COMPONENT_BOX;
-    const halfH = COMPONENT_BOX;
-    const slot = index % side;
-    const spacing = (COMPONENT_BOX * 2) / (side + 1);
-    const ringIndex = Math.floor(index / side);
-    let off: PinOffset;
-    if (ringIndex === 0) {
-      off = { dx: -halfW, dy: -halfH + spacing * (slot + 1) };
-    } else if (ringIndex === 1) {
-      off = { dx: halfW, dy: -halfH + spacing * (slot + 1) };
-    } else if (ringIndex === 2) {
-      off = { dx: -halfW + spacing * (slot + 1), dy: -halfH };
-    } else {
-      off = { dx: -halfW + spacing * (slot + 1), dy: halfH };
-    }
+    const off = subcktPinLocalOffset(component.pins ?? [], pin);
     const rotated = transformPinOffset(off, component);
     return { x: component.x + rotated.dx, y: component.y + rotated.dy };
   }
@@ -745,5 +727,226 @@ export function buildSchematicPayload(
       params: analysisParams
     },
     subcircuits
+  };
+}
+
+/* ---- Editor helpers shared by the canvas, menus, and keyboard handlers --- */
+
+/** Local (un-rotated, un-mirrored) pin offset for a SUBCKT pin slot. */
+export function subcktPinLocalOffset(pins: string[], pin: string): PinOffset {
+  const index = Math.max(0, pins.indexOf(pin));
+  const n = Math.max(1, pins.length);
+  const side = Math.ceil(n / 4);
+  const halfW = COMPONENT_BOX;
+  const halfH = COMPONENT_BOX;
+  const slot = index % side;
+  const spacing = (COMPONENT_BOX * 2) / (side + 1);
+  const ringIndex = Math.floor(index / side);
+  if (ringIndex === 0) return { dx: -halfW, dy: -halfH + spacing * (slot + 1) };
+  if (ringIndex === 1) return { dx: halfW, dy: -halfH + spacing * (slot + 1) };
+  if (ringIndex === 2) return { dx: -halfW + spacing * (slot + 1), dy: -halfH };
+  return { dx: -halfW + spacing * (slot + 1), dy: halfH };
+}
+
+function coordKey(x: number, y: number): string {
+  return `${Math.round(x)}:${Math.round(y)}`;
+}
+
+/**
+ * Connection census of the schematic: how many wire ends and pins meet at
+ * every coordinate, plus the set of pins that have at least one wire.
+ *
+ * LTspice draws a solid junction dot wherever three or more things meet
+ * (a T or a cross), and shows open squares on pins that are not wired. We
+ * reproduce both from this census.
+ */
+export type ConnectionCensus = {
+  /** Coordinates where >= 3 connections meet, in world units. */
+  junctions: { x: number; y: number }[];
+  /** ``componentId:pin`` keys that have at least one wire attached. */
+  wiredPins: Set<string>;
+};
+
+export function computeConnectionCensus(
+  components: CanvasComponent[],
+  wires: CanvasWire[]
+): ConnectionCensus {
+  const componentsById = new Map(components.map((c) => [c.id, c]));
+  const countAt = new Map<string, { x: number; y: number; n: number }>();
+  const bump = (x: number, y: number) => {
+    const key = coordKey(x, y);
+    const entry = countAt.get(key);
+    if (entry) entry.n += 1;
+    else countAt.set(key, { x, y, n: 1 });
+  };
+  const wiredPins = new Set<string>();
+  for (const w of wires) {
+    for (const ep of [w.start, w.end]) {
+      if (ep.kind === "pin") {
+        wiredPins.add(`${ep.componentId}:${ep.pin}`);
+        const c = componentsById.get(ep.componentId);
+        if (!c) continue;
+        const p = getPinCoordinates(c, ep.pin);
+        bump(p.x, p.y);
+      } else {
+        bump(ep.x, ep.y);
+      }
+    }
+  }
+  // A pin itself counts as one connection at its coordinate, so a pin with
+  // two wires forms a T (3 connections) and gets a dot.
+  for (const c of components) {
+    if (c.type === "NODE" || c.type === "LABEL") continue;
+    for (const pin of getPinsForType(c.type, c)) {
+      const p = getPinCoordinates(c, pin);
+      const key = coordKey(p.x, p.y);
+      if (countAt.has(key)) bump(p.x, p.y);
+    }
+  }
+  const junctions: { x: number; y: number }[] = [];
+  for (const entry of countAt.values()) {
+    if (entry.n >= 3) junctions.push({ x: entry.x, y: entry.y });
+  }
+  return { junctions, wiredPins };
+}
+
+/** Axis-aligned bounds of every component and wire endpoint (world units). */
+export function schematicBounds(
+  components: CanvasComponent[],
+  wires: CanvasWire[]
+): { x: number; y: number; w: number; h: number } | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  const grow = (x: number, y: number) => {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  };
+  for (const c of components) {
+    const b = componentBounds(c);
+    grow(b.x, b.y);
+    grow(b.x + b.w, b.y + b.h + 24);
+  }
+  const byId = new Map(components.map((c) => [c.id, c]));
+  for (const w of wires) {
+    for (const ep of [w.start, w.end]) {
+      const p = endpointXY(ep, byId);
+      if (p) grow(p.x, p.y);
+    }
+  }
+  if (!Number.isFinite(minX)) return null;
+  return { x: minX, y: minY, w: Math.max(1, maxX - minX), h: Math.max(1, maxY - minY) };
+}
+
+/** Clipboard snapshot: selected components plus wires fully inside the selection. */
+export type ClipboardData = {
+  components: CanvasComponent[];
+  wires: CanvasWire[];
+};
+
+export function extractClipboard(
+  components: CanvasComponent[],
+  wires: CanvasWire[],
+  selectedIds: Set<string>
+): ClipboardData | null {
+  if (selectedIds.size === 0) return null;
+  const comps = components.filter((c) => selectedIds.has(c.id));
+  const compSet = new Set(comps.map((c) => c.id));
+  const picked = wires.filter((w) => {
+    if (selectedIds.has(w.id)) return true;
+    const startOk = w.start.kind === "point" || compSet.has(w.start.componentId);
+    const endOk = w.end.kind === "point" || compSet.has(w.end.componentId);
+    return startOk && endOk;
+  });
+  if (comps.length === 0 && picked.length === 0) return null;
+  return {
+    components: comps.map((c) => ({
+      ...c,
+      pins: c.pins ? [...c.pins] : undefined,
+      metadata: c.metadata ? { ...c.metadata } : undefined
+    })),
+    wires: picked.map((w) => ({
+      ...w,
+      start: w.start.kind === "pin" ? { ...w.start } : { ...w.start },
+      end: w.end.kind === "pin" ? { ...w.end } : { ...w.end }
+    }))
+  };
+}
+
+/** Split ``wire`` at a point lying on one of its two orthogonal segments. */
+export function splitWireAtPoint(
+  wire: CanvasWire,
+  point: { x: number; y: number },
+  componentsById: Map<string, CanvasComponent>
+): CanvasWire[] | null {
+  const a = endpointXY(wire.start, componentsById);
+  const b = endpointXY(wire.end, componentsById);
+  if (!a || !b) return null;
+  const sx = snap(point.x);
+  const sy = snap(point.y);
+  if ((sx === a.x && sy === a.y) || (sx === b.x && sy === b.y)) return null;
+  const joint = pointEndpoint(sx, sy);
+  const mk = (start: WireEndpoint, end: WireEndpoint): CanvasWire => ({
+    id: `w-${Math.random().toString(36).slice(2, 8)}`,
+    start,
+    end
+  });
+  return [mk(wire.start, joint), mk(joint, wire.end)];
+}
+
+/* ---- Workspace file format (File > Save / Open) ------------------------ */
+
+export const WORKSPACE_FILE_VERSION = 1;
+
+export type WorkspaceFile = {
+  format: "mna-simulator-workspace";
+  version: number;
+  savedAt: string;
+  levels: SchematicLevel[];
+  activeLevelId: string;
+  analysis: AnalysisState;
+  netlistMode: "schematic" | "netlist";
+  netlistText: string;
+};
+
+export function serializeWorkspace(data: Omit<WorkspaceFile, "format" | "version" | "savedAt">): string {
+  const file: WorkspaceFile = {
+    format: "mna-simulator-workspace",
+    version: WORKSPACE_FILE_VERSION,
+    savedAt: new Date().toISOString(),
+    ...data
+  };
+  return JSON.stringify(file, null, 2);
+}
+
+export function parseWorkspace(text: string): WorkspaceFile {
+  const raw = JSON.parse(text) as Partial<WorkspaceFile>;
+  if (!raw || raw.format !== "mna-simulator-workspace" || !Array.isArray(raw.levels)) {
+    throw new Error("Not an MNA Simulator workspace file.");
+  }
+  for (const level of raw.levels) {
+    if (!level || typeof level.id !== "string" || !Array.isArray(level.components) || !Array.isArray(level.wires)) {
+      throw new Error("Workspace file has a malformed schematic level.");
+    }
+    level.pins = Array.isArray(level.pins) ? level.pins : [];
+    level.parentId = typeof level.parentId === "string" ? level.parentId : null;
+  }
+  const rootExists = raw.levels.some((l) => l.parentId === null);
+  if (!rootExists) throw new Error("Workspace file has no top-level schematic.");
+  return {
+    format: "mna-simulator-workspace",
+    version: Number(raw.version ?? 1),
+    savedAt: String(raw.savedAt ?? ""),
+    levels: raw.levels,
+    activeLevelId:
+      typeof raw.activeLevelId === "string" && raw.levels.some((l) => l.id === raw.activeLevelId)
+        ? raw.activeLevelId
+        : raw.levels.find((l) => l.parentId === null)!.id,
+    analysis: (raw.analysis ?? {}) as AnalysisState,
+    netlistMode: raw.netlistMode === "netlist" ? "netlist" : "schematic",
+    netlistText: typeof raw.netlistText === "string" ? raw.netlistText : ""
   };
 }

@@ -6,7 +6,7 @@
  * should leave the context state as it found it.
  */
 
-import { CanvasComponent, COMPONENT_BOX, DeviceType, GND_BOX } from "./schematic";
+import { CanvasComponent, COMPONENT_BOX, DeviceType, GND_BOX, subcktPinLocalOffset } from "./schematic";
 
 export type SymbolTheme = {
   stroke: string;
@@ -350,7 +350,57 @@ function drawSubckt(ctx: CanvasRenderingContext2D, theme: SymbolTheme, component
   ctx.font = "600 12px Inter, system-ui, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
-  ctx.fillText(component.name || "SUBCKT", 0, 0);
+  drawUprightText(ctx, component, component.name || "SUBCKT", 0, 0, "center");
+
+  // Pin names just inside the body edge, so a hierarchical block reads like
+  // an LTspice symbol: every port is identifiable without opening the child.
+  const pins = component.pins ?? [];
+  ctx.fillStyle = theme.muted;
+  ctx.font = "500 9px Inter, system-ui, sans-serif";
+  for (const pin of pins) {
+    const off = subcktPinLocalOffset(pins, pin);
+    const inset = 8;
+    let tx = off.dx;
+    let ty = off.dy;
+    let align: CanvasTextAlign = "center";
+    if (off.dx <= -w / 2 + 1) {
+      tx += inset;
+      align = "left";
+    } else if (off.dx >= w / 2 - 1) {
+      tx -= inset;
+      align = "right";
+    } else if (off.dy <= -h / 2 + 1) {
+      ty += inset;
+    } else {
+      ty -= inset;
+    }
+    drawUprightText(ctx, component, pin, tx, ty, align);
+  }
+  ctx.restore();
+}
+
+/**
+ * Draw text at a local symbol coordinate while cancelling the symbol's
+ * rotation/mirror so labels never render upside down or mirrored.
+ */
+function drawUprightText(
+  ctx: CanvasRenderingContext2D,
+  component: CanvasComponent,
+  text: string,
+  x: number,
+  y: number,
+  align: CanvasTextAlign
+): void {
+  ctx.save();
+  ctx.translate(x, y);
+  if (component.mirrored) ctx.scale(-1, 1);
+  if (component.rotation) ctx.rotate((-component.rotation * Math.PI) / 180);
+  let finalAlign = align;
+  if (component.mirrored && align !== "center") finalAlign = align === "left" ? "right" : "left";
+  if (component.rotation === 180 && align !== "center") finalAlign = finalAlign === "left" ? "right" : "left";
+  ctx.textAlign = finalAlign;
+  ctx.textBaseline = "middle";
+  ctx.fillText(text, 0, 0);
   ctx.restore();
 }
 
@@ -378,11 +428,11 @@ function drawNodeMarker(ctx: CanvasRenderingContext2D, theme: SymbolTheme, compo
   ctx.moveTo(8, 0);
   ctx.lineTo(22, 0);
   ctx.stroke();
+  // Name above-right of the flag stub so neither a horizontal nor a
+  // vertical wire through the marker runs through the text.
   ctx.fillStyle = theme.label;
   ctx.font = "600 10px Inter, system-ui, sans-serif";
-  ctx.textAlign = "left";
-  ctx.textBaseline = "middle";
-  ctx.fillText(text, 26, 0);
+  drawUprightText(ctx, component, text, 10, -10, "left");
   ctx.restore();
 }
 
@@ -464,6 +514,66 @@ export function drawPalettePreview(
   type: DeviceType,
   theme: SymbolTheme = DEFAULT_THEME
 ): void {
+  // Text-based symbols are illegible at palette scale, so use dedicated glyphs.
+  if (type === "LABEL") {
+    ctx.save();
+    ctx.fillStyle = theme.label;
+    ctx.font = "700 44px Inter, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("T", 0, 2);
+    ctx.restore();
+    return;
+  }
+  if (type === "NODE") {
+    ctx.save();
+    ctx.strokeStyle = theme.stroke;
+    ctx.fillStyle = theme.accent;
+    ctx.lineWidth = 4;
+    ctx.lineJoin = "round";
+    ctx.beginPath();
+    ctx.moveTo(-30, 0);
+    ctx.lineTo(-6, 0);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-6, -14);
+    ctx.lineTo(18, -14);
+    ctx.lineTo(30, 0);
+    ctx.lineTo(18, 14);
+    ctx.lineTo(-6, 14);
+    ctx.closePath();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(-30, 0, 6, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    return;
+  }
+  if (type === "SUBCKT") {
+    ctx.save();
+    ctx.strokeStyle = theme.stroke;
+    ctx.fillStyle = theme.fill;
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.rect(-20, -22, 40, 44);
+    ctx.fill();
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-34, -10);
+    ctx.lineTo(-20, -10);
+    ctx.moveTo(-34, 10);
+    ctx.lineTo(-20, 10);
+    ctx.moveTo(20, 0);
+    ctx.lineTo(34, 0);
+    ctx.stroke();
+    ctx.fillStyle = theme.label;
+    ctx.font = "700 22px Inter, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.fillText("X", 0, 1);
+    ctx.restore();
+    return;
+  }
   const fake: CanvasComponent = {
     id: "preview",
     type,
@@ -471,8 +581,7 @@ export function drawPalettePreview(
     value: "",
     x: 0,
     y: 0,
-    rotation: 0,
-    pins: type === "SUBCKT" ? ["a", "b", "c", "d"] : undefined
+    rotation: 0
   };
   drawComponent(ctx, fake, theme);
 }

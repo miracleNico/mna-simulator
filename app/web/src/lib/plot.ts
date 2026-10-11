@@ -45,10 +45,10 @@ export function drawPlot(ctx: CanvasRenderingContext2D, w: number, h: number, da
   ctx.fillStyle = "#0f1422";
   ctx.fillRect(0, 0, w, h);
 
-  const padL = 48;
+  const padL = 52;
   const padR = 16;
-  const padT = data.title ? 24 : 12;
-  const padB = 30;
+  const padT = data.title ? 26 : 14;
+  const padB = 38;
   const plotW = w - padL - padR;
   const plotH = h - padT - padB;
 
@@ -96,8 +96,10 @@ export function drawPlot(ctx: CanvasRenderingContext2D, w: number, h: number, da
       ? xs.filter((v) => Number.isFinite(v))
       : useLogX
         ? logTicks(xMin, xMax)
-        : niceTicks(xMin, xMax, 6);
+        : niceTicks(xMin, xMax, plotW < 360 ? 4 : 6);
   const yTicks = niceTicks(yMin, yMax, 5);
+  const yStep = yTicks.length > 1 ? Math.abs(yTicks[1] - yTicks[0]) : Math.abs(yMax - yMin);
+  const xStep = xTicks.length > 1 ? Math.abs(xTicks[1] - xTicks[0]) : Math.abs(xMax - xMin);
 
   ctx.beginPath();
   for (const tv of xTicks) {
@@ -130,7 +132,7 @@ export function drawPlot(ctx: CanvasRenderingContext2D, w: number, h: number, da
   ctx.textBaseline = "top";
   for (const tv of xTicks) {
     const px = scaleX(tv, xMin, xMax, plotW, padL, useLogX);
-    const label = data.kind === "bar" ? data.xTickLabels?.[Math.round(tv)] ?? formatTick(tv) : formatTick(tv);
+    const label = data.kind === "bar" ? data.xTickLabels?.[Math.round(tv)] ?? formatTick(tv, xStep) : formatTick(tv, xStep);
     const trimmed = label.length > 11 ? `${label.slice(0, 10)}…` : label;
     ctx.fillText(trimmed, px, padT + plotH + 6);
   }
@@ -138,7 +140,7 @@ export function drawPlot(ctx: CanvasRenderingContext2D, w: number, h: number, da
   ctx.textBaseline = "middle";
   for (const tv of yTicks) {
     const py = padT + plotH - ((tv - yMin) / (yMax - yMin)) * plotH;
-    ctx.fillText(formatTick(tv), padL - 6, py);
+    ctx.fillText(formatTick(tv, yStep), padL - 6, py);
   }
 
   // Title
@@ -150,16 +152,20 @@ export function drawPlot(ctx: CanvasRenderingContext2D, w: number, h: number, da
     ctx.fillText(data.title, padL, 6);
   }
 
-  // Axis labels
+  // Axis labels (explicit baseline so they never collide with tick labels)
   if (data.xLabel) {
     ctx.fillStyle = "#7f8fa6";
+    ctx.font = "10px Inter, system-ui, sans-serif";
     ctx.textAlign = "center";
-    ctx.fillText(data.xLabel, padL + plotW / 2, h - 14);
+    ctx.textBaseline = "bottom";
+    ctx.fillText(data.xLabel, padL + plotW / 2, h - 5);
   }
   if (data.yLabel) {
     ctx.save();
     ctx.fillStyle = "#7f8fa6";
+    ctx.font = "10px Inter, system-ui, sans-serif";
     ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
     ctx.translate(12, padT + plotH / 2);
     ctx.rotate(-Math.PI / 2);
     ctx.fillText(data.yLabel, 0, 0);
@@ -239,12 +245,17 @@ export function drawPlot(ctx: CanvasRenderingContext2D, w: number, h: number, da
     ctx.restore();
   });
 
-  // Legend
+  // Legend (top-left with a translucent backing so traces stay readable)
   const legendX = padL + 8;
   let legendY = padT + 8;
   ctx.font = "11px Inter, system-ui, sans-serif";
   ctx.textAlign = "left";
   ctx.textBaseline = "middle";
+  if (data.series.length > 0) {
+    const widest = Math.max(...data.series.map((series) => ctx.measureText(series.label).width));
+    ctx.fillStyle = "rgba(15,20,34,0.78)";
+    ctx.fillRect(legendX - 4, legendY - 9, widest + 22, data.series.length * 14 + 4);
+  }
   data.series.forEach((series, sIdx) => {
     const color = series.color ?? PALETTE[sIdx % PALETTE.length];
     ctx.fillStyle = color;
@@ -340,12 +351,24 @@ function niceStep(raw: number): number {
   return nf * Math.pow(10, exp);
 }
 
-function formatTick(v: number): string {
-  if (v === 0) return "0";
+/**
+ * Engineering-notation tick labels (2m, 20n, 1.5k) like a SPICE waveform
+ * viewer. ``step`` is the tick spacing: values far below it are floating
+ * point noise around zero and print as "0" instead of "-2.8e-17".
+ */
+function formatTick(v: number, step = 0): string {
+  if (v === 0 || (step > 0 && Math.abs(v) < step * 1e-6)) return "0";
   const abs = Math.abs(v);
-  if (abs >= 1e6 || abs < 1e-3) {
-    return v.toExponential(1);
-  }
-  if (abs >= 1) return v.toFixed(2).replace(/\.?0+$/, "");
-  return v.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
+  const units: [number, string][] = [
+    [1e12, "T"], [1e9, "G"], [1e6, "M"], [1e3, "k"], [1, ""],
+    [1e-3, "m"], [1e-6, "µ"], [1e-9, "n"], [1e-12, "p"], [1e-15, "f"]
+  ];
+  if (abs >= 1e15 || abs < 1e-16) return v.toExponential(1);
+  const [scale, suffix] = units.find(([candidate]) => abs >= candidate * 0.9999) ?? [1e-15, "f"];
+  const scaled = v / scale;
+  const stepScaled = step > 0 ? step / scale : 0;
+  // Keep enough decimals to separate neighbouring ticks, but no trailing zeros.
+  const decimals = stepScaled > 0 ? Math.min(4, Math.max(0, Math.ceil(-Math.log10(stepScaled)) + 1)) : 2;
+  const text = Number(scaled.toFixed(decimals)).toString();
+  return `${text}${suffix}`;
 }

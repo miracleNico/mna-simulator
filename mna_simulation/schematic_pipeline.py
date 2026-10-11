@@ -723,7 +723,7 @@ def schematic_to_netlist(
         for pin in expected:
             pin_key = f"cp:{component.id}:{pin}"
             if pin_key not in connected_pin_keys:
-                error_handler(f"NETLIST_FATAL: Component '{component.id}' pin '{pin}' is disconnected.")
+                error_handler(f"NETLIST_FATAL: Component '{component.name or component.id}' pin '{pin}' is disconnected.")
             nodes[pin] = pin_to_node[pin_key]
 
         if len(expected) >= 2:

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/.cache
+
+# Front end caches (node_modules and dist are intentionally tracked today)
+app/web/node_modules/.vite/
+app/web/.vite/
+
+# Editors / OS
+.DS_Store
+Thumbs.db

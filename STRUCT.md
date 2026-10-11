@@ -27,9 +27,15 @@ This document describes the project-authored source, config, docs, and tests. It
 ### `STRUCT.md`
 - This file-by-file architecture reference.
 
+### `DESIGN_AUDIT.md`
+- Front end design audit: findings from driving the app in headless Chromium, what was changed, and an LTspice feature comparison with suggested next steps.
+
+### `.gitignore`
+- Ignores Python bytecode, pytest and Vite caches. `app/web/node_modules` and `app/web/dist` remain tracked.
+
 ### `pyproject.toml`
 - Python package metadata.
-- Declares runtime dependencies (`numpy`, `scipy`, `sympy`, `fastapi`, `uvicorn`, etc.).
+- Declares runtime dependencies (`numpy`, `scipy`, `sympy`, `fastapi`, `uvicorn[standard]` for websocket support, etc.).
 - Declares dev dependencies (`pytest`, `httpx`).
 - Registers CLI entrypoint: `mna-sim = mna_simulation.cli:main`.
 
@@ -170,6 +176,7 @@ This document describes the project-authored source, config, docs, and tests. It
 ### `app/web/src/lib/schematic.ts`
 - Frontend schematic model and payload conversion.
 - Defines device types, component/wire/level types, pin layouts, geometry helpers, net-label computation, and `buildSchematicPayload()`.
+- Editor helpers: connection census (junction dots, wired/open pins), schematic bounds for zoom-to-fit, clipboard extraction, wire splitting for T-junctions, and the JSON workspace file format (`serializeWorkspace` / `parseWorkspace`).
 - Defines analysis state for Krylov enablement plus MOR enablement, method, auto/manual order, and separate MOR outputs.
 - Expands frontend `NODE` markers into backend `port_<name>` junctions.
 - Repairs stale `SUBCKT` wire endpoint names before sending payloads.
@@ -192,24 +199,27 @@ This document describes the project-authored source, config, docs, and tests. It
 
 ### `app/web/src/lib/symbols.ts`
 - Canvas symbol drawing for schematic components.
-- Includes passives, sources, controlled sources, transistor symbols, labels, nodes, and subcircuits.
+- Includes passives, sources, controlled sources, transistor symbols, labels, nodes, and subcircuits (with pin names drawn upright inside the body).
+- Dedicated palette glyphs for LABEL, NODE, and SUBCKT toolbar buttons.
 
 ### `app/web/src/components/Toolbar.tsx`
-- Component toolbar.
-- Exposes primitives, controlled sources, transistors, `SUBCKT`, `LABEL`, `NODE`, probe, and run controls.
-- Exposes Help, which opens the detailed user-guide dialog from the toolbar.
+- Component toolbar that wraps on narrow viewports.
+- Device palette (primitives, transistors, controlled sources, `SUBCKT`, `NODE`, `LABEL`), an edit group (wire tool, rotate, mirror, delete, undo, redo, zoom to fit), and a simulate group (probe, dynamic display, Run, Help).
 
 ### `app/web/src/components/LeftPane.tsx`
 - Simulation controls, hierarchy tree, library list, and property editor.
 - Supports `SUBCKT` displayed/entity name, node count, editable pin names, transistor small-signal fields, and display-node controls.
+- Primary controls (mode, parameters, display nodes, Run) come first; dynamic display, Krylov, and MOR live in collapsible "Advanced" sub-panels.
 - Exposes Krylov subspace solver algorithm selection, method-specific manual value wording, display-node clear, and simulation-control reset.
 - Exposes MOR controls with method selection including Linear Krylov MOR, auto/manual order, and output-node selection separate from display nodes.
+- Properties expands and focuses its first field when a part is double-clicked on the canvas.
 - Contains the editable netlist panel. Editing asks for confirmation, clears schematic hierarchy, and switches runs to raw `netlist_text`.
 
 ### `app/web/src/components/SchematicCanvas.tsx`
 - Schematic graph editor.
 - Handles hit-testing, selection, dragging, wiring, marquee selection, copy/paste, deletion, rotation, hover badges, and drawing.
-- Allows `NODE` markers to be selected and edited while still acting as wire endpoints.
+- LTspice-style editing: wire tool with multi-segment routing and T-junction splits, sticky placement with rotate/mirror on the cursor part, right-drag pan, wheel zoom, zoom-to-fit, arrow-key nudge, double-click to open Properties.
+- Draws junction dots, open-pin squares, dangling-end rings, de-cluttered automatic net labels, and reports cursor position and zoom through callbacks. Exposes an imperative zoom handle.
 
 ### `app/web/src/components/PlotTile.tsx`
 - Movable/resizable plot tile wrapper.
@@ -219,6 +229,7 @@ This document describes the project-authored source, config, docs, and tests. It
 - Main frontend orchestration component.
 - Owns hierarchy levels, active level, analysis settings, selection, tiles, generated netlist preview, and API calls.
 - Owns the Help dialog state and renders the in-app user guide.
+- Owns the File / Edit / View / Simulate / Demo menus, the undo/redo stacks, workspace save/open, netlist export, the wire tool and view toggles, and the window-level keyboard shortcuts.
 - Synchronizes child `NODE` port renames to only the matching `SUBCKT` instances.
 - Rewrites stale `SUBCKT` wire endpoints when pins are renamed.
 - Tracks schematic mode versus raw netlist mode and sends the matching API payload.

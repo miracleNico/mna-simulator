@@ -1,21 +1,25 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { LeftPane } from "../components/LeftPane";
 import { PlotTile } from "../components/PlotTile";
 import { OpResultData, ResultTile } from "../components/ResultTile";
-import { ClipboardData, ProbeTarget, SchematicCanvas } from "../components/SchematicCanvas";
+import { ProbeTarget, SchematicCanvas, SchematicCanvasHandle } from "../components/SchematicCanvas";
 import { Toolbar } from "../components/Toolbar";
-import { DEMO_MENU_GROUPS, HIDDEN_DEMO_PRESETS, SCHEMATIC_PRESETS } from "../lib/demoPresets";
+import { DEMO_MENU_GROUPS } from "../lib/demoPresets";
 import { PlotData } from "../lib/plot";
 import {
   AnalysisState,
   CanvasComponent,
   CanvasWire,
+  ClipboardData,
   DeviceType,
   SchematicLevel,
   SchematicPreset,
   buildSchematicPayload,
-  normalizeNodeName
+  extractClipboard,
+  normalizeNodeName,
+  parseWorkspace,
+  serializeWorkspace
 } from "../lib/schematic";
 import { USER_GUIDE_SECTIONS } from "../lib/userGuide";
 
@@ -69,6 +73,70 @@ type EditorSnapshot = {
   netlistMode: "schematic" | "netlist";
   netlistText: string;
   generatedNetlist: string;
+};
+
+type MenuId = "file" | "edit" | "view" | "simulate" | "demo";
+
+type MenuEntry =
+  | { kind: "item"; label: string; shortcut?: string; onSelect: () => void; disabled?: boolean; checked?: boolean }
+  | { kind: "separator" };
+
+/** Tiny external store so cursor coordinates re-render only the status readout. */
+function createCursorStore() {
+  let value: { x: number; y: number } | null = null;
+  const listeners = new Set<() => void>();
+  return {
+    set(next: { x: number; y: number } | null) {
+      if (next === value) return;
+      if (next && value && next.x === value.x && next.y === value.y) return;
+      value = next;
+      listeners.forEach((listener) => listener());
+    },
+    get: () => value,
+    subscribe(listener: () => void) {
+      listeners.add(listener);
+      return () => {
+        listeners.delete(listener);
+      };
+    }
+  };
+}
+
+type CursorStore = ReturnType<typeof createCursorStore>;
+
+function CursorReadout({ store }: { store: CursorStore }) {
+  const pos = useSyncExternalStore(store.subscribe, store.get);
+  return (
+    <span className="statusbar__slot statusbar__slot--mono" title="Cursor position (grid units)">
+      {pos ? `x ${pos.x}  y ${pos.y}` : "x —  y —"}
+    </span>
+  );
+}
+
+function downloadText(filename: string, text: string, mime = "application/json"): void {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function fileSlug(title: string): string {
+  const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "schematic";
+}
+
+const EMPTY_ROOT: SchematicLevel = {
+  id: "root",
+  title: "Top level",
+  components: [],
+  wires: [],
+  pins: [],
+  parentId: null
 };
 
 const LIBRARY_ITEMS: DeviceType[] = [
@@ -294,8 +362,19 @@ export function App() {
   const [responsePreview, setResponsePreview] = useState<string>("");
   const [tiles, setTiles] = useState<TileRecord[]>([]);
   const [clipboard, setClipboard] = useState<ClipboardData | null>(null);
-  const [demoOpen, setDemoOpen] = useState(false);
+  const [openMenu, setOpenMenu] = useState<MenuId | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [wireTool, setWireTool] = useState(false);
+  const [showGrid, setShowGrid] = useState(true);
+  const [showNetNames, setShowNetNames] = useState(true);
+  const [zoomScale, setZoomScale] = useState(1);
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const [propertiesFocusToken, setPropertiesFocusToken] = useState(0);
+  const canvasHandleRef = useRef<SchematicCanvasHandle | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const redoRef = useRef<EditorSnapshot[]>([]);
+  const cursorStore = useRef<CursorStore | null>(null);
+  if (!cursorStore.current) cursorStore.current = createCursorStore();
   const [statusElapsedMs, setStatusElapsedMs] = useState(0);
   const [statusIterations, setStatusIterations] = useState(0);
   const tileCounterRef = useRef(1);
@@ -319,25 +398,28 @@ export function App() {
     generatedNetlistRef.current = generatedNetlist;
   }, [levels, activeLevelId, netlistMode, netlistText, generatedNetlist]);
 
-  const pushEditorHistory = useCallback(() => {
-    historyRef.current.push({
+  const captureSnapshot = useCallback(
+    (): EditorSnapshot => ({
       levels: cloneLevels(levelsRef.current),
       activeLevelId: activeLevelIdRef.current,
       netlistMode: netlistModeRef.current,
       netlistText: netlistTextRef.current,
       generatedNetlist: generatedNetlistRef.current
-    });
+    }),
+    []
+  );
+
+  const pushEditorHistory = useCallback(() => {
+    historyRef.current.push(captureSnapshot());
     if (historyRef.current.length > 100) {
       historyRef.current.shift();
     }
-  }, []);
+    // A fresh edit invalidates the redo branch, like every desktop editor.
+    redoRef.current = [];
+    setHistoryVersion((v) => v + 1);
+  }, [captureSnapshot]);
 
-  const undoEditor = useCallback(() => {
-    const snapshot = historyRef.current.pop();
-    if (!snapshot) {
-      setStatusMsg("Nothing to roll back.");
-      return;
-    }
+  const restoreSnapshot = useCallback((snapshot: EditorSnapshot) => {
     setLevels(cloneLevels(snapshot.levels));
     setActiveLevelId(snapshot.activeLevelId);
     setNetlistMode(snapshot.netlistMode);
@@ -346,9 +428,36 @@ export function App() {
     setSelectedIds(new Set());
     setPendingDevice(null);
     setProbeMode(false);
+    setWireTool(false);
     setStatus("idle");
-    setStatusMsg("Rolled back last schematic edit.");
   }, []);
+
+  const undoEditor = useCallback(() => {
+    const snapshot = historyRef.current.pop();
+    if (!snapshot) {
+      setStatusMsg("Nothing to undo.");
+      return;
+    }
+    redoRef.current.push(captureSnapshot());
+    restoreSnapshot(snapshot);
+    setHistoryVersion((v) => v + 1);
+    setStatusMsg("Undid last edit.");
+  }, [captureSnapshot, restoreSnapshot]);
+
+  const redoEditor = useCallback(() => {
+    const snapshot = redoRef.current.pop();
+    if (!snapshot) {
+      setStatusMsg("Nothing to redo.");
+      return;
+    }
+    historyRef.current.push(captureSnapshot());
+    restoreSnapshot(snapshot);
+    setHistoryVersion((v) => v + 1);
+    setStatusMsg("Redid edit.");
+  }, [captureSnapshot, restoreSnapshot]);
+
+  const canUndo = historyVersion >= 0 && historyRef.current.length > 0;
+  const canRedo = historyVersion >= 0 && redoRef.current.length > 0;
 
   const stopStatusTimer = useCallback(() => {
     if (statusStartRef.current !== null) {
@@ -492,6 +601,30 @@ export function App() {
   const startDragType = useCallback((type: DeviceType) => {
     setPendingDevice(type);
     setProbeMode(false);
+    setWireTool(false);
+    canvasHandleRef.current?.focus();
+  }, []);
+
+  const pickDevice = useCallback((type: DeviceType | null) => {
+    setPendingDevice(type);
+    if (type) {
+      setProbeMode(false);
+      setWireTool(false);
+      canvasHandleRef.current?.focus();
+    }
+  }, []);
+
+  const toggleWireTool = useCallback(() => {
+    setWireTool((v) => !v);
+    setPendingDevice(null);
+    setProbeMode(false);
+    canvasHandleRef.current?.focus();
+  }, []);
+
+  const toggleProbeMode = useCallback(() => {
+    setProbeMode((v) => !v);
+    setPendingDevice(null);
+    setWireTool(false);
   }, []);
 
   const rotateSelection = useCallback(() => {
@@ -519,40 +652,43 @@ export function App() {
   }, [pushEditorHistory, selectedIds, setActiveComponents]);
 
   const openHelp = useCallback(() => {
-    setDemoOpen(false);
+    setOpenMenu(null);
     setHelpOpen(true);
   }, []);
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (isEditableTarget(event.target)) return;
-      const key = event.key.toLowerCase();
-      if (event.key === "Escape" && helpOpen) {
-        setHelpOpen(false);
-        event.preventDefault();
-        return;
-      }
-      if (event.key === "Escape" && pendingDevice) {
-        setPendingDevice(null);
-        setStatusMsg("Component placement canceled.");
-        event.preventDefault();
-        return;
-      }
-      if (!(event.ctrlKey || event.metaKey)) return;
-      if (key === "z") {
-        undoEditor();
-        event.preventDefault();
-      } else if (key === "r") {
-        rotateSelection();
-        event.preventDefault();
-      } else if (key === "e") {
-        mirrorSelection();
-        event.preventDefault();
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [helpOpen, mirrorSelection, pendingDevice, rotateSelection, undoEditor]);
+  const deleteSelection = useCallback(() => {
+    if (selectedIds.size === 0) return;
+    const sel = selectedIds;
+    pushEditorHistory();
+    setActiveComponents((cur) => cur.filter((c) => !sel.has(c.id)));
+    setActiveWires((cur) =>
+      cur.filter((w) => {
+        if (sel.has(w.id)) return false;
+        if (w.start.kind === "pin" && sel.has(w.start.componentId)) return false;
+        if (w.end.kind === "pin" && sel.has(w.end.componentId)) return false;
+        return true;
+      })
+    );
+    setSelectedIds(new Set());
+    setStatusMsg(`Deleted ${sel.size} item${sel.size === 1 ? "" : "s"}.`);
+  }, [pushEditorHistory, selectedIds, setActiveComponents, setActiveWires]);
+
+  const selectAll = useCallback(() => {
+    const all = new Set<string>();
+    activeLevel.components.forEach((c) => all.add(c.id));
+    activeLevel.wires.forEach((w) => all.add(w.id));
+    setSelectedIds(all);
+  }, [activeLevel]);
+
+  const copySelection = useCallback((): ClipboardData | null => {
+    const data = extractClipboard(activeLevel.components, activeLevel.wires, selectedIds);
+    if (!data) return null;
+    setClipboard(data);
+    setStatusMsg(`Copied ${data.components.length} component${data.components.length === 1 ? "" : "s"}.`);
+    return data;
+  }, [activeLevel, selectedIds]);
+
+  /* Keyboard shortcuts are installed after the file/zoom helpers below. */
 
   /* -------------- Property update -------------- */
 
@@ -615,8 +751,11 @@ export function App() {
 
   /* -------------- Run simulation -------------- */
 
-  const runSimulation = useCallback(async () => {
+  const runSimulation = useCallback(async (override?: Partial<AnalysisState>) => {
     if (running) return;
+    const effective: AnalysisState = override ? { ...analysis, ...override } : analysis;
+    if (override) setAnalysis(effective);
+    setOpenMenu(null);
     activeDynamicTilesRef.current.clear();
     startStatusTimer();
     setRunning(true);
@@ -628,7 +767,7 @@ export function App() {
         : buildSchematicPayload(
             activeLevel.components,
             activeLevel.wires,
-            analysis,
+            effective,
             levels,
             activeLevel.junctions ?? []
           );
@@ -638,8 +777,8 @@ export function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           netlist_text: netlistMode === "netlist" ? netlistText : "",
-          mode: analysis.mode,
-          options: { ...simulationRequestOptions(analysis), output_max_points: MAX_STATIC_PLOT_POINTS },
+          mode: effective.mode,
+          options: { ...simulationRequestOptions(effective), output_max_points: MAX_STATIC_PLOT_POINTS },
           schematic: schematicPayload ?? undefined
         })
       });
@@ -650,8 +789,8 @@ export function App() {
         setResponsePreview(formatResponsePreview(body));
       } else {
         setStatus("ok");
-        setStatusMsg(`${analysis.mode.toUpperCase()} complete (${body.status}).`);
-        setStatusIterationCount(responseIterationCount(body, analysis.mode));
+        setStatusMsg(`${effective.mode.toUpperCase()} complete (${body.status}).`);
+        setStatusIterationCount(responseIterationCount(body, effective.mode));
         if (body?.metadata?.generated_netlist) {
           setGeneratedNetlist(String(body.metadata.generated_netlist));
         } else if (netlistMode === "netlist") {
@@ -660,20 +799,20 @@ export function App() {
         setResponsePreview(formatResponsePreview(body));
 
         // Materialize a result tile.
-        if (analysis.mode === "tran" && body.waveform) {
-          const data = toPlotData(body.waveform, "time (s)", "V", analysis.probeNodes);
+        if (effective.mode === "tran" && body.waveform) {
+          const data = toPlotData(body.waveform, "time (s)", "V", effective.probeNodes);
           addTile({
-            title: `.tran — ${analysis.tStop}`,
+            title: `.tran — ${effective.tStop}`,
             mode: "static",
             view: "plot",
             data
           });
-        } else if (analysis.mode === "ac" && body.spectrum) {
-          const data = toSpectrumPlot(body.spectrum, { kind: "line", db: true, filterLabels: analysis.probeNodes });
+        } else if (effective.mode === "ac" && body.spectrum) {
+          const data = toSpectrumPlot(body.spectrum, { kind: "line", db: true, filterLabels: effective.probeNodes });
           addTile({ title: `.ac sweep`, mode: "static", view: "plot", data });
-        } else if (analysis.mode === "hb" && body.spectrum) {
+        } else if (effective.mode === "hb" && body.spectrum) {
           const f0 = Number(body?.metadata?.base_frequency_hz ?? 0);
-          const data = toSpectrumPlot(body.spectrum, { kind: "stem", filterLabels: analysis.probeNodes });
+          const data = toSpectrumPlot(body.spectrum, { kind: "stem", filterLabels: effective.probeNodes });
           addTile({
             title: f0 > 0 ? `.hb spectrum · f0 ${formatCompact(f0)}Hz` : `.hb spectrum`,
             mode: "static",
@@ -682,17 +821,17 @@ export function App() {
             w: 520,
             h: 300
           });
-        } else if (analysis.mode === "hb" && body.waveform) {
-          const data = toPlotData(body.waveform, "time (s)", "V", analysis.probeNodes);
+        } else if (effective.mode === "hb" && body.waveform) {
+          const data = toPlotData(body.waveform, "time (s)", "V", effective.probeNodes);
           addTile({
-            title: `.hb reconstruct — ${analysis.hbTimeWindow || "window"}`,
+            title: `.hb reconstruct — ${effective.hbTimeWindow || "window"}`,
             mode: "static",
             view: "plot",
             data,
             w: 520,
             h: 300
           });
-        } else if (analysis.mode === "op" && body.dc_solution) {
+        } else if (effective.mode === "op" && body.dc_solution) {
           addTile({
             title: `.op — matrices and operating point`,
             mode: "static",
@@ -702,7 +841,7 @@ export function App() {
               values: body.dc_solution ?? [],
               matrices: body.matrices ?? {},
               deviceOperatingPoints: body.metadata?.device_operating_points ?? [],
-              filterLabels: analysis.probeNodes
+              filterLabels: effective.probeNodes
             },
             w: 760,
             h: 520
@@ -919,7 +1058,6 @@ export function App() {
       y: 60 + offset,
       w: 420,
       h: 260,
-      view: "plot",
       ...partial
     };
     setTiles((cur) => [...cur, tile]);
@@ -981,6 +1119,9 @@ export function App() {
 
   function applyPreset(preset: SchematicPreset) {
     pushEditorHistory();
+    setWireTool(false);
+    setProbeMode(false);
+    setPendingDevice(null);
     const rootLevel: SchematicLevel = {
       id: "root",
       title: preset.title,
@@ -1015,12 +1156,80 @@ export function App() {
     setStatusMsg(`Preset "${preset.title}" loaded.`);
   }
 
-  const loadPreset = useCallback((presetId: string) => {
-    const preset =
-      SCHEMATIC_PRESETS.find((p) => p.id === presetId) ??
-      HIDDEN_DEMO_PRESETS.find((p) => p.id === presetId);
-    if (preset) applyPreset(preset);
-  }, []);
+  /* -------------- File menu -------------- */
+
+  const workspaceHasContent = levels.some((l) => l.components.length > 0 || l.wires.length > 0) || netlistText.trim().length > 0;
+
+  function newWorkspace() {
+    setOpenMenu(null);
+    if (workspaceHasContent && !window.confirm("Start a new empty schematic? The current workspace stays in the undo history.")) {
+      return;
+    }
+    pushEditorHistory();
+    setLevels([{ ...EMPTY_ROOT }]);
+    setActiveLevelId("root");
+    setAnalysis({ ...defaultAnalysis });
+    setSelectedIds(new Set());
+    setGeneratedNetlist("");
+    setNetlistMode("schematic");
+    setNetlistText("");
+    setResponsePreview("");
+    setPendingDevice(null);
+    setWireTool(false);
+    setProbeMode(false);
+    setStatus("idle");
+    setStatusMsg("New empty schematic.");
+  }
+
+  function saveWorkspace() {
+    setOpenMenu(null);
+    const root = levels.find((l) => l.parentId === null);
+    const text = serializeWorkspace({ levels, activeLevelId, analysis, netlistMode, netlistText });
+    downloadText(`${fileSlug(root?.title ?? "schematic")}.mna.json`, text);
+    setStatusMsg("Workspace saved as JSON.");
+  }
+
+  function openWorkspacePicker() {
+    setOpenMenu(null);
+    fileInputRef.current?.click();
+  }
+
+  async function openWorkspaceFile(file: File) {
+    try {
+      const parsed = parseWorkspace(await file.text());
+      pushEditorHistory();
+      setLevels(cloneLevels(parsed.levels));
+      setActiveLevelId(parsed.activeLevelId);
+      setAnalysis({ ...defaultAnalysis, ...parsed.analysis });
+      setNetlistMode(parsed.netlistMode);
+      setNetlistText(parsed.netlistText);
+      setGeneratedNetlist("");
+      setResponsePreview("");
+      setSelectedIds(new Set());
+      setPendingDevice(null);
+      setWireTool(false);
+      setProbeMode(false);
+      setStatus("idle");
+      setStatusMsg(`Opened "${file.name}".`);
+      window.setTimeout(() => canvasHandleRef.current?.zoomToFit(), 0);
+    } catch (err) {
+      setStatus("error");
+      setStatusMsg(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  function exportNetlist() {
+    setOpenMenu(null);
+    const text = netlistMode === "netlist" ? netlistText : generatedNetlist;
+    if (!text.trim()) {
+      setStatus("error");
+      setStatusMsg("Run a simulation once to generate the netlist, then export it.");
+      return;
+    }
+    const root = levels.find((l) => l.parentId === null);
+    downloadText(`${fileSlug(root?.title ?? "schematic")}.cir`, text, "text/plain");
+    setStatusMsg("Netlist exported.");
+  }
 
   /* -------------- Hierarchy handlers -------------- */
 
@@ -1078,13 +1287,9 @@ export function App() {
 
   /* -------------- Copy / paste -------------- */
 
-  const onCopy = useCallback((data: ClipboardData) => {
-    setClipboard(data);
-    setStatusMsg(`Copied ${data.components.length} component${data.components.length === 1 ? "" : "s"}.`);
-  }, []);
-
-  const onPaste = useCallback(() => {
-    if (!clipboard || clipboard.components.length === 0) return;
+  const pasteClipboard = useCallback((source: ClipboardData | null) => {
+    if (!source || source.components.length === 0) return;
+    const clipboard = source;
     pushEditorHistory();
     const idRemap = new Map<string, string>();
     const dx = 40;
@@ -1127,7 +1332,135 @@ export function App() {
     newComponents.forEach((c) => sel.add(c.id));
     newWires.forEach((w) => sel.add(w.id));
     setSelectedIds(sel);
-  }, [clipboard, pushEditorHistory, setActiveComponents, setActiveWires]);
+  }, [pushEditorHistory, setActiveComponents, setActiveWires]);
+
+  const onPaste = useCallback(() => pasteClipboard(clipboard), [clipboard, pasteClipboard]);
+
+  /** LTspice F6: copy the selection and drop the copy offset right away. */
+  const duplicateSelection = useCallback(() => {
+    const data = copySelection();
+    if (data) pasteClipboard(data);
+  }, [copySelection, pasteClipboard]);
+
+  /* -------------- Keyboard shortcuts -------------- */
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isEditableTarget(event.target)) return;
+      const key = event.key.toLowerCase();
+      const ctrl = event.ctrlKey || event.metaKey;
+
+      if (event.key === "Escape") {
+        if (openMenu) setOpenMenu(null);
+        else if (helpOpen) setHelpOpen(false);
+        else if (pendingDevice) {
+          setPendingDevice(null);
+          setStatusMsg("Component placement finished.");
+        } else if (wireTool) setWireTool(false);
+        else if (probeMode) setProbeMode(false);
+        else return;
+        event.preventDefault();
+        return;
+      }
+
+      // Function keys follow LTspice: F1 help, F3 wire, F4 net label, F6 duplicate, F9 undo.
+      if (event.key === "F1") {
+        openHelp();
+        event.preventDefault();
+        return;
+      }
+      if (event.key === "F3") {
+        toggleWireTool();
+        event.preventDefault();
+        return;
+      }
+      if (event.key === "F4") {
+        pickDevice("NODE");
+        event.preventDefault();
+        return;
+      }
+      if (event.key === "F6") {
+        duplicateSelection();
+        event.preventDefault();
+        return;
+      }
+      if (event.key === "F9") {
+        if (event.shiftKey) redoEditor();
+        else undoEditor();
+        event.preventDefault();
+        return;
+      }
+
+      if (!ctrl) {
+        if (key === "w" && !pendingDevice) {
+          toggleWireTool();
+          event.preventDefault();
+        } else if (key === "r" && !pendingDevice) {
+          rotateSelection();
+          event.preventDefault();
+        } else if ((event.key === "Delete" || event.key === "Backspace") && selectedIds.size > 0) {
+          deleteSelection();
+          event.preventDefault();
+        } else if (event.key === " " && !pendingDevice) {
+          canvasHandleRef.current?.zoomToFit();
+          event.preventDefault();
+        }
+        return;
+      }
+
+      switch (key) {
+        case "z":
+          if (event.shiftKey) redoEditor();
+          else undoEditor();
+          break;
+        case "y":
+          redoEditor();
+          break;
+        case "r":
+          if (!pendingDevice) rotateSelection();
+          break;
+        case "e":
+          if (!pendingDevice) mirrorSelection();
+          break;
+        case "d":
+          duplicateSelection();
+          break;
+        case "c":
+          copySelection();
+          break;
+        case "v":
+          onPaste();
+          break;
+        case "a":
+          selectAll();
+          break;
+        case "s":
+          saveWorkspace();
+          break;
+        case "o":
+          openWorkspacePicker();
+          break;
+        case "=":
+        case "+":
+          canvasHandleRef.current?.zoomIn();
+          break;
+        case "-":
+          canvasHandleRef.current?.zoomOut();
+          break;
+        case "0":
+          canvasHandleRef.current?.zoomToFit();
+          break;
+        case "enter":
+          void runSimulation();
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   /* -------------- Render -------------- */
 
@@ -1135,28 +1468,134 @@ export function App() {
     selectedIds.size === 1
       ? activeLevel.components.find((c) => selectedIds.has(c.id)) ?? null
       : null;
+  const hasSelection = selectedIds.size > 0;
+
+  const fileMenu: MenuEntry[] = [
+    { kind: "item", label: "New schematic", shortcut: "", onSelect: newWorkspace },
+    { kind: "item", label: "Open workspace…", shortcut: "Ctrl+O", onSelect: openWorkspacePicker },
+    { kind: "item", label: "Save workspace as JSON", shortcut: "Ctrl+S", onSelect: saveWorkspace },
+    { kind: "separator" },
+    { kind: "item", label: "Export SPICE netlist (.cir)", onSelect: exportNetlist }
+  ];
+  const editMenu: MenuEntry[] = [
+    { kind: "item", label: "Undo", shortcut: "Ctrl+Z", onSelect: undoEditor, disabled: !canUndo },
+    { kind: "item", label: "Redo", shortcut: "Ctrl+Y", onSelect: redoEditor, disabled: !canRedo },
+    { kind: "separator" },
+    { kind: "item", label: "Copy", shortcut: "Ctrl+C", onSelect: () => void copySelection(), disabled: !hasSelection },
+    { kind: "item", label: "Paste", shortcut: "Ctrl+V", onSelect: onPaste, disabled: !clipboard },
+    { kind: "item", label: "Duplicate", shortcut: "Ctrl+D / F6", onSelect: duplicateSelection, disabled: !hasSelection },
+    { kind: "item", label: "Delete", shortcut: "Del", onSelect: deleteSelection, disabled: !hasSelection },
+    { kind: "item", label: "Select all", shortcut: "Ctrl+A", onSelect: selectAll },
+    { kind: "separator" },
+    { kind: "item", label: "Rotate", shortcut: "Ctrl+R / R", onSelect: rotateSelection, disabled: !hasSelection },
+    { kind: "item", label: "Mirror", shortcut: "Ctrl+E", onSelect: mirrorSelection, disabled: !hasSelection },
+    { kind: "separator" },
+    { kind: "item", label: "Wire tool", shortcut: "W / F3", onSelect: toggleWireTool, checked: wireTool },
+    { kind: "item", label: "Place net label (NODE)", shortcut: "F4", onSelect: () => pickDevice("NODE"), checked: pendingDevice === "NODE" }
+  ];
+  const viewMenu: MenuEntry[] = [
+    { kind: "item", label: "Zoom in", shortcut: "Ctrl + =", onSelect: () => canvasHandleRef.current?.zoomIn() },
+    { kind: "item", label: "Zoom out", shortcut: "Ctrl + −", onSelect: () => canvasHandleRef.current?.zoomOut() },
+    { kind: "item", label: "Zoom to fit", shortcut: "Space / Ctrl+0", onSelect: () => canvasHandleRef.current?.zoomToFit() },
+    { kind: "item", label: "Actual size (100%)", onSelect: () => canvasHandleRef.current?.resetZoom() },
+    { kind: "separator" },
+    { kind: "item", label: "Show grid", onSelect: () => setShowGrid((v) => !v), checked: showGrid },
+    { kind: "item", label: "Show auto net names", onSelect: () => setShowNetNames((v) => !v), checked: showNetNames },
+    { kind: "separator" },
+    { kind: "item", label: "Close all result tiles", onSelect: () => tiles.forEach((t) => closeTile(t.id)), disabled: tiles.length === 0 }
+  ];
+  const simulateMenu: MenuEntry[] = [
+    { kind: "item", label: "Run .op (operating point)", onSelect: () => void runSimulation({ mode: "op" }), disabled: running },
+    { kind: "item", label: "Run .tran (transient)", onSelect: () => void runSimulation({ mode: "tran" }), disabled: running },
+    { kind: "item", label: "Run .ac (frequency sweep)", onSelect: () => void runSimulation({ mode: "ac" }), disabled: running },
+    { kind: "item", label: "Run .hb (harmonic balance)", onSelect: () => void runSimulation({ mode: "hb" }), disabled: running },
+    { kind: "separator" },
+    { kind: "item", label: "Run current mode", shortcut: "Ctrl+Enter", onSelect: () => void runSimulation(), disabled: running },
+    { kind: "item", label: "Start dynamic display", onSelect: () => { setOpenMenu(null); startCaredNodeDisplay(); }, disabled: running },
+    { kind: "item", label: "Probe mode", onSelect: toggleProbeMode, checked: probeMode },
+    { kind: "separator" },
+    { kind: "item", label: "Reset simulation controls", onSelect: resetAnalysisControls }
+  ];
+
+  const renderMenu = (id: MenuId, title: string, entries: MenuEntry[]) => (
+    <div className="menubar__dropdown" key={id}>
+      <button
+        className={`menubar__item ${openMenu === id ? "open" : ""}`}
+        onClick={() => setOpenMenu((cur) => (cur === id ? null : id))}
+        onMouseEnter={() => {
+          if (openMenu && openMenu !== id) setOpenMenu(id);
+        }}
+        aria-haspopup="menu"
+        aria-expanded={openMenu === id}
+      >
+        {title}
+      </button>
+      {openMenu === id ? (
+        <div className="menubar__dropdownPanel" role="menu">
+          {entries.map((entry, index) =>
+            entry.kind === "separator" ? (
+              <div key={`sep-${index}`} className="menuRow__sep" />
+            ) : (
+              <button
+                key={entry.label}
+                className="menubar__dropdownItem menuRow"
+                role="menuitem"
+                disabled={entry.disabled}
+                onClick={() => {
+                  setOpenMenu(null);
+                  entry.onSelect();
+                }}
+              >
+                <span className="menuRow__check">{entry.checked ? "✓" : ""}</span>
+                <span className="menuRow__label">{entry.label}</span>
+                {entry.shortcut ? <span className="menuRow__shortcut">{entry.shortcut}</span> : null}
+              </button>
+            )
+          )}
+        </div>
+      ) : null}
+    </div>
+  );
 
   return (
     <div className="app">
+      {openMenu ? <div className="menuBackdrop" onMouseDown={() => setOpenMenu(null)} /> : null}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".json,application/json"
+        className="srOnly"
+        aria-hidden="true"
+        tabIndex={-1}
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          if (file) void openWorkspaceFile(file);
+          e.target.value = "";
+        }}
+      />
       <div className="menubar">
         <div className="menubar__brand">
           <span className="dot" /> MNA Simulator
         </div>
         <div className="menubar__menu">
-          <button className="menubar__item">File</button>
-          <button className="menubar__item">Edit</button>
-          <button className="menubar__item">View</button>
-          <button className="menubar__item">Simulate</button>
+          {renderMenu("file", "File", fileMenu)}
+          {renderMenu("edit", "Edit", editMenu)}
+          {renderMenu("view", "View", viewMenu)}
+          {renderMenu("simulate", "Simulate", simulateMenu)}
           <div className="menubar__dropdown">
             <button
-              className={`menubar__item ${demoOpen ? "open" : ""}`}
-              onClick={() => setDemoOpen((v) => !v)}
-              onBlur={() => setTimeout(() => setDemoOpen(false), 120)}
+              className={`menubar__item ${openMenu === "demo" ? "open" : ""}`}
+              onClick={() => setOpenMenu((cur) => (cur === "demo" ? null : "demo"))}
+              onMouseEnter={() => {
+                if (openMenu && openMenu !== "demo") setOpenMenu("demo");
+              }}
+              aria-haspopup="menu"
+              aria-expanded={openMenu === "demo"}
             >
               Demo
             </button>
-            {demoOpen ? (
-              <div className="menubar__dropdownPanel">
+            {openMenu === "demo" ? (
+              <div className="menubar__dropdownPanel" role="menu">
                 {DEMO_MENU_GROUPS.map((group) => (
                   <div key={group.title} className="menubar__dropdownGroup">
                     <div className="menubar__dropdownHeading">{group.title}</div>
@@ -1164,9 +1603,11 @@ export function App() {
                       <button
                         key={d.id}
                         className="menubar__dropdownItem"
-                        onMouseDown={() => {
+                        role="menuitem"
+                        onClick={() => {
                           applyPreset(d);
-                          setDemoOpen(false);
+                          setOpenMenu(null);
+                          window.setTimeout(() => canvasHandleRef.current?.zoomToFit(), 0);
                         }}
                       >
                         <strong>{d.title}</strong>
@@ -1191,10 +1632,23 @@ export function App() {
 
       <Toolbar
         pendingDevice={pendingDevice}
-        onPickDevice={setPendingDevice}
-        onToggleProbe={() => setProbeMode((v) => !v)}
+        onPickDevice={pickDevice}
+        wireTool={wireTool}
+        onToggleWireTool={toggleWireTool}
+        onToggleProbe={toggleProbeMode}
         probeMode={probeMode}
         onStartDisplay={startCaredNodeDisplay}
+        onRun={() => void runSimulation()}
+        analysisMode={analysis.mode}
+        onUndo={undoEditor}
+        onRedo={redoEditor}
+        canUndo={canUndo}
+        canRedo={canRedo}
+        onRotate={rotateSelection}
+        onMirror={mirrorSelection}
+        onDelete={deleteSelection}
+        hasSelection={hasSelection}
+        onZoomToFit={() => canvasHandleRef.current?.zoomToFit()}
         onOpenHelp={openHelp}
         running={running}
       />
@@ -1241,9 +1695,7 @@ export function App() {
       <LeftPane
         analysis={analysis}
         onAnalysisChange={(patch) => setAnalysis((cur) => ({ ...cur, ...patch }))}
-        presets={SCHEMATIC_PRESETS}
-        onLoadPreset={loadPreset}
-        onRun={runSimulation}
+        onRun={() => void runSimulation()}
         running={running}
         availableNodes={availableNodes}
         onAddProbeNode={addProbeNode}
@@ -1263,6 +1715,7 @@ export function App() {
         onStartDrag={startDragType}
         selectedComponent={selectedComponent}
         onUpdateComponent={updateComponent}
+        propertiesFocusToken={propertiesFocusToken}
         netlistPreview={netlistPreview}
         generatedNetlist={generatedNetlist}
         netlistMode={netlistMode}
@@ -1272,20 +1725,29 @@ export function App() {
 
       <div className="canvasArea" style={{ position: "relative" }}>
         <SchematicCanvas
+          ref={canvasHandleRef}
           components={activeLevel.components}
           wires={activeLevel.wires}
           junctions={activeLevel.junctions}
           selectedIds={selectedIds}
           pendingDevice={pendingDevice}
           probeMode={probeMode}
+          wireTool={wireTool}
+          showGrid={showGrid}
+          showNetNames={showNetNames}
           onSetComponents={setActiveComponents}
           onSetWires={setActiveWires}
           onSelect={setSelectedIds}
           onPendingResolved={() => setPendingDevice(null)}
+          onWireToolResolved={() => setWireTool(false)}
           onBeforeEdit={pushEditorHistory}
           onProbePick={onProbePick}
-          onCopy={onCopy}
+          onCopy={() => void copySelection()}
           onPaste={onPaste}
+          onDuplicate={duplicateSelection}
+          onOpenProperties={() => setPropertiesFocusToken((t) => t + 1)}
+          onZoomChange={setZoomScale}
+          onCursorChange={(pos) => cursorStore.current?.set(pos)}
         />
         <div className="tileLayer">
           {tiles.map((tile) => (
@@ -1339,9 +1801,16 @@ export function App() {
           {activeLevel.components.length} comp · {activeLevel.wires.length} wires
           {selectedIds.size > 0 ? ` · ${selectedIds.size} selected` : ""}
         </span>
-        <span style={{ flex: 1 }} />
+        {cursorStore.current ? <CursorReadout store={cursorStore.current} /> : null}
+        <span className="statusbar__slot statusbar__slot--mono" style={{ minWidth: 70 }} title="Zoom (Space = fit)">
+          {Math.round(zoomScale * 100)}%
+        </span>
         <span className="statusbar__slot">
-          Shift+click: multi-select · drag: marquee · Ctrl+C/V: copy/paste · Ctrl+R: rotate · Ctrl+E: mirror · Ctrl+Z: rollback · Del: delete
+          {wireTool ? "Wire tool" : probeMode ? "Probe" : pendingDevice ? `Placing ${pendingDevice}` : netlistMode === "netlist" ? "Netlist mode" : "Select"}
+        </span>
+        <span style={{ flex: 1 }} />
+        <span className="statusbar__slot statusbar__hint">
+          W wire · R rotate · Ctrl+E mirror · Ctrl+D duplicate · Ctrl+Z/Y undo/redo · Space fit · right-drag pan · double-click edit
         </span>
       </div>
     </div>

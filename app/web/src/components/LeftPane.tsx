@@ -5,7 +5,6 @@ import {
   CanvasComponent,
   DeviceType,
   SchematicLevel,
-  SchematicPreset,
   DEVICE_LABELS
 } from "../lib/schematic";
 import { drawPalettePreview } from "../lib/symbols";
@@ -13,8 +12,6 @@ import { drawPalettePreview } from "../lib/symbols";
 type Props = {
   analysis: AnalysisState;
   onAnalysisChange: (patch: Partial<AnalysisState>) => void;
-  presets: SchematicPreset[];
-  onLoadPreset: (id: string) => void;
   onRun: () => void;
   running: boolean;
   availableNodes: string[];
@@ -38,6 +35,8 @@ type Props = {
 
   selectedComponent: CanvasComponent | null;
   onUpdateComponent: (id: string, patch: Partial<CanvasComponent>) => void;
+  /** Bumped when the user double-clicks a part: expands and focuses Properties. */
+  propertiesFocusToken: number;
 
   netlistPreview: string;
   generatedNetlist: string;
@@ -64,26 +63,6 @@ export function LeftPane(props: Props) {
           onRun={props.onRun}
           running={props.running}
         />
-        <div className="formRow" style={{ marginTop: 8 }}>
-          <label>Preset</label>
-          <select
-            className="select"
-            defaultValue=""
-            onChange={(e) => {
-              if (e.target.value) props.onLoadPreset(e.target.value);
-              e.currentTarget.value = "";
-            }}
-          >
-            <option value="" disabled>
-              Load preset…
-            </option>
-            {props.presets.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.title}
-              </option>
-            ))}
-          </select>
-        </div>
       </CollapsibleSection>
 
       <CollapsibleSection title="Hierarchy" defaultOpen>
@@ -97,13 +76,9 @@ export function LeftPane(props: Props) {
         />
       </CollapsibleSection>
 
-      <CollapsibleSection title="Visualization">
-        <div className="hintText">
-          Simulations open draggable result tiles. .op shows matrix tables and
-          operating-point lists; waveform analyses use plots.
-        </div>
-        <div className="formRow" style={{ marginTop: 10 }}>
-          <label>Netlist</label>
+      <CollapsibleSection title="Netlist">
+        <div className="hintText" style={{ marginTop: 0, marginBottom: 8 }}>
+          Generated SPICE netlist after a run. Edit it to switch to raw netlist mode.
         </div>
         <textarea
           className="textarea miniPreview netlistEditor"
@@ -130,11 +105,17 @@ export function LeftPane(props: Props) {
       </CollapsibleSection>
 
       {props.selectedComponent ? (
-        <CollapsibleSection title={`Properties — ${props.selectedComponent.name}`} defaultOpen>
+        <CollapsibleSection
+          title={`Properties — ${props.selectedComponent.name}`}
+          defaultOpen
+          openToken={props.propertiesFocusToken}
+          id="properties-section"
+        >
           <PropertyEditor
             component={props.selectedComponent}
             levels={props.levels}
             onUpdate={(patch) => props.onUpdateComponent(props.selectedComponent!.id, patch)}
+            focusToken={props.propertiesFocusToken}
           />
         </CollapsibleSection>
       ) : null}
@@ -200,20 +181,47 @@ function sourceSubtypePatch(component: CanvasComponent, subtype: string): Partia
 function CollapsibleSection({
   title,
   defaultOpen,
+  openToken,
+  id,
   children
 }: {
   title: string;
   defaultOpen?: boolean;
+  /** When this value changes the section expands (used for double-click → Properties). */
+  openToken?: number;
+  id?: string;
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(!!defaultOpen);
+  useEffect(() => {
+    if (openToken) setOpen(true);
+  }, [openToken]);
   return (
-    <div className={`section ${open ? "" : "collapsed"}`}>
-      <div className="section__header" onClick={() => setOpen((v) => !v)}>
+    <div className={`section ${open ? "" : "collapsed"}`} id={id}>
+      <button
+        type="button"
+        className="section__header"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+      >
         <span>{title}</span>
         <span className="chev">▾</span>
-      </div>
+      </button>
       <div className="section__body">{children}</div>
+    </div>
+  );
+}
+
+/** Secondary disclosure used for advanced solver options inside a section. */
+function SubPanel({ title, children, defaultOpen }: { title: string; children: ReactNode; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(!!defaultOpen);
+  return (
+    <div className={`subPanel ${open ? "open" : ""}`}>
+      <button type="button" className="subPanel__header" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <span className="chev">▾</span>
+        <span>{title}</span>
+      </button>
+      {open ? <div className="subPanel__body">{children}</div> : null}
     </div>
   );
 }
@@ -357,9 +365,70 @@ function SimulationControls({
         </>
       )}
 
-      <div className="controlBlock">
-        <div className="hintText" style={{ marginBottom: 6 }}>
-          Dynamic display — add display nodes and press the toolbar play icon, or use probe to click a pin.
+      <div className="formRow" style={{ flexDirection: "column", alignItems: "stretch" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <span className="fieldLabel" style={{ flex: 1 }}>Display nodes</span>
+          <button
+            className="ghostBtn"
+            type="button"
+            onClick={onClearProbeNodes}
+            disabled={analysis.probeNodes.length === 0}
+          >
+            Clear
+          </button>
+        </div>
+        <div style={{ display: "flex", flexWrap: "wrap" }}>
+          {analysis.probeNodes.length === 0 ? (
+            <span className="hintText" style={{ marginLeft: 0 }}>
+              Empty = show all.
+            </span>
+          ) : (
+            analysis.probeNodes.map((n) => (
+              <span key={n} className="tag">
+                {n}
+                <button onClick={() => onRemoveProbeNode(n)} aria-label="Remove">
+                  ×
+                </button>
+              </span>
+            ))
+          )}
+        </div>
+        <select
+          className="select"
+          defaultValue=""
+          onChange={(e) => {
+            if (e.target.value) onAddProbeNode(e.target.value);
+            e.currentTarget.value = "";
+          }}
+          style={{ marginTop: 6 }}
+        >
+          <option value="" disabled>
+            Add node…
+          </option>
+          {availableNodes
+            .filter((n) => !analysis.probeNodes.includes(n))
+            .map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+        </select>
+      </div>
+
+      <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+        <button className="runBtn" disabled={running} onClick={onRun} style={{ flex: 1, width: "auto" }}>
+          {running ? "Running…" : `Run .${analysis.mode}`}
+        </button>
+        <button className="ghostBtn" type="button" onClick={onResetAnalysis} title="Reset simulation controls to defaults">
+          Reset
+        </button>
+      </div>
+
+      <div className="controlDivider" />
+      <div className="fieldLabel" style={{ marginBottom: 4 }}>Advanced</div>
+      <SubPanel title="Dynamic display">
+        <div className="hintText" style={{ marginTop: 0, marginBottom: 6 }}>
+          Live streaming .tran: add display nodes and press the toolbar play icon, or use probe to click a pin.
         </div>
         <div className="formRow">
           <label title="Simulation seconds per real-time second. e.g. 1m = 1ms of sim per 1 s of wall time.">
@@ -382,14 +451,12 @@ function SimulationControls({
             placeholder="5m"
           />
         </div>
-      </div>
+      </SubPanel>
 
-      <div className="controlDivider" />
-
-      <div className="controlBlock">
+      <SubPanel title="Krylov subspace solver">
         <div className="formRow">
           <label title="Enable a Krylov subspace iterative solver for the full MNA system. Auto chooses by matrix class; manual algorithm selection overrides the class.">
-            Krylov subspace solver
+            Enable
           </label>
           <input
             type="checkbox"
@@ -448,14 +515,12 @@ function SimulationControls({
             ? `${krylovHint} Auto rank resolves to ceil(50% of matrix dimension).`
             : "Krylov subspace solver disabled: simulations use the regular direct solver path."}
         </div>
-      </div>
+      </SubPanel>
 
-      <div className="controlDivider" />
-
-      <div className="controlBlock">
+      <SubPanel title="Model-order reduction (MOR)">
         <div className="formRow">
           <label title="Enable model-order reduction for a few selected outputs.">
-            MOR
+            Enable
           </label>
           <input
             type="checkbox"
@@ -508,7 +573,7 @@ function SimulationControls({
             ) : null}
             <div className="formRow" style={{ flexDirection: "column", alignItems: "stretch" }}>
               <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                <label style={{ marginBottom: 0, flex: 1 }}>MOR outputs</label>
+                <span className="fieldLabel" style={{ flex: 1 }}>MOR outputs</span>
                 <button
                   className="ghostBtn"
                   type="button"
@@ -562,66 +627,8 @@ function SimulationControls({
             ? "Reduced results contain only MOR outputs. Display nodes must be empty or a subset of those outputs."
             : "MOR disabled: full MNA state is solved and available."}
         </div>
-      </div>
+      </SubPanel>
 
-      <div className="formRow" style={{ flexDirection: "column", alignItems: "stretch" }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-          <label style={{ marginBottom: 0, flex: 1 }}>Display nodes</label>
-          <button
-            className="ghostBtn"
-            type="button"
-            onClick={onClearProbeNodes}
-            disabled={analysis.probeNodes.length === 0}
-          >
-            Clear
-          </button>
-        </div>
-        <div style={{ display: "flex", flexWrap: "wrap" }}>
-          {analysis.probeNodes.length === 0 ? (
-            <span className="hintText" style={{ marginLeft: 0 }}>
-              Empty = show all.
-            </span>
-          ) : (
-            analysis.probeNodes.map((n) => (
-              <span key={n} className="tag">
-                {n}
-                <button onClick={() => onRemoveProbeNode(n)} aria-label="Remove">
-                  ×
-                </button>
-              </span>
-            ))
-          )}
-        </div>
-        <select
-          className="select"
-          defaultValue=""
-          onChange={(e) => {
-            if (e.target.value) onAddProbeNode(e.target.value);
-            e.currentTarget.value = "";
-          }}
-          style={{ marginTop: 6 }}
-        >
-          <option value="" disabled>
-            Add node…
-          </option>
-          {availableNodes
-            .filter((n) => !analysis.probeNodes.includes(n))
-            .map((n) => (
-              <option key={n} value={n}>
-                {n}
-              </option>
-            ))}
-        </select>
-      </div>
-
-      <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-        <button className="runBtn" disabled={running} onClick={onRun} style={{ flex: 1, width: "auto" }}>
-          {running ? "Running…" : `Run ${analysis.mode}`}
-        </button>
-        <button className="ghostBtn" type="button" onClick={onResetAnalysis}>
-          Clear
-        </button>
-      </div>
     </>
   );
 }
@@ -781,12 +788,23 @@ function LibItem({ type, onClick }: { type: DeviceType; onClick: () => void }) {
 function PropertyEditor({
   component,
   levels,
-  onUpdate
+  onUpdate,
+  focusToken
 }: {
   component: CanvasComponent;
   levels: SchematicLevel[];
   onUpdate: (patch: Partial<CanvasComponent>) => void;
+  focusToken?: number;
 }) {
+  const firstInputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (!focusToken) return;
+    const el = firstInputRef.current;
+    if (!el) return;
+    el.scrollIntoView({ block: "center" });
+    el.focus();
+    el.select();
+  }, [focusToken]);
   const isSource = component.type === "V" || component.type === "I";
   const isControlled = component.type === "VCVS" || component.type === "VCCS";
   const isCurrentControlled = component.type === "CCCS" || component.type === "CCVS";
@@ -800,7 +818,7 @@ function PropertyEditor({
   const updateMetadata = (key: string, value: string) =>
     onUpdate({ metadata: { ...(component.metadata ?? {}), [key]: value } });
   const updateBjtModel = (model: "small_signal" | "level1") => {
-    const metadata = { ...(component.metadata ?? {}), model };
+    const metadata: Record<string, string> = { ...(component.metadata ?? {}), model };
     if (model === "level1") {
       onUpdate({
         metadata: {
@@ -834,7 +852,7 @@ function PropertyEditor({
     }
   };
   const updateMosModel = (model: "small_signal" | "level1") => {
-    const metadata = { ...(component.metadata ?? {}), model };
+    const metadata: Record<string, string> = { ...(component.metadata ?? {}), model };
     if (model === "level1") {
       onUpdate({
         metadata: { ...metadata, cgs: metadata.cgs ?? "2p", cgd: metadata.cgd ?? "1p" },
@@ -867,6 +885,7 @@ function PropertyEditor({
       <div className="formRow">
         <label>{isSubckt ? "displayed_name" : isLabel ? "text" : isNode ? "node" : "Name"}</label>
         <input
+          ref={firstInputRef}
           className="input"
           value={component.name}
           onChange={(e) => onUpdate({ name: e.target.value })}

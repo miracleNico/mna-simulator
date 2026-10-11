@@ -15,7 +15,7 @@ dependencies = [
   "matplotlib",
   "pydantic>=2,<3",
   "fastapi>=0.100,<1",
-  "uvicorn>=0.20,<1",
+  "uvicorn[standard]>=0.20,<1",
 ]
 
 [project.optional-dependencies]

@@ -26,7 +26,9 @@ The project includes:
 - **Large RLC benchmark demo:** the 23x23 distributed RLC mesh produces a 1035-unknown sparse MNA system for Krylov/MINRES benchmarking.
 - **Editable netlist mode:** the web app can switch from schematic mode to raw netlist editing after a confirmation that clears the schematic hierarchy.
 - **Interactive visualization:** `.op`, `.tran`, `.ac`, `.hb`, and `.dyn` results render in movable plot tiles, with selectable display nodes.
-- **In-app user guide:** toolbar Help opens a detailed guide for demos, schematic editing, hierarchy, analysis modes, visualization, Krylov controls, and raw netlist mode.
+- **LTspice-style schematic editing:** wire tool with corners and T-junction taps, junction dots, open-pin markers, sticky part placement with rotate/mirror on the cursor, undo/redo, duplicate, zoom-to-fit, right-drag pan, and working File / Edit / View / Simulate menus with keyboard shortcuts.
+- **Workspace files:** save and reopen the whole hierarchy plus analysis settings as JSON, and export the generated SPICE netlist.
+- **In-app user guide:** toolbar Help (F1) opens a detailed guide for demos, schematic editing, hierarchy, analysis modes, visualization, Krylov controls, and raw netlist mode.
 
 ## Repository Layout
 
@@ -37,6 +39,7 @@ The project includes:
 - `benchmarks/`: lightweight benchmark entry points.
 - `legacy/`: older simulator snapshots kept for comparison.
 - `USER_GUIDE.md`: user-facing web-app guide mirrored by the in-app Help dialog.
+- `DESIGN_AUDIT.md`: front end design audit, changes made, and LTspice feature comparison.
 - `STRUCT.md`: file-by-file architecture reference.
 
 ## Quick Start
