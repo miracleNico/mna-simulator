@@ -133,11 +133,14 @@ def test_available_core_units_match_reference_at_full_size(unit_id: str) -> None
 
 
 def test_unavailable_core_raises_with_phase() -> None:
-    unit = perf_units.get_unit("tpwl_train_sram_248")
+    pending = [unit for unit in perf_units.UNITS.values() if _is_unavailable(unit)]
+    if not pending:
+        pytest.skip("every unit has a native implementation")
+    unit = pending[0]
     with pytest.raises(UnitUnavailable) as info:
         unit.core(None, 1)
-    assert info.value.phase == "P5"
-    assert compare_backends.unavailable_tag(str(info.value)) == "P5"
+    assert info.value.phase == unit.phase
+    assert compare_backends.unavailable_tag(str(info.value)) == unit.phase
 
 
 def test_parity_metrics() -> None:
