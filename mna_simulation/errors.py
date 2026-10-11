@@ -37,7 +37,9 @@ def error_handler(message: str) -> None:
         code = "UNKNOWN"
         msg = message
 
-    if code in {"NETLIST_FATAL", "PARSE_ERROR", "COMPONENT_ERROR", "MODEL_ERROR", "MOR_CONFIG"}:
+    # TRAN_ERROR (bad t_stop / t_step) is an input error like MOR_CONFIG
+    # (CPP_MIGRATION_PLAN.md section 2.4.1).
+    if code in {"NETLIST_FATAL", "PARSE_ERROR", "COMPONENT_ERROR", "MODEL_ERROR", "MOR_CONFIG", "TRAN_ERROR"}:
         raise NetlistError(msg, code=code)
 
     if code in {

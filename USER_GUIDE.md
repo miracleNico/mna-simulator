@@ -55,6 +55,7 @@ This guide explains the normal web-app workflow for drawing circuits, running an
 - `.ac` first solves `.op`, then linearizes nonlinear devices around that bias and sweeps frequency.
 - `.hb` solves steady-state harmonic balance. Supplying a time window reconstructs a time-domain waveform from harmonic-balance coefficients.
 - `.dyn` is the frontend dynamic display path. It streams transient samples through the backend websocket.
+- API callers that pass options directly: booleans such as `use_krylov` must be `true`/`false` (or `yes/no/on/off/1/0`), counts must be whole numbers, and times/frequencies may use metric suffixes like `"1m"`, as in the netlist directives. Other values return HTTP 400.
 
 ## Threads
 

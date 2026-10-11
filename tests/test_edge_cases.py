@@ -6,7 +6,9 @@ numbers). Nothing here says the behaviour is *right*; ``tests/EDGE_CASES.md``
 lists each case with a "looks intentional?" verdict so the coordinator can
 decide which behaviours the new core must preserve and which it should define
 differently. When a behaviour is changed on purpose, update the test, the
-table, and (if the oracle is affected) ``tests/reference/README.md``.
+table, and (if the oracle is affected) ``tests/reference/README.md``. Tests
+commented "Decided in CPP_MIGRATION_PLAN.md 2.4.1" pin a ruling that has been
+applied; the table keeps the previous behaviour under "Was:".
 
 Conventions used below:
 
@@ -26,7 +28,7 @@ import pytest
 from mna_simulation.api.contracts import AnalysisMode, AnalysisOptions, AnalysisRequest, CircuitIR
 from mna_simulation.api.service import SimulationService
 from mna_simulation.core_basic import _mos_level1_region, build_and_run_basic
-from mna_simulation.errors import CircuitSimulatorError, NetlistError, SolverConvergenceError
+from mna_simulation.errors import NetlistError, SolverConvergenceError
 from mna_simulation.mna_builder import build_mna_problem
 from mna_simulation.netlist import parse_directive, parse_netlist_text
 from mna_simulation.solvers import (
@@ -568,18 +570,20 @@ def test_solve_transient_with_zero_t_stop_returns_only_the_initial_point() -> No
     ],
 )
 def test_transient_time_points_reject_bad_arguments_with_tran_error(t_stop, t_step, message) -> None:
-    with pytest.raises(CircuitSimulatorError) as exc:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: TRAN_ERROR is an input error, so NetlistError (was base CSE).
+    with pytest.raises(NetlistError) as exc:
         _transient_time_points(t_stop, t_step)
-    _assert_error(exc, CircuitSimulatorError, "TRAN_ERROR", message)
+    _assert_error(exc, NetlistError, "TRAN_ERROR", message)
 
 
 def test_negative_t_stop_through_core_and_service_raises_tran_error() -> None:
-    with pytest.raises(CircuitSimulatorError) as core_exc:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: NetlistError (was base CSE); the service still re-raises it.
+    with pytest.raises(NetlistError) as core_exc:
         _basic(RC, AnalysisMode.TRAN, tran_stop=-1e-3, tran_step=1e-4)
-    _assert_error(core_exc, CircuitSimulatorError, "TRAN_ERROR", "t_stop must be non-negative.")
-    with pytest.raises(CircuitSimulatorError) as svc_exc:
+    _assert_error(core_exc, NetlistError, "TRAN_ERROR", "t_stop must be non-negative.")
+    with pytest.raises(NetlistError) as svc_exc:
         _svc(RC, "tran", t_stop=-1e-3, t_step=1e-4)
-    _assert_error(svc_exc, CircuitSimulatorError, "TRAN_ERROR", "t_stop must be non-negative.")
+    _assert_error(svc_exc, NetlistError, "TRAN_ERROR", "t_stop must be non-negative.")
 
 
 def test_t_step_larger_than_t_stop_gives_a_single_step() -> None:
@@ -637,9 +641,14 @@ def test_tran_directive_defaults() -> None:
     _assert_error(exc, NetlistError, "NETLIST_FATAL", "Use .tran <time> (<step_time>).")
 
 
-def test_service_does_not_parse_string_time_options() -> None:
-    with pytest.raises(TypeError):
-        _svc(RC, "tran", t_stop="1m", t_step="1u")
+def test_service_parses_string_time_options() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: metric-suffix strings are parsed like .tran (was TypeError).
+    response = _svc(RC, "tran", t_stop="1m", t_step="0.25m")
+    assert response.waveform["time"] == pytest.approx([0.0, 2.5e-4, 5e-4, 7.5e-4, 1e-3], rel=1e-15)
+    assert _svc(RC, "tran", t_stop=" 2e-3 ", t_step=1e-3).waveform["time"] == [0.0, 1e-3, 2e-3]
+    with pytest.raises(ValueError) as exc:
+        _svc(RC, "tran", t_stop="1 ms", t_step="1u")
+    assert type(exc.value) is ValueError and str(exc.value) == "t_stop must be a number (metric suffixes allowed)"
 
 
 # ---------------------------------------------------------------------------
@@ -747,13 +756,25 @@ def test_init_condition_with_wrong_length_raises_type_error() -> None:
 
 
 def test_init_condition_json_list_through_the_service() -> None:
-    with pytest.raises(AttributeError) as exc:
-        _svc(DIODE, "op", init_condition=[5.0, 0.7, -0.004])
-    assert str(exc.value) == "'list' object has no attribute 'flatten'"
-    with pytest.raises(AttributeError):
-        _svc(RC, "tran", t_stop=2e-3, t_step=1e-3, init_condition=[1.0, 0.0, 0.0])
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: build_options turns a numeric list into a float column
+    # array (was AttributeError), and DEFAULT/RANDOM are case-insensitive through the service.
+    reference = _dc(_basic(DIODE, AnalysisMode.OP, init_condition="DEFAULT"))
+    assert _svc(DIODE, "op", init_condition=[5.0, 0.7, -0.004]).dc_solution == pytest.approx(reference, **NL)
+    tran = _svc(RC, "tran", t_stop=2e-3, t_step=1e-3, init_condition=[1.0, 0.0, 0.0])
+    assert tran.metadata["op_used"] is False
+    np.testing.assert_allclose(
+        tran.waveform["values"], [[1.0, 1.0, 1.0], [0.0, 0.5, 0.75], [0.0, -5e-4, -2.5e-4]], rtol=1e-12, atol=1e-15
+    )
     linear = _svc("V1 a 0 DC 5\nR1 a 0 1k\n", "op", init_condition=[123.0, 456.0])
     assert linear.dc_solution == pytest.approx([5.0, -5e-3], **LIN)
+    assert _svc(DIODE, "op", init_condition=" default ").dc_solution == pytest.approx(reference, **NL)
+    # Length validation is still the solvers' job (P3 ruling): a short list fails inside the solve.
+    with pytest.raises(TypeError):
+        _svc(DIODE, "op", init_condition=[1.0, 2.0])
+    with pytest.raises(ValueError) as exc:
+        _svc("V1 a 0 DC 5\nR1 a 0 1k\n", "op", init_condition="garbage")
+    assert type(exc.value) is ValueError
+    assert str(exc.value) == "init_condition must be 'DEFAULT', 'RANDOM', or a numeric array"
 
 
 # ---------------------------------------------------------------------------
@@ -851,8 +872,11 @@ def test_krylov_non_convergence_falls_back_to_the_direct_solve() -> None:
     [
         (0, "krylov_rank must be 'auto' or a positive integer."),
         (-3, "krylov_rank must be 'auto' or a positive integer."),
-        ("abc", "invalid literal for int() with base 10: 'abc'"),
-        ("", "invalid literal for int() with base 10: ''"),
+        # Decided in CPP_MIGRATION_PLAN.md 2.4.1: strict integers (was int()'s message; 2.7 was truncated).
+        ("abc", "krylov_rank must be an integer"),
+        ("", "krylov_rank must be an integer"),
+        (2.7, "krylov_rank must be an integer"),
+        ("2.5", "krylov_rank must be an integer"),
     ],
 )
 def test_invalid_krylov_rank_raises_plain_value_error(rank, message: str) -> None:
@@ -863,7 +887,8 @@ def test_invalid_krylov_rank_raises_plain_value_error(rank, message: str) -> Non
 
 @pytest.mark.parametrize(
     ("rank", "resolved", "mode"),
-    [(2.7, 2, "manual"), (None, 2, "auto"), ("AUTO", 2, "auto"), ("  auto ", 2, "auto")],
+    # 2.7 is now rejected (see above); integral floats and strings are accepted (2.4.1).
+    [(2.0, 2, "manual"), ("1", 1, "manual"), (None, 2, "auto"), ("AUTO", 2, "auto"), ("  auto ", 2, "auto")],
 )
 def test_krylov_rank_coercion(rank, resolved: int, mode: str) -> None:
     md = _svc(KRYLOV_NET, "op", use_krylov=True, krylov_rank=rank).metadata
@@ -892,9 +917,14 @@ def test_krylov_method_aliases(method, used: str, requested: str) -> None:
     assert (md["krylov_method"], md["krylov_requested_method"]) == (used, requested)
 
 
-def test_use_krylov_string_false_enables_krylov() -> None:
-    assert _svc(KRYLOV_NET, "op", use_krylov="false").metadata["linear_solver"] == "krylov"
-    assert _svc(KRYLOV_NET, "op", krylov="no").metadata["linear_solver"] == "krylov"
+def test_use_krylov_string_false_keeps_krylov_off() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: strict booleans (was bool("false") is True, Krylov ON).
+    assert "linear_solver" not in _svc(KRYLOV_NET, "op", use_krylov="false").metadata
+    assert "linear_solver" not in _svc(KRYLOV_NET, "op", krylov="no").metadata
+    assert _svc(KRYLOV_NET, "op", use_krylov="True").metadata["linear_solver"] == "krylov"
+    with pytest.raises(ValueError) as exc:
+        _svc(KRYLOV_NET, "op", use_krylov="maybe")
+    assert type(exc.value) is ValueError and str(exc.value) == "use_krylov must be a boolean"
 
 
 # ---------------------------------------------------------------------------
@@ -1046,10 +1076,15 @@ def test_ac_sweep_is_linear_and_accepts_descending_and_negative_frequencies() ->
     assert negative.spectrum["magnitudes"][1] == pytest.approx([_rc_mag(10.0), 1.0, _rc_mag(10.0)], rel=1e-12)
 
 
-@pytest.mark.parametrize("points", [2.5, "3"])
-def test_ac_points_must_be_an_integer(points) -> None:
-    with pytest.raises(TypeError):
-        _svc(AC_NET, "ac", f_start=1, f_stop=10, points=points)
+def test_ac_points_must_be_an_integer() -> None:
+    # Decided in CPP_MIGRATION_PLAN.md 2.4.1: integral strings/floats are coerced, the rest is a
+    # plain ValueError (was TypeError from np.linspace for both 2.5 and "3").
+    for points in ("3", 3.0):
+        assert _svc(AC_NET, "ac", f_start=1, f_stop=10, points=points).spectrum["frequencies"] == [1.0, 5.5, 10.0]
+    for points in (2.5, "2.5"):
+        with pytest.raises(ValueError) as exc:
+            _svc(AC_NET, "ac", f_start=1, f_stop=10, points=points)
+        assert type(exc.value) is ValueError and str(exc.value) == "points must be an integer"
 
 
 def test_ac_without_an_ac_source_returns_zero_magnitudes() -> None:

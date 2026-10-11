@@ -105,6 +105,7 @@ Schematic runs return the generated canonical netlist in response metadata. Simu
 - `mor_validate`: when true, requires `probe_nodes` to be a subset of `mor_output_nodes`.
 - `probe_nodes`: optional labels such as `V(n1)` or `I(L1)` for result filtering.
 - `output_max_points`: optional waveform decimation limit for API responses.
+- Option values are type-checked: booleans take `true`/`false` (also `yes/no/on/off/1/0`, any case), counts take whole numbers (`3`, `"3"`, `3.0`), time/frequency values (`t_stop`, `t_step`, `f_start`, `f_stop`, `time_window`) and tolerances take numbers or metric strings such as `"1m"`, and `init_condition` takes `DEFAULT`, `RANDOM` (any case) or a list of numbers. Anything else returns HTTP 400 (`INVALID_OPTIONS`).
 
 ## Threads and Concurrency
 

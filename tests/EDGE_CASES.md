@@ -13,6 +13,10 @@ decision:
   `tests/reference/README.md`.
 - **unclear**: a defensible design choice that differs from SPICE or from a neighbouring
   code path. The coordinator should decide and record the decision.
+- **decided: ... (2.4.1)**: the ruling in `CPP_MIGRATION_PLAN.md` section 2.4.1 has been
+  applied to `mna_simulation`. "Current behaviour" gives the new behaviour; "Was:" keeps
+  what the frozen oracle still does. Rulings scheduled for a later phase keep their old
+  verdict until they land.
 
 Notation: *basic* = `core_basic.build_and_run_basic` at gmin=0. *service* =
 `SimulationService.run_request`, which retries over `DEFAULT_GMIN_STEPS = [0, 1e-12, ..., 1e-5]`
@@ -38,13 +42,25 @@ Test ids are functions in `tests/test_edge_cases.py`.
    step raises raw `numpy.linalg.LinAlgError` at gmin 0, which the service then hides by
    succeeding at gmin=1e-12. String `t_stop` and float `points` raise `TypeError`. A JSON list
    `init_condition` raises `AttributeError`.
+   **Decided (2.4.1), applied for the option part:** `build_options` parses time/frequency
+   strings with metric suffixes (`"1m"` is 1e-3), coerces integral `points` (`"3"`, `3.0`),
+   rejects non-integral ones with a plain `ValueError` (HTTP 400), and turns a numeric list
+   `init_condition` into a float column array. R=0 and the singular transient step are
+   P2/P3 items.
 6. **Non-finite results come back as `status="ok"`.** `V1 a 0 DC 1e999` returns
    `[nan, -inf]`, and `FUNC 0 nan` returns an all-NaN waveform.
 7. **`init_condition` is handled inconsistently.** Strings are ignored on linear `.op` and on
    every `.tran`. They are validated only on nonlinear `.op` (case-sensitive). A wrong-length
    array raises `TypeError` from the lambdified function.
+   **Decided (2.4.1), applied at the request level:** `build_options` upper-cases
+   `DEFAULT`/`RANDOM` and rejects any other string with a plain `ValueError`, so requests no
+   longer reach the core with an ignored or case-mismatched string. The core-level handling
+   and the length check are P3 items.
 8. **Options are not type-checked.** `use_krylov="false"` (or `krylov="no"`) turns Krylov ON
    because `bool("false")` is true, and `krylov_rank=2.7` is silently truncated to 2.
+   **Decided (2.4.1), applied:** strict booleans (`true/false/yes/no/on/off/1/0`, any case)
+   and strict integers (integral floats/strings accepted); anything else is a plain
+   `ValueError` that the HTTP layer answers with 400.
 
 ## Table
 
@@ -117,15 +133,15 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | --- | --- | --- | --- |
 | `_transient_time_points(0, h)` | `[0.0]` | `test_transient_time_points_with_zero_t_stop` | yes |
 | `solve_transient(t_stop=0)` directly | One sample: the DC operating point | `test_solve_transient_with_zero_t_stop_returns_only_the_initial_point` | yes |
-| Negative `t_stop`, `t_step <= 0` (direct) | Base `CSE` with code `TRAN_ERROR` ("t_stop must be non-negative." / "t_step must be positive."). `error_handler` has no mapping for `TRAN_ERROR`, so it is neither `NetlistError` nor `SCE` | `test_transient_time_points_reject_bad_arguments_with_tran_error` | unclear |
-| Negative `t_stop` via *basic* / *service* | Same `CSE` `TRAN_ERROR` (the service re-raises it after trying every gmin) | `test_negative_t_stop_through_core_and_service_raises_tran_error` | yes |
+| Negative `t_stop`, `t_step <= 0` (direct) | `NetlistError` with code `TRAN_ERROR` ("t_stop must be non-negative." / "t_step must be positive."). Was: base `CSE`, because `error_handler` had no mapping for `TRAN_ERROR` | `test_transient_time_points_reject_bad_arguments_with_tran_error` | decided: NetlistError (2.4.1) |
+| Negative `t_stop` via *basic* / *service* | Same `NetlistError` `TRAN_ERROR` (the service re-raises it after trying every gmin; HTTP 400 with the code). Was: base `CSE` | `test_negative_t_stop_through_core_and_service_raises_tran_error` | decided: NetlistError (2.4.1) |
 | `t_step > t_stop` | `[0, t_stop]` (one shortened step) | `test_t_step_larger_than_t_stop_gives_a_single_step` | yes |
 | `t_step` not dividing `t_stop` | Grid ends exactly at `t_stop` with a shorter last step: `(1e-3, 3e-4)` gives 5 points | `test_t_step_not_dividing_t_stop_ends_exactly_at_t_stop` | yes |
 | Grid construction | Repeated addition, not `i*h`: `(1.0, 0.1)` gives `0.30000000000000004`, `0.7999999999999999`, ... A bit-exact port must accumulate the same way | `test_time_grid_is_built_by_repeated_addition` | unclear |
 | Snapping tolerance `max(|t_stop|, |t_step|, eps) * 1e-9` | Overshoot inside it snaps (11 points). Just outside it, an extra ~1e-11 s step is appended (12 points; a tiny BE step makes C/h huge). Undershoot shortens the last step | `test_time_grid_snapping_tolerance_is_1e_minus_9_relative` | unclear |
 | `tran_stop=0` / unset / `tran_step=0` via *basic* | `or` substitution: `t_stop` becomes 0.1 s, `t_step` becomes 1e-5 (so `.tran 0` would run 10 001 steps) | `test_core_basic_replaces_falsy_tran_stop_and_tran_step_with_defaults` | no |
 | `.tran 0`, `.tran 1m`, bare `.tran` | `{t_stop: 0, t_step: 1e-5}`, `{1e-3, 1e-5}`, `NETLIST_FATAL` "Use .tran <time> (<step_time>)." | `test_tran_directive_defaults` | yes |
-| Service options `t_stop="1m"` | Not parsed: `TypeError` ("'<' not supported ...") | `test_service_does_not_parse_string_time_options` | no |
+| Service options `t_stop="1m"` | Parsed by `build_options` with `parse_value`, like `.tran` (`"1m"` is 1e-3; also `t_step`, `f_start`, `f_stop`, `time_window`, `krylov_tol`, `v_tol`, `f_tol`). An unparsable string is a plain `ValueError` "t_stop must be a number (metric suffixes allowed)". Was: not parsed, `TypeError` ("'<' not supported ...") | `test_service_parses_string_time_options` (was `test_service_does_not_parse_string_time_options`) | decided: coerce (2.4.1) |
 
 ### Non-convergence
 
@@ -142,11 +158,11 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
 | `"DEFAULT"`, `"RANDOM"` (global NumPy RNG), ndarray start | Same operating point. The array is copied, not mutated | `test_init_condition_default_random_and_array_reach_the_same_point` | yes |
-| Unknown string, or lowercase `"default"` / `"random"`, on nonlinear `.op` | `NetlistError` `NETLIST_FATAL` "Unsupported init condition 'x'." | `test_init_condition_unknown_string_raises_on_nonlinear_op` | yes |
-| Any string on linear `.op`, or on any `.tran` | Silently ignored | `test_init_condition_strings_are_ignored_on_linear_op_and_on_tran` | no |
+| Unknown string, or lowercase `"default"` / `"random"`, on nonlinear `.op` | `NetlistError` `NETLIST_FATAL` "Unsupported init condition 'x'." (core level). Through the service, `build_options` now upper-cases `default`/`random` and rejects other strings first (row "JSON list" below) | `test_init_condition_unknown_string_raises_on_nonlinear_op` | yes |
+| Any string on linear `.op`, or on any `.tran` | Silently ignored (core level; the P3 ruling changes it). Through the service an unknown string no longer gets here: `build_options` raises a plain `ValueError` | `test_init_condition_strings_are_ignored_on_linear_op_and_on_tran` | no (core part: P3) |
 | ndarray on `.tran` | Used as the t=0 state. No OP is computed (`op_used=False`) | `test_init_condition_array_sets_the_transient_initial_state` | yes |
 | ndarray of the wrong length | `TypeError` from the lambdified function | `test_init_condition_with_wrong_length_raises_type_error` | no |
-| JSON list through the service | Nonlinear `.op` / `.tran`: `AttributeError` "'list' object has no attribute 'flatten'" after every gmin. Linear `.op`: ignored | `test_init_condition_json_list_through_the_service` | no |
+| JSON list through the service | `build_options` converts a numeric list/tuple to a float column array, so nonlinear `.op` and `.tran` use it like an ndarray; linear `.op` ignores it. Other strings than `DEFAULT`/`RANDOM` (any case) and non-numeric lists are a plain `ValueError` "init_condition must be 'DEFAULT', 'RANDOM', or a numeric array". A wrong-length list still fails inside the solve (`TypeError`; length validation is P3). Was: `AttributeError` "'list' object has no attribute 'flatten'" after every gmin | `test_init_condition_json_list_through_the_service` | decided: lists accepted (2.4.1) |
 
 ### `probe_nodes`, output decimation
 
@@ -165,12 +181,12 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | Case | Current behaviour | Test id | Looks intentional? |
 | --- | --- | --- | --- |
 | `krylov_max_iter=1`, rank 1 on a general 3x3 | GMRES fails, so it falls back to the direct solve (exact answer). `krylov_converged=False`, `krylov_used_direct_fallback=True` | `test_krylov_non_convergence_falls_back_to_the_direct_solve` | yes |
-| `krylov_rank` 0 / -3 / `"abc"` / `""` | Plain `ValueError` from `build_options`, raised before the gmin loop. No `.code` | `test_invalid_krylov_rank_raises_plain_value_error` | unclear (not a `CSE`) |
-| `krylov_rank` 2.7 / None / `"AUTO"` / `" auto "` | 2 manual (truncated) / auto / auto / auto | `test_krylov_rank_coercion` | 2.7: no; rest: yes |
+| `krylov_rank` 0 / -3 / `"abc"` / `""` / 2.7 / `"2.5"` | Plain `ValueError` from `build_options`, raised before the gmin loop. No `.code`. 0 / -3: "krylov_rank must be 'auto' or a positive integer."; the rest: "krylov_rank must be an integer". Was: `int()`'s "invalid literal ..." message for `"abc"`/`""`, and 2.7 truncated | `test_invalid_krylov_rank_raises_plain_value_error` | decided: plain ValueError, HTTP 400 (2.4.1) |
+| `krylov_rank` 2.0 / `"1"` / None / `"AUTO"` / `" auto "` | 2 manual / 1 manual / auto / auto / auto (integral floats and strings accepted; same rule for `krylov_max_iter`, `krylov_restart`, `max_iter`, `points`, `harmonics`, `mor_order`). Was: 2.7 gave 2 manual (truncated) | `test_krylov_rank_coercion` | decided: strict integers (2.4.1) |
 | Only `krylov_restart` given | Used as a manual rank | `test_krylov_restart_alone_sets_a_manual_rank` | yes |
-| `krylov_method` `"foo"` / `"hermitian"` | `ValueError` "Unknown Krylov method 'x'." even with `use_krylov=False`. `hermitian` is accepted by `solvers._krylov_route` but not by the backend alias table | `test_invalid_krylov_method_raises_even_when_krylov_is_off` | unclear |
+| `krylov_method` `"foo"` / `"hermitian"` | `ValueError` "Unknown Krylov method 'x'." even with `use_krylov=False`. `hermitian` is accepted by `solvers._krylov_route` but not by the backend alias table | `test_invalid_krylov_method_raises_even_when_krylov_is_off` | decided: preserve the validation (2.4.1) |
 | `krylov_method` aliases (`GMRES`, `minres`, None, `""`) | Normalised. `minres` maps to `conjugate_residual` | `test_krylov_method_aliases` | yes |
-| `use_krylov="false"`, `krylov="no"` | Krylov ON (`bool()` of a non-empty string) | `test_use_krylov_string_false_enables_krylov` | no |
+| `use_krylov="false"`, `krylov="no"` | Krylov OFF. Booleans (`use_krylov`/`krylov`, `use_mor`/`mor`, `mor_validate`) accept bools, 0/1 and `true/false/yes/no/on/off/1/0` (case-insensitive, trimmed); anything else is a plain `ValueError` "use_krylov must be a boolean" (HTTP 400). None means unset (default). Was: Krylov ON (`bool()` of a non-empty string) | `test_use_krylov_string_false_keeps_krylov_off` (was `test_use_krylov_string_false_enables_krylov`) | decided: strict booleans (2.4.1) |
 
 ### MOR options
 
@@ -181,7 +197,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | `probe_nodes` not a subset of the outputs | `MOR_CONFIG` "Display nodes must be a subset ...". Skipped when `mor_validate=False` | `test_mor_with_probe_nodes_not_a_subset_of_outputs` | yes |
 | Output labels `"out, V(out), I(V1)"` | Bare names resolve to `V(...)`, duplicates are dropped, giving `["V(out)", "I(V1)"]` | `test_mor_output_labels_are_normalised_and_deduplicated` | yes |
 | `tpwl` on `.ac`; `linear` on nonlinear `.tran` | `MOR_CONFIG` with the pinned messages | `test_mor_method_and_mode_mismatches` | yes |
-| `mor_method="xyz"`, `mor_order=0` | Plain `ValueError` (not `MOR_CONFIG`) | `test_invalid_mor_method_and_order_raise_plain_value_error` | unclear |
+| `mor_method="xyz"`, `mor_order=0` | Plain `ValueError` (not `MOR_CONFIG`). A non-integral `mor_order` (2.5, `"2.5"`) is "mor_order must be an integer" (2.4.1) | `test_invalid_mor_method_and_order_raise_plain_value_error` | decided: preserve plain ValueError, HTTP 400 (2.4.1) |
 | MOR on `show_matrix` | `mor_used=False`, reason ".show_matrix requires the full MNA system." | `test_mor_on_show_matrix_reports_not_used` | yes |
 
 ### Harmonic balance
@@ -201,7 +217,7 @@ Test ids are functions in `tests/test_edge_cases.py`.
 | `points=1` | Single frequency `f_start` | `test_ac_single_point` | yes |
 | `f_start=0`, `f_stop=0`, `points=0` (options or `.ac 0 1k 1`) | Replaced by 1 Hz, 1 MHz and 100 points | `test_ac_falsy_start_stop_and_points_are_replaced_by_defaults` | no |
 | Sweep shape | **Linear** `np.linspace` (SPICE uses dec/oct/lin). Descending and negative frequencies are accepted (\|H(-f)\| = \|H(f)\|) | `test_ac_sweep_is_linear_and_accepts_descending_and_negative_frequencies` | linear: unclear; negative f: no |
-| `points=2.5` / `"3"` | `TypeError` from `np.linspace` | `test_ac_points_must_be_an_integer` | no |
+| `points=2.5` / `"3"` | `"3"` and `3.0` are coerced to 3; `2.5` and `"2.5"` are a plain `ValueError` "points must be an integer" (HTTP 400). Was: `TypeError` from `np.linspace` for both | `test_ac_points_must_be_an_integer` | decided: strict integers (2.4.1) |
 | No AC/SIN/COS source | All-zero magnitudes, `status="ok"` | `test_ac_without_an_ac_source_returns_zero_magnitudes` | yes |
 
 ### `show_matrix`, mode selection, source semantics
@@ -220,3 +236,9 @@ Test ids are functions in `tests/test_edge_cases.py`.
   generator skips HB on its two-diode DC string because the HB Newton is undamped.
 - `.ac` cases on circuits whose OP needs gmin stepping are avoided: with `max_iter` ignored
   (highlight 4), each failing gmin step can run 10 000 Newton iterations.
+- The oracle keeps the old option coercion and raises `TRAN_ERROR` as the base `CSE`. No
+  corpus case uses a non-canonical option value (string boolean, non-integral number,
+  string time, list `init_condition`) or reaches `TRAN_ERROR`, so the 2.4.1 option and
+  `TRAN_ERROR` changes need no corpus edits; both packages' `build_options` agree on every
+  corpus analysis. The full set of accepted and rejected forms is in
+  `tests/test_option_coercion.py`.

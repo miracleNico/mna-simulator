@@ -158,18 +158,18 @@ the oracle must follow, a CHANGELOG entry in `tests/reference/README.md`):
 | `.ac` ignores `max_iter`, `v_tol`, `f_tol` for its operating point | change: pass the options through | P3 |
 | `R = 0` raises `ZeroDivisionError` | change: `NETLIST_FATAL: '<name>' has zero resistance` from the builder, raised once (no gmin retries) | P2 cut-over |
 | Singular linear transient step raises raw `LinAlgError` | change: `NR_CONVERGENCE` with the step time in the message (gmin stepping still applies) | P3 |
-| String `t_stop` / float `points` raise `TypeError`; JSON-list `init_condition` raises `AttributeError` | change: option coercion in `build_options` (metric suffix strings accepted, lists accepted, wrong length is `NETLIST_FATAL`) | runtime work, before P3 |
+| String `t_stop` / float `points` raise `TypeError`; JSON-list `init_condition` raises `AttributeError` | change: option coercion in `build_options` (metric suffix strings accepted, lists accepted); wrong-length arrays become `NETLIST_FATAL` in P3 | applied (coercion); P3 (length check) |
 | Non-finite results returned with `status = "ok"` | change: `NR_CONVERGENCE: non-finite solution` | P3 |
 | `init_condition` strings ignored on linear `.op` and on `.tran` | change: `DEFAULT`/`RANDOM` (case-insensitive) set the Newton starting point everywhere nonlinear and are ignored with a diagnostic on linear paths; arrays are validated | P3 |
-| `use_krylov = "false"` enables Krylov; `krylov_rank = 2.7` truncated | change: strict boolean and integer coercion, `ValueError` otherwise (HTTP 400) | runtime work |
+| `use_krylov = "false"` enables Krylov; `krylov_rank = 2.7` truncated | change: strict boolean and integer coercion, `ValueError` otherwise (HTTP 400) | applied |
 | Independent current source injects into `node1` (opposite of SPICE) | preserve: project convention used by the UI, demos and every test; documented | - |
 | Floating island fails at every gmin (gmin is stamped only across C, D and transistor terminals) | change together with node-to-ground gmin above; the pinned expectation moves from "fails" to "converges at the first gmin step that regularizes it" | P3 |
 | Inductor-only loops and C-only nodes are singular at DC; `C = 0` / `L = 0` silently skipped; negative C/L accepted; negative `vth` taken as magnitude; duplicate non-branch names stamped twice | preserve (physically or conventionally defensible); a parser diagnostic for duplicate names may be added later outside the core | - |
 | Level-1 BJT Jacobian disagrees with the clipped current beyond `|vbe/vt| > 80` | change: the derivative of the clipped exponential is 0 beyond the clip (consistent Jacobian); no corpus case reaches the clip, so parity elsewhere is unaffected | P1/P2 |
-| `TRAN_ERROR` raises the base `CircuitSimulatorError` | change: map `TRAN_ERROR` to `NetlistError` (it is an input error, like `MOR_CONFIG`) | P3 |
+| `TRAN_ERROR` raises the base `CircuitSimulatorError` | change: map `TRAN_ERROR` to `NetlistError` (it is an input error, like `MOR_CONFIG`) | applied |
 | Time grid by repeated addition; snapping tolerance behaviour | preserve bit-for-bit (parity rule) | - |
 | Unknown `probe_nodes` ignored without MOR; decimation keeps the last sample so it can return `max_points + 1` | preserve (service layer, harmless) | - |
-| Invalid Krylov/MOR option values raise plain `ValueError` even when the feature is off | preserve the validation; the server maps `ValueError` to HTTP 400 | runtime work |
+| Invalid Krylov/MOR option values raise plain `ValueError` even when the feature is off | preserve the validation; the server maps tagged option `ValueError`s to HTTP 400 | applied |
 | `.op` ignores time-dependent sources at `t = 0` while `.tran`'s initial operating point includes them | preserve (parity quirk 5 in 6.1); documented in the user guide | - |
 
 ### 2.5 Multithreading design
