@@ -104,7 +104,10 @@ builder never reads vendor syntax.
 
 Common keys: `metadata["model"]` selects the equation set, `metadata["model_name"]` is the
 card name (for messages), `metadata["area"]` (default `1`) and `metadata["m"]` (default `1`)
-are the SPICE instance multipliers. Card parameters the parser does not recognise are still
+are the SPICE instance multipliers. Ruling (M2): on a diode `metadata["m"]` is always the
+card's grading coefficient `M`, never an instance multiplier (a diode has `area` only; an
+instance `m=` on a diode line is a parser diagnostic and is dropped). On a BJT `m` multiplies
+the area, on a MOS it multiplies `beta` and the overlap capacitances. Card parameters the parser does not recognise are still
 copied into `metadata` (lowercase) and listed once per card in `CircuitIR.diagnostics`
 (`"model D1N4148: parameters ... are not used by the diode equations"`). The parser owns the
 supported-parameter lists in `mna_simulation/spice/model_cards.py`; they must match the tables
