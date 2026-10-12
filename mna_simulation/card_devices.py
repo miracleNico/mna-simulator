@@ -294,8 +294,52 @@ def _gummel_poon(component: ComponentRecord) -> CardDevice:
     return device
 
 
+#: Oxide permittivity (3.9 eps0), silicon permittivity (11.7 eps0), electron charge and the
+#: intrinsic carrier density SPICE3f5 uses to derive KP, PHI and GAMMA from a process card
+#: (``mos1temp.c``: UO in cm^2/Vs, TOX in m, NSUB in cm^-3).
+EPS_OX = 3.9 * 8.854214871e-12
+EPS_SI = 11.7 * 8.854214871e-12
+CHARGE = 1.6021918e-19
+NI_300K = 1.45e16
+
+
+def _derive_process_parameters(component: ComponentRecord, card: dict[str, float]) -> None:
+    """Fill ``kp``, ``phi`` and ``gamma`` from ``uo``/``tox``/``nsub`` when the card omits them.
+
+    SPICE3f5 at TNOM = 27 C: ``kp = uo * 1e-4 * cox``, ``phi = 2 vt ln(nsub * 1e6 / ni)``,
+    ``gamma = sqrt(2 eps_si q nsub * 1e6) / cox`` with ``cox = eps_ox / tox``. A card that
+    gives the parameter keeps it; ``vto`` is never derived (it needs the gate work function).
+    """
+
+    metadata = component.metadata
+    given = {key for key in ("kp", "phi", "gamma") if metadata.get(key) is not None}
+    if given >= {"kp", "phi", "gamma"}:
+        return
+    tox = metadata.get("tox")
+    cox = None
+    if tox is not None:
+        tox_value = parse_card_value(tox, component, "tox")
+        if not (tox_value > 0.0 and math.isfinite(tox_value)):
+            _fail(component, f"parameter tox = {tox_value!r} must be a positive finite number")
+        cox = EPS_OX / tox_value
+    uo = metadata.get("uo")
+    if "kp" not in given and cox is not None and uo is not None:
+        card["kp"] = parse_card_value(uo, component, "uo") * 1e-4 * cox
+    nsub = metadata.get("nsub")
+    if nsub is None:
+        return
+    nsub_value = parse_card_value(nsub, component, "nsub") * 1e6
+    if not (nsub_value > NI_300K and math.isfinite(nsub_value)):
+        _fail(component, f"parameter nsub = {nsub!r} must exceed the intrinsic density 1.45e10 cm^-3")
+    if "phi" not in given:
+        card["phi"] = 2.0 * CARD_VT * math.log(nsub_value / NI_300K)
+    if "gamma" not in given and cox is not None:
+        card["gamma"] = math.sqrt(2.0 * EPS_SI * CHARGE * nsub_value) / cox
+
+
 def _mos(component: ComponentRecord) -> CardDevice:
     card = _read(component, MOS_DEFAULTS, {})
+    _derive_process_parameters(component, card)
     level = card["level"]
     if level not in (1.0, 2.0, 3.0):
         _fail(component, f"MOS LEVEL {level:g} is not supported (LEVEL 1, 2 and 3 map to the Level-1 equations)")
