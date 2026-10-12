@@ -22,6 +22,12 @@ tolerance class of each case.
   a wheel. Checked on the editable install: `import mna_reference` fails outside
   the test run and the `mna-simulation` distribution records no `mna_reference`
   or `tests/` files.
+- **Python mode.** Besides the tests, the package is also imported (read-only) by
+  `mna_simulation/api/reference_service.py` when the server or CLI is started with
+  `MNA_CORE=python` / `--core python`: it appends `tests/reference` to `sys.path`
+  and serves requests with this pre-migration core. That mode therefore needs a
+  source checkout; a wheel install reports `ReferenceCoreUnavailable`. It never
+  writes here, and the rules below apply unchanged.
 - Later commits: up to `d8fb23e` ("Add native core build skeleton") the only
   change under `mna_simulation/` is the new `native/` subpackage (the C++
   extension accessor). It is deliberately not part of the oracle, which is the

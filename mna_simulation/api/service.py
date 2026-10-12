@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import time
+from collections.abc import Mapping
 from dataclasses import asdict
 from functools import lru_cache
 
@@ -54,6 +56,10 @@ def _core_version() -> str:
 class SimulationService:
     """Single orchestration entry point shared by CLI and HTTP API."""
 
+    # Which implementation produces the numbers: every analysis runs in the native core
+    # since the P5 cut-over (CPP_MIGRATION_PLAN.md section 6).
+    core_backend = "cpp"
+
     def __init__(self, backend: PythonBackend | None = None, budget: ThreadBudget | None = None) -> None:
         self.backend = backend or PythonBackend()
         self._budget = budget
@@ -104,9 +110,7 @@ class SimulationService:
                 "threads_requested": threads_requested,
                 "threads_used": threads_used,
                 "thread_budget_total": budget.total,
-                # Which implementation produced the numbers: every analysis runs in the
-                # native core since the P5 cut-over (CPP_MIGRATION_PLAN.md section 6).
-                "core_backend": "cpp",
+                "core_backend": self.core_backend,
                 "core_version": _core_version(),
                 "elapsed_ms": round(elapsed_ms, 3),
             }
@@ -167,10 +171,41 @@ class SimulationService:
             "status": "ok",
             "capabilities": asdict(self.backend.capabilities),
             "models": [model.name for model in self.backend.registry.list_models()],
+            "core_backend": self.core_backend,
             "core_version": _core_version(),
             "build_info": build_info(),
             "thread_budget": self.budget.snapshot(),
         }
+
+
+CORE_ENV_VAR = "MNA_CORE"
+CORES = ("cpp", "python")
+
+
+def resolve_core(core: str | None = None, environ: Mapping[str, str] | None = None) -> str:
+    """``core``, else ``MNA_CORE``, else ``"cpp"``; anything but ``cpp``/``python`` is a ValueError."""
+
+    if core is None:
+        core = (os.environ if environ is None else environ).get(CORE_ENV_VAR) or "cpp"
+    cleaned = core.strip().lower()
+    if cleaned not in CORES:
+        raise ValueError(f"{CORE_ENV_VAR} must be one of {', '.join(CORES)} (got {core!r})")
+    return cleaned
+
+
+def create_service(core: str | None = None, budget: ThreadBudget | None = None):  # noqa: ANN201
+    """The service for ``core`` (see :func:`resolve_core`).
+
+    ``"cpp"`` (the default) is :class:`SimulationService` on the native core;
+    ``"python"`` is :class:`~mna_simulation.api.reference_service.ReferenceSimulationService`,
+    the frozen pre-migration pure-Python core (source checkouts only).
+    """
+
+    if resolve_core(core) == "python":
+        from .reference_service import ReferenceSimulationService
+
+        return ReferenceSimulationService(budget=budget)
+    return SimulationService(budget=budget)
 
 
 def _sample_indexes(length: int, max_points: int) -> np.ndarray | None:

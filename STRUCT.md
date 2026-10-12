@@ -133,6 +133,7 @@ Every analysis runs in the mandatory C++17 extension `mna_simulation._core` (`cp
 - Commands: `run <path>` and `run-text <netlist_text>`.
 - Supports optional mode overrides and JSON output.
 - `--threads N|auto` (validated by `coerce_num_threads`) is passed as the `num_threads` request option; text output prints the threads used, requested, and the budget.
+- `--core cpp|python` picks the numerical core through `create_service` (default: `MNA_CORE`, else `cpp`); text output prints the core and its version.
 
 ## Native Package: `mna_simulation/native/`
 
@@ -178,9 +179,16 @@ Every analysis runs in the mandatory C++17 extension `mna_simulation._core` (`cp
 - Routes schematic payloads through `schematic_pipeline`.
 - Adds generated canonical netlist text to response metadata.
 - Applies optional output decimation to large waveform responses.
-- Leases threads from a `ThreadBudget` (the process default unless one is injected) and runs the backend inside `pin_blas_threads()`; adds `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend` (`"cpp"`: every analysis runs in the native core), `core_version`, and `elapsed_ms` (wall time of `backend.run`) to result metadata.
+- Leases threads from a `ThreadBudget` (the process default unless one is injected) and runs the backend inside `pin_blas_threads()`; adds `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend` (`SimulationService.core_backend`, `"cpp"`: every analysis runs in the native core), `core_version`, and `elapsed_ms` (wall time of `backend.run`) to result metadata.
 - Tags option-validation `ValueError`s with a PEP 678 note (`is_invalid_option_error`) so the HTTP layer can answer 400 without catching solver `ValueError`s.
-- `healthcheck()` also reports `core_version`, `build_info`, and the thread budget snapshot.
+- `healthcheck()` also reports `core_backend`, `core_version`, `build_info`, and the thread budget snapshot.
+- `resolve_core` / `create_service`: the core selection shared by the server and the CLI. `MNA_CORE` (`CORE_ENV_VAR`) is `cpp` (default, `SimulationService`) or `python` (`ReferenceSimulationService`); any other value is a `ValueError`.
+
+### `mna_simulation/api/reference_service.py`
+- Python mode (`MNA_CORE=python`): `ReferenceSimulationService` serves the `SimulationService` contract (`run_request`, `healthcheck`, `budget`) with the frozen pre-migration pure-Python core `tests/reference/mna_reference`.
+- `load_reference_package` imports `mna_reference`, appending `tests/reference` to `sys.path` when it is not importable yet; without a source checkout (wheels) it raises `ReferenceCoreUnavailable`. The oracle is only imported, never changed.
+- Validates request options with the live `PythonBackend.build_options` rules first (same HTTP 400s as the C++ mode), then runs the request through the oracle's own `SimulationService` (its backend subclassed only to tag option `ValueError`s for HTTP 400).
+- Re-raises oracle simulator errors as the matching `mna_simulation.errors` classes (same `code`/`message`), leases one thread per run and pins BLAS, and reports `core_backend: "python"`, `core_version: "python-reference@<frozen commit>"` (from `FROZEN_AT.txt`), the thread fields and `elapsed_ms`; `healthcheck()` reports `build_info: None`.
 
 ## Backends: `mna_simulation/backends/`
 
@@ -266,7 +274,8 @@ Headers are listed relative to `include/mna/`; each `x.hpp` with an implementati
 - Translates simulator errors into HTTP 400 payloads; option-validation errors become HTTP 400 `INVALID_OPTIONS`.
 - Dynamic websocket requests accept Krylov options and cap display frame rate while continuing looped playback.
 - Runs `/api/simulate` (now async) and `/ws/dyn` simulations on a bounded `ThreadPoolExecutor` with one worker per budget thread (`budget_total()`), created in the app lifespan (or lazily) and shut down with it.
-- `GET /health` adds `core_version`, `build_info`, and the thread budget; `/ws/dyn` accepts `num_threads` and reports `threads_used` and `elapsed_ms` in its `meta` message.
+- Builds its service with `create_service()`, so `MNA_CORE=python` boots the server on the frozen pre-migration Python core (`mna_simulation/api/reference_service.py`); the lifespan logs `MNA core: <core_backend> (<core_version>)` at startup.
+- `GET /health` adds `core_backend`, `core_version`, `build_info`, and the thread budget; `/ws/dyn` accepts `num_threads` and reports `threads_used` and `elapsed_ms` in its `meta` message.
 
 ## Web App: `app/web/`
 
@@ -444,6 +453,9 @@ Each module exercises one native unit through its binding and its Python facade,
 ### `tests/test_physical_sram.py`
 - Level-1 MOS and SRAM behavior tests.
 - Verifies inverter convergence, selected 6T cell write/hold/read behavior, and full 10x10 SRAM transient execution.
+
+### `tests/test_python_core_mode.py`
+- Python mode (`MNA_CORE=python`): `resolve_core`/`create_service` selection, the frozen package actually running, the error when the oracle is missing, `.op`/`.tran`/`.ac` agreement with the C++ core, metadata and health fields, the same option 400s as the C++ mode, live error classes, `/health`, `/api/simulate` and `/ws/dyn` on a Python-mode server, and the CLI `--core` option.
 
 ### `tests/test_mor.py`
 - Selected-output MOR tests.

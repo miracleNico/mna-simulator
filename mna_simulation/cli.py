@@ -7,8 +7,7 @@ import json
 from pathlib import Path
 
 from .api.contracts import AnalysisMode, AnalysisRequest
-from .api.service import SimulationService
-from .backends.python_backend import PythonBackend
+from .api.service import CORE_ENV_VAR, CORES, create_service
 from .errors import CircuitSimulatorError
 from .native.threads import ENV_VAR, coerce_num_threads
 
@@ -30,6 +29,13 @@ def _add_threads_option(parser: argparse.ArgumentParser) -> None:
         metavar="N|auto",
         help=f"Worker threads for the run: a positive integer or 'auto' (default). "
         f"Capped by the thread budget ({ENV_VAR}, default: CPU count).",
+    )
+    parser.add_argument(
+        "--core",
+        choices=CORES,
+        default=None,
+        help=f"Numerical core: 'cpp' (native, the default) or 'python' (the frozen pre-migration "
+        f"pure-Python core, source checkouts only). Default: {CORE_ENV_VAR} or 'cpp'.",
     )
 
 
@@ -71,6 +77,8 @@ def _print_response(response, as_json: bool) -> None:
     print(f"Mode: {response.mode}")
     print(f"Status: {response.status}")
     metadata = response.metadata or {}
+    if "core_backend" in metadata:
+        print(f"Core: {metadata['core_backend']} ({metadata.get('core_version', '?')})")
     if "threads_used" in metadata:
         print(
             f"Threads used: {metadata['threads_used']} "
@@ -98,8 +106,11 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    backend = PythonBackend()
-    service = SimulationService(backend)
+    try:
+        service = create_service(args.core)
+    except (ValueError, RuntimeError) as exc:
+        print(f"error: {exc}")
+        return 2
 
     try:
         if args.command == "run":

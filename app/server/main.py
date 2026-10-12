@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -20,7 +21,7 @@ from mna_simulation.api.contracts import (
     SchematicDocument,
     SimulationResponse,
 )
-from mna_simulation.api.service import SimulationService, is_invalid_option_error
+from mna_simulation.api.service import create_service, is_invalid_option_error
 from mna_simulation.errors import CircuitSimulatorError
 from mna_simulation.native.threads import budget_total
 from mna_simulation.schematic_pipeline import schematic_to_circuit_ir
@@ -36,6 +37,8 @@ def _new_executor() -> ThreadPoolExecutor:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    health = service.healthcheck()
+    logging.getLogger("uvicorn.error").info("MNA core: %s (%s)", health["core_backend"], health["core_version"])
     app.state.executor = _new_executor()
     try:
         yield
@@ -53,7 +56,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-service = SimulationService()
+# MNA_CORE selects the numerical core: "cpp" (default, the native core) or "python" (the frozen
+# pre-migration pure-Python core, source checkouts only; mna_simulation/api/reference_service.py).
+service = create_service()
 
 
 def _executor() -> ThreadPoolExecutor:

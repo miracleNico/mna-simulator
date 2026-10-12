@@ -88,6 +88,14 @@ Start the backend API:
 python -m uvicorn app.server.main:app --host 127.0.0.1 --port 8010
 ```
 
+The server runs every analysis in the native C++ core. To compare with the simulator as it was before the C++ migration, boot it on the frozen pure-Python core instead by setting `MNA_CORE=python` (`MNA_CORE=cpp` or unset is the default):
+
+```bash
+MNA_CORE=python python -m uvicorn app.server.main:app --host 127.0.0.1 --port 8010
+```
+
+In PowerShell, run `$env:MNA_CORE="python"` first. Python mode runs the parser, MNA builder and solvers of `tests/reference/mna_reference`, the pre-migration package kept as the test oracle, behind the same API. Requests are validated by the same option rules as in the default mode (HTTP 400 for the same inputs), each run uses one thread, and results report `core_backend: "python"` and `core_version: "python-reference@e5172cb"`. Pre-migration behaviour is kept as it was, including what `USER_GUIDE.md` lists as changed with the native core. The oracle is not shipped in wheels, so this mode needs a source checkout (`pip install -e .`). Expect analyses to run roughly 5x to 300x slower, depending on the analysis (`benchmarks/results/baseline-*.md`). The startup log line `MNA core: ...` and `GET /health` (`core_backend`) show which core is running.
+
 Start the frontend:
 
 ```bash
@@ -118,6 +126,12 @@ Return JSON:
 python -m mna_simulation.cli run path/to/circuit.cir --json
 ```
 
+Run on the frozen pre-migration Python core (`--core python`; the default is `--core cpp`, or `MNA_CORE` when set):
+
+```bash
+python -m mna_simulation.cli run path/to/circuit.cir --core python
+```
+
 ## API
 
 - `GET /health`: service health, backend capabilities, and model registry metadata.
@@ -143,8 +157,8 @@ Schematic runs return the generated canonical netlist in response metadata. Simu
 
 Every run leases worker threads from one machine-wide budget, so concurrent API requests and websocket streams divide the cores instead of oversubscribing them.
 
-- `MNA_NUM_THREADS` caps the server (default: `os.cpu_count()`, never more). `/api/simulate` and `/ws/dyn` run on a thread pool of that size, and a request waits while every thread is leased. `GET /health` reports `thread_budget` (`total`, `free`, `active`), `core_version`, and `build_info`.
-- Requests pass `options.num_threads`: `"auto"` (the default) or a positive integer, which acts as an upper limit (`min(requested, free, total)`). `"auto"` takes a fair share of what is free, `max(1, total // (active runs + 1))`, capped at what the analysis can use (`mna_simulation.native.threads.useful_threads`): one thread for `.op`/`.tran` below 2048 devices and for harmonic balance below 64 nodes (the core runs those on one thread anyway), `points // 2` for `.ac`; a large analysis that finds the server idle gets the whole budget. Anything else returns HTTP 400. The CLI takes `--threads N|auto` and the UI has a Threads control. Result metadata reports `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend` (`"cpp"`), `core_version`, and `elapsed_ms` (wall time of the backend run).
+- `MNA_NUM_THREADS` caps the server (default: `os.cpu_count()`, never more). `/api/simulate` and `/ws/dyn` run on a thread pool of that size, and a request waits while every thread is leased. `GET /health` reports `thread_budget` (`total`, `free`, `active`), `core_backend`, `core_version`, and `build_info`.
+- Requests pass `options.num_threads`: `"auto"` (the default) or a positive integer, which acts as an upper limit (`min(requested, free, total)`). `"auto"` takes a fair share of what is free, `max(1, total // (active runs + 1))`, capped at what the analysis can use (`mna_simulation.native.threads.useful_threads`): one thread for `.op`/`.tran` below 2048 devices and for harmonic balance below 64 nodes (the core runs those on one thread anyway), `points // 2` for `.ac`; a large analysis that finds the server idle gets the whole budget. Anything else returns HTTP 400. The CLI takes `--threads N|auto` and the UI has a Threads control. Result metadata reports `threads_requested`, `threads_used`, `thread_budget_total`, `core_backend` (`"cpp"`, or `"python"` in Python mode), `core_version`, and `elapsed_ms` (wall time of the backend run).
 - The native core uses the granted threads where an analysis has parallel work (see [Native Core](#native-core)); the thread count changes speed only, never results. Small circuits gain nothing from more threads, because every parallel region starts its own workers.
 - Concurrent requests in one server process overlap in their native parts, which run without the GIL, and `"auto"` leases only what each analysis can use, so simultaneous small requests run side by side instead of queueing behind one lease. Four concurrent harmonic-balance mixer requests (about 0.7 s of native work each) finish in 1.10x the time of one. Parsing, MNA building, the device operating-point table and response conversion still run in Python under the GIL and are most of a short request: four simultaneous SRAM 10x10 transients (about 30 ms each) take about 4.9x as long as one, 153 ms in total (`python benchmarks/concurrent_requests.py [--workload hb_mixer]`; `PERFORMANCE_PLAN.md` section 10.2; a process pool is the follow-up).
 - NumPy/SciPy BLAS is pinned to one thread for the duration of every run (`threadpoolctl`). Before the native core, with four concurrent SRAM transients in separate processes, this took the batch from 45 s to 3.5 s on a 4-core machine (`PERFORMANCE_PLAN.md` section 4.2). Still start the server with `OPENBLAS_NUM_THREADS=1` as belt and braces, because it also covers BLAS calls made outside a run:
