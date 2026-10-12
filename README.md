@@ -209,7 +209,7 @@ The parser reads the forms above and the SPICE constructs used by vendor model c
 
 ### Vendor model cards
 
-Diodes, BJTs and MOSFETs can carry the parameters of a SPICE `.model` card (`HIERARCHY_AND_MODELS_PLAN.md` 3.2, phase M2). A component selects the equation set with `metadata["model"]` and carries the card values as text in `metadata` (lowercase keys, SPICE suffixes such as `2.52n`, `100MEG`, `4pF`); missing keys take the SPICE defaults. Until the SPICE-dialect parser lands, such components are built as `ComponentRecord`s in Python. All three equation sets use `vt = k T / q` at 27 °C (`8.617333262e-5 * 300.15`, about 0.025865 V); the existing `LEVEL1` and ideal-diode paths keep 0.02585 V and 0.025 V. Every exponential continues linearly beyond `|v / (n vt)| = 80` (value and slope continuous), so Newton never sees `inf`.
+Diodes, BJTs and MOSFETs can carry the parameters of a SPICE `.model` card (`HIERARCHY_AND_MODELS_PLAN.md` 3.2, phase M2). A component selects the equation set with `metadata["model"]` and carries the card values as text in `metadata` (lowercase keys, SPICE suffixes such as `2.52n`, `100MEG`, `4pF`); missing keys take the SPICE defaults. A netlist writes them with `.model` cards ([Netlist dialect](#netlist-dialect)); Python code can also build the `ComponentRecord`s directly. All three equation sets use `vt = k T / q` at 27 °C (`8.617333262e-5 * 300.15`, about 0.025865 V); the existing `LEVEL1` and ideal-diode paths keep 0.02585 V and 0.025 V. Every exponential continues linearly beyond `|v / (n vt)| = 80` (value and slope continuous), so Newton never sees `inf`.
 
 | `metadata["model"]` | Device | Honoured in this phase | Recorded, used later (phase M4) |
 | --- | --- | --- | --- |

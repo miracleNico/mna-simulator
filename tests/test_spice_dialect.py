@@ -1103,6 +1103,94 @@ def test_cli_run_reads_includes_through_lib_directories(tmp_path: Path, capsys: 
 
 
 # ---------------------------------------------------------------------------
+# Model-card devices end to end (parser records -> phase M2 equations)
+# ---------------------------------------------------------------------------
+
+
+VT_CARD = 8.617333262e-5 * 300.15
+
+
+def _record_op(records: list[ComponentRecord]) -> dict[str, float]:
+    from mna_simulation.api.contracts import AnalysisOptions, CircuitIR
+    from mna_simulation.core_basic import build_and_run_basic
+
+    result = build_and_run_basic(CircuitIR(components=records), AnalysisOptions(mode=AnalysisMode.OP))
+    return dict(zip(result.labels, np.asarray(result.dc_solution, dtype=float).reshape(-1)))
+
+
+def test_parsed_1n4148_card_runs_through_the_service() -> None:
+    response = SimulationService().run_request(
+        AnalysisRequest(netlist_text=f"{D1N4148}\nV1 in 0 5\nR1 in a 1kOhm\nD1 a 0 D1N4148\n.op\n")
+    )
+    values = dict(zip(response.labels, response.dc_solution))
+    current = (values["V(in)"] - values["V(a)"]) / 1000.0
+    n, is_, rs = 1.752, 2.52e-9, 0.568
+    assert values["V(a)"] == pytest.approx(n * VT_CARD * math.log(current / is_ + 1.0) + current * rs, abs=1e-8)
+    assert values["V(D1#a)"] == pytest.approx(values["V(a)"] - current * rs, abs=1e-9)  # rs internal node
+    assert response.diagnostics == ["model D1N4148: parameters m, tt are recorded but not modelled yet"]
+
+
+def test_parsed_cards_give_the_same_op_as_contract_records() -> None:
+    text = (
+        f"{Q2N2222}\n{BS170}\n"
+        "VCC vcc 0 DC 12\nRB1 vcc b 47k\nRB2 b 0 10k\nRC vcc c 2.2k\nRE e 0 470\nQ1 c b e Q2N2222\n"
+        "RD vcc d 10k\nVG g 0 DC 3\nM1 d g 0 BS170 W=100u L=2u\n.op\n"
+    )
+    parsed = _op(text)
+    card_q = {**Q2N2222_PARAMS, "model": "gummel_poon", "model_name": "Q2N2222"}
+    card_m = {
+        "model": "spice_level1",
+        "model_name": "BS170",
+        "level": "3",
+        "vto": "1.824",
+        "kp": ".1233",
+        "gamma": "0",
+        "phi": ".6",
+        "lambda": "0",
+        "cgso": "1.2n",
+        "cgdo": "0.25n",
+        "w": "100u",
+        "l": "2u",
+    }
+    records = [
+        ComponentRecord("VCC", "V", "vcc", "0", "12", "DC"),
+        ComponentRecord("RB1", "R", "vcc", "b", "47k"),
+        ComponentRecord("RB2", "R", "b", "0", "10k"),
+        ComponentRecord("RC", "R", "vcc", "c", "2.2k"),
+        ComponentRecord("RE", "R", "e", "0", "470"),
+        ComponentRecord("Q1", "QNPN", "c", "e", "14.34f", "QNPN", "b", None, None, "255.9", "6.092", card_q),
+        ComponentRecord("RD", "R", "vcc", "d", "10k"),
+        ComponentRecord("VG", "V", "g", "0", "3", "DC"),
+        ComponentRecord("M1", "NMOS", "d", "0", None, "NMOS", "g", None, None, None, None, card_m),
+    ]
+    expected = _record_op(records)
+    assert sorted(parsed) == sorted(expected)
+    assert [parsed[k] for k in sorted(parsed)] == pytest.approx([expected[k] for k in sorted(expected)], rel=1e-12, abs=1e-15)
+    assert 0.5 < parsed["V(b)"] - parsed["V(e)"] < 0.8 and parsed["V(c)"] < 12.0  # the BJT conducts
+    assert parsed["V(d)"] < 12.0  # the MOSFET conducts
+
+
+def test_vendor_style_macromodel_with_a_local_diode_card_simulates() -> None:
+    # A clamp macromodel: its own .model card, a parameterised series resistor, ports bound to the parent.
+    text = (
+        ".subckt CLAMP in out PARAMS: rser=100\n"
+        ".model DCL D(IS=1n N=1.5 RS=2)\n"
+        "R1 in out {rser}\n"
+        "D1 out 0 DCL\n"
+        ".ends CLAMP\n"
+        "V1 src 0 DC 3\n"
+        "X1 src node CLAMP rser=1k\n"
+        "RL node 0 100k\n"
+        ".op\n"
+    )
+    values = _op(text)
+    assert "V(X1.D1#a)" in values
+    diode_current = (values["V(src)"] - values["V(node)"]) / 1e3 - values["V(node)"] / 100e3
+    expected = 1.5 * VT_CARD * math.log(diode_current / 1e-9 + 1.0) + diode_current * 2.0
+    assert values["V(node)"] == pytest.approx(expected, abs=1e-8)
+
+
+# ---------------------------------------------------------------------------
 # The netlist dialect is unaffected
 # ---------------------------------------------------------------------------
 
