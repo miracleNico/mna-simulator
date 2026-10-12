@@ -320,7 +320,7 @@ def test_mos_level3_card_three_and_four_terminal_instances() -> None:
     assert records["M2"].metadata == {**card, "model": "spice_level1", "model_name": "BS170"}
     assert circuit.diagnostics == [
         "model BS170: LEVEL=3 card mapped to the Level-1 MOS equations",
-        "model BS170: parameters cbd, eta, kappa, rd, rs, theta, tox, vmax are recorded but not modelled yet",
+        "model BS170: parameters cbd, eta, kappa, rd, rs, theta, vmax are recorded but not modelled yet",
         "line 6: 'M1': instance parameters off are ignored",
     ]
 
@@ -409,12 +409,15 @@ def test_supported_key_lists_match_the_plan_tables() -> None:
     assert model_cards.SUPPORTED_KEYS["D"] == {"is", "n", "rs", "bv", "ibv", "cjo", "vj", "m", "fc", "tt", "eg", "xti", "tnom"}
     assert model_cards.MODELLED_KEYS["D"] == {"is", "n", "rs", "bv", "ibv", "cjo"}
     assert model_cards.SUPPORTED_KEYS["NPN"] == model_cards.SUPPORTED_KEYS["PNP"]
-    assert {"is", "bf", "nf", "br", "nr", "vaf", "var", "ikf", "ikr", "ise", "ne", "isc", "nc", "rb", "re", "rc"} <= (
-        model_cards.MODELLED_KEYS["NPN"]
-    )
+    # The keys the builder's equations read (card_devices), exactly.
+    assert model_cards.MODELLED_KEYS["NPN"] == {
+        "is", "bf", "nf", "br", "nr", "vaf", "var", "ikf", "ikr", "ise", "ne", "isc", "nc", "rb", "re", "rc", "cje", "cjc"
+    }  # fmt: skip
     assert {"rbm", "irb", "tf", "tr", "xtf", "vtf", "itf", "ptf", "xtb", "eg", "xti", "tnom"} <= model_cards.SUPPORTED_KEYS["NPN"]
-    assert {"vto", "kp", "lambda", "gamma", "phi", "cgso", "cgdo", "cgbo", "level"} <= model_cards.MODELLED_KEYS["NMOS"]
-    assert {"tox", "nsub", "uo", "vmax", "theta", "eta", "kappa", "rd", "rs", "cbd", "cbs"} <= model_cards.SUPPORTED_KEYS["NMOS"]
+    assert model_cards.MODELLED_KEYS["NMOS"] == {
+        "level", "vto", "kp", "lambda", "gamma", "phi", "cgso", "cgdo", "cgbo", "w", "l", "uo", "tox", "nsub"
+    }  # fmt: skip
+    assert {"vmax", "theta", "eta", "kappa", "rd", "rs", "cbd", "cbs", "nss", "tpg"} <= model_cards.SUPPORTED_KEYS["NMOS"]
     assert model_cards.MOS_INSTANCE_KEYS == ("w", "l", "m", "ad", "as", "pd", "ps", "nrd", "nrs")
 
 
@@ -1279,6 +1282,15 @@ def test_parsed_cards_give_the_same_op_as_contract_records() -> None:
     assert [parsed[k] for k in sorted(parsed)] == pytest.approx([expected[k] for k in sorted(expected)], rel=1e-12, abs=1e-15)
     assert 0.5 < parsed["V(b)"] - parsed["V(e)"] < 0.8 and parsed["V(c)"] < 12.0  # the BJT conducts
     assert parsed["V(d)"] < 12.0  # the MOSFET conducts
+
+
+def test_parsed_process_card_without_kp_runs_through_the_service() -> None:
+    text = ".model NP NMOS(LEVEL=3 VTO=1 UO=600 TOX=1e-7 NSUB=1e15)\nVDD d 0 5\nVG g 0 2\nM1 d g 0 NP W=10u L=10u\n.op\n"
+    circuit = parse_netlist_text(text)
+    assert circuit.diagnostics == ["model NP: LEVEL=3 card mapped to the Level-1 MOS equations"]
+    values = _op(text)
+    kp = 600 * 1e-4 * 3.9 * 8.854214871e-12 / 1e-7  # derived from UO and TOX by the builder
+    assert -values["I(VDD)"] == pytest.approx(0.5 * kp * (2 - 1) ** 2, rel=1e-9)  # saturation, lambda = 0
 
 
 def test_vendor_style_macromodel_with_a_local_diode_card_simulates() -> None:

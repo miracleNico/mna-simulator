@@ -51,7 +51,10 @@ BJT_LATER = frozenset(
 
 # ``w``/``l`` on a card (some vendor cards carry them) share the instance keys in
 # ``metadata``: the instance's ``W=``/``L=`` replace them, otherwise they act as defaults.
-MOS_MODELLED = frozenset({"level", "vto", "kp", "lambda", "gamma", "phi", "cgso", "cgdo", "cgbo", "w", "l"})
+# ``uo``/``tox``/``nsub`` give ``kp``/``phi``/``gamma`` when a card omits those (SPICE).
+MOS_MODELLED = frozenset(
+    {"level", "vto", "kp", "lambda", "gamma", "phi", "cgso", "cgdo", "cgbo", "w", "l", "uo", "tox", "nsub"}
+)
 MOS_LATER = frozenset(
     {
         "cbd",
@@ -62,10 +65,7 @@ MOS_LATER = frozenset(
         "mj",
         "mjsw",
         "js",
-        "tox",
-        "nsub",
         "nss",
-        "uo",
         "tpg",
         "xj",
         "ld",
