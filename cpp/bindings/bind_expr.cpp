@@ -47,15 +47,50 @@ void check_x(const Program& program, const In1D<double>& x, const char* fn) {
     }
 }
 
+/// Tables of compile_program: a sequence of (times, values, period, origin) tuples.
+std::vector<mna::expr::Table> tables_from(const nb::handle& tables) {
+    std::vector<mna::expr::Table> out;
+    if (tables.is_none()) {
+        return out;
+    }
+    std::size_t k = 0;
+    for (nb::handle item : tables) {
+        const std::string where = "compile_program: table " + std::to_string(k);
+        nb::tuple entry;
+        if (!nb::try_cast<nb::tuple>(item, entry) || entry.size() != 4) {
+            bad_input(where + " must be a (times, values, period, origin) tuple");
+        }
+        In1D<double> times;
+        In1D<double> values;
+        double period = 0.0;
+        double origin = 0.0;
+        if (!nb::try_cast<In1D<double>>(entry[0], times) || !nb::try_cast<In1D<double>>(entry[1], values)) {
+            bad_input(where + ": times and values must be contiguous 1-D float64 arrays");
+        }
+        if (!nb::try_cast<double>(entry[2], period) || !nb::try_cast<double>(entry[3], origin)) {
+            bad_input(where + ": period and origin must be numbers");
+        }
+        mna::expr::Table table;
+        table.times.assign(times.data(), times.data() + times.shape(0));
+        table.values.assign(values.data(), values.data() + values.shape(0));
+        table.period = period;
+        table.origin = origin;
+        out.push_back(std::move(table));
+        ++k;
+    }
+    return out;
+}
+
 std::shared_ptr<Program> compile_program(In1D<std::int32_t> opcodes, In1D<std::int32_t> args, In1D<double> consts,
-                                         int n_unknowns, bool time_dependent) {
+                                         int n_unknowns, bool time_dependent, nb::handle tables) {
     if (opcodes.shape(0) != args.shape(0)) {
         bad_input("compile_program: opcodes and args differ in length (" + std::to_string(opcodes.shape(0)) + " vs " +
                   std::to_string(args.shape(0)) + ")");
     }
     std::vector<double> c(consts.data(), consts.data() + consts.shape(0));
+    std::vector<mna::expr::Table> t = tables_from(tables);
     return std::make_shared<Program>(opcodes.data(), args.data(), opcodes.shape(0), std::move(c), n_unknowns,
-                                     time_dependent);
+                                     time_dependent, std::move(t));
 }
 
 double evaluate_program(const Program& program, In1D<double> x, double t) {
@@ -97,6 +132,8 @@ void bind_expr(nb::module_& m) {
         .def_prop_ro("n_unknowns", &Program::n_unknowns)
         .def_prop_ro("time_dependent", &Program::time_dependent)
         .def_prop_ro("max_depth", [](const Program& p) { return p.max_depth(); })
+        .def_prop_ro("n_tables", [](const Program& p) { return p.tables().size(); },
+                     "Number of piecewise-linear tables read by TABLE instructions.")
         .def_prop_ro("unknowns", [](const Program& p) { return p.unknowns(); },
                      "Sorted unknown indices read by the program.")
         .def("__len__", [](const Program& p) { return p.code().size(); })
@@ -126,9 +163,11 @@ void bind_expr(nb::module_& m) {
 
     m.def("expr_opcodes", &opcode_table, "Opcode numbers of the expression VM, keyed by mnemonic.");
     m.def("compile_program", &compile_program, "opcodes"_a, "args"_a, "consts"_a, "n_unknowns"_a,
-          "time_dependent"_a,
+          "time_dependent"_a, "tables"_a = nb::none(),
           "Validate an expression program (int32 opcodes and operands, float64 constants).\n"
-          "Raises CoreError(NETLIST_FATAL) for a malformed program.");
+          "tables: None or a sequence of (times, values, period, origin) tuples read by TABLE\n"
+          "instructions (float64 arrays, strictly increasing times; period 0 means no repetition).\n"
+          "Raises CoreError(NETLIST_FATAL) for a malformed program or table.");
     m.def("evaluate_program", &evaluate_program, "program"_a, "x"_a, "t"_a = 0.0,
           "Value of a program at unknowns x (at least n_unknowns entries) and time t.");
     m.def("evaluate_program_batch", &evaluate_program_batch, "program"_a, "t_array"_a,

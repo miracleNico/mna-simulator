@@ -20,9 +20,11 @@ from ..solvers import (
     _problem_circuit,
     _problem_is_nonlinear,
     _time_sources,
-    _transient_time_points,
     solve_transient,
+    transient_grid,
+    transient_tables,
 )
+from ..table_sources import TIME_TABLES_KEY
 from .linear import _problem_size, count_input_directions
 from .metadata import resolve_mor_order, used_metadata
 from .selectors import build_output_selector, validate_probe_subset
@@ -54,6 +56,7 @@ def _problem_cache_digest(
     outputs: list[str],
     order: int | str | None,
     method: str,
+    breakpoints: bool = True,
 ) -> str:
     hasher = hashlib.sha256()
     hasher.update(repr(problem.components).encode("utf-8", errors="replace"))
@@ -66,6 +69,11 @@ def _problem_cache_digest(
     hasher.update(repr(problem.level1_mos_devices).encode("utf-8", errors="replace"))
     hasher.update(repr(problem.level1_bjt_devices).encode("utf-8", errors="replace"))
     hasher.update(f"{t_stop:.17g}|{t_step:.17g}|{outputs}|{order}|{method}".encode("utf-8"))
+    specs = problem.metadata.get(TIME_TABLES_KEY) if problem.metadata else None
+    if specs:
+        # Table data behind the __table_k(t) placeholders, and whether the grid has the breakpoints.
+        hasher.update(repr([(spec.table.key if spec.table is not None else spec.pulse) for spec in specs]).encode("utf-8"))
+        hasher.update(f"|breakpoints={bool(breakpoints)}".encode("utf-8"))
     return hasher.hexdigest()
 
 
@@ -116,6 +124,7 @@ def _train_tpwl(
     f_tol: float,
     output_count: int,
     num_threads: int | str | None = None,
+    breakpoints: bool = True,
 ) -> dict[str, object]:
     threads = native_mor.resolve_threads(num_threads)
     full = solve_transient(
@@ -128,6 +137,7 @@ def _train_tpwl(
         init_cond=None,
         use_krylov=False,
         num_threads=threads,
+        breakpoints=breakpoints,
     )
     snapshots = np.asarray(full.values, dtype=float)
     basis = _pod_basis(snapshots, order)
@@ -169,8 +179,13 @@ def solve_transient_tpwl(
     v_tol: float,
     f_tol: float,
     num_threads: int | str | None = None,
+    breakpoints: bool = True,
 ) -> tuple[WaveformResult, dict[str, object]]:
-    """Train/reuse a TPWL ROM and return selected transient outputs."""
+    """Train/reuse a TPWL ROM and return selected transient outputs.
+
+    The training run and the reduced step loop use the same grid as :func:`solve_transient`
+    (the uniform grid merged with the table-source breakpoints when ``breakpoints``).
+    """
 
     labels = list(problem.metadata["labels"])
     selector, output_labels = build_output_selector(labels, mor_output_nodes)
@@ -186,6 +201,7 @@ def solve_transient_tpwl(
         outputs=output_labels,
         order=order,
         method=requested_method,
+        breakpoints=breakpoints,
     )
     entry = _cache_get(cache_key)
     cache_hit = entry is not None
@@ -200,6 +216,7 @@ def solve_transient_tpwl(
             f_tol=f_tol,
             output_count=len(output_labels),
             num_threads=num_threads,
+            breakpoints=breakpoints,
         )
         _cache_put(cache_key, entry)
 
@@ -220,8 +237,9 @@ def solve_transient_tpwl(
         else:
             circuit, gmin = _problem_circuit(problem, True)
             Gr, Cr = native_mor.project(native_mor.circuit_operands(circuit, gmin=gmin), V)
-            source_rows, source_programs = _time_sources(problem.b_time_str)
-            t_points = _transient_time_points(t_stop, t_step)
+            tables = transient_tables(problem, t_step, t_stop)
+            source_rows, source_programs = _time_sources(problem.b_time_str, tables)
+            t_points = transient_grid(problem, t_stop, t_step, tables, breakpoints)
             values = native_mor.tpwl_simulate(
                 Gr,
                 Cr,

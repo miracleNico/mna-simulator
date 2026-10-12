@@ -20,9 +20,10 @@ from ..solvers import (
     _problem_circuit,
     _problem_is_nonlinear,
     _time_sources,
-    _transient_time_points,
     solve_operating_point,
     solve_transient,
+    transient_grid,
+    transient_tables,
 )
 from .metadata import resolve_mor_order, used_metadata
 from .selectors import build_output_selector, validate_probe_subset
@@ -273,8 +274,13 @@ def solve_transient_mor(
     init_cond: np.ndarray | None = None,
     linear_kwargs: dict[str, object] | None = None,
     num_threads: int | str | None = None,
+    breakpoints: bool = True,
 ) -> tuple[WaveformResult, dict[str, object]]:
-    """Solve selected transient outputs through a reduced linear model."""
+    """Solve selected transient outputs through a reduced linear model.
+
+    The grid is :func:`~mna_simulation.solvers.transient_grid`'s (table breakpoints merged
+    when ``breakpoints``), the same as the full-order :func:`solve_transient`.
+    """
 
     labels = list(problem.metadata["labels"])
     selector, output_labels = build_output_selector(labels, mor_output_nodes)
@@ -290,7 +296,8 @@ def solve_transient_mor(
     V = native_mor.krylov_basis(operands, inputs, selector, shifts, order, num_threads=threads)
     Gr, Cr = native_mor.project(operands, V)
     Sr = selector @ V
-    source_rows, source_programs = _time_sources(problem.b_time_str)
+    tables = transient_tables(problem, t_step, t_stop)
+    source_rows, source_programs = _time_sources(problem.b_time_str, tables)
 
     if init_cond is None:
         # b_dc + b_time(0): every time program added to its row (compile_time_source_func's values).
@@ -315,7 +322,7 @@ def solve_transient_mor(
         if x0.shape[0] != n:
             error_handler(f"NETLIST_FATAL: init_condition has {x0.shape[0]} values, expected {n} (one per unknown).")
 
-    t_points = _transient_time_points(t_stop, t_step)
+    t_points = transient_grid(problem, t_stop, t_step, tables, breakpoints)
     values, reduced_failed = native_mor.reduced_transient(
         Gr, Cr, V, Sr, x0, t_points, problem.b_dc, source_rows, source_programs
     )
@@ -353,6 +360,7 @@ def solve_transient_mor(
             krylov_method="auto",
             krylov_stats=reference_stats,
             num_threads=threads,
+            breakpoints=breakpoints,
         )
         reference_values = selector @ np.asarray(reference.values, dtype=float)
         error = values - reference_values

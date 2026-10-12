@@ -422,7 +422,9 @@ def test_programs_serialize_to_int32_and_float64_arrays_and_are_cached() -> None
 def test_opcode_table_matches_the_core() -> None:
     table = core.expr_opcodes()
     assert table["const"] == 0 and table["load_x"] == 1 and table["load_t"] == 2 and table["select"] == 29
-    assert len(table) == 30 and sorted(table.values()) == list(range(30))
+    # "table" (MIXED_SIGNAL.md phase D1) is the newest opcode, appended after "select".
+    assert table["table"] == 30
+    assert len(table) == 31 and sorted(table.values()) == list(range(31))
 
 
 def test_unsupported_functions_raise_netlist_fatal() -> None:

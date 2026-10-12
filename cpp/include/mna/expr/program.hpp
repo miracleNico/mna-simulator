@@ -19,13 +19,22 @@
 //   * SELECT k pops k (value, condition) pairs pushed in order and yields the
 //     value of the first true condition, NaN if none is true
 //     (numpy.select(..., default=nan)).
+//   * TABLE k pushes table k of the program evaluated at t (time-dependent
+//     programs only): a piecewise-linear lookup (binary search, one linear
+//     interpolation v_i + slope_i * (t - t_i) with slope_i precomputed as
+//     (v_{i+1} - v_i) / (t_{i+1} - t_i)); the first value is held before (and
+//     at) the first point, the last value at and after the last point. With
+//     period > 0 a time t >= origin is first folded to
+//     origin + PYMOD(t - origin, period), so the waveform repeats from origin
+//     (MIXED_SIGNAL.md phase D1). A NaN time gives NaN.
 //
 // Derivatives (evaluate_with_gradient) use forward-mode dual numbers. Choices
 // at non-differentiable points: HEAVISIDE and comparisons/logic have derivative
 // 0, SELECT differentiates the selected branch only, MIN/MAX the selected
 // operand (the second one at ties, the operand the value comes from), ABS has
 // derivative sign(x) with 0 at x == 0,
-// PYMOD has d/da = 1 and d/db = -floor(a/b). Chain-rule terms whose partial is
+// PYMOD has d/da = 1 and d/db = -floor(a/b), TABLE has no dependence on the
+// unknowns (derivative 0 in every direction). Chain-rule terms whose partial is
 // zero (constants, t, unknowns outside `wrt`, or a component the operand does
 // not depend on) are skipped, as they are absent from SymPy's symbolic
 // derivative, so 0 * inf never turns an unrelated entry into NaN.
@@ -69,9 +78,10 @@ enum class Op : std::int32_t {
     Or = 27,
     Not = 28,
     Select = 29,  ///< arg = number of (value, condition) pairs
+    Table = 30,   ///< push tables()[arg] evaluated at t (time-dependent programs only)
 };
 
-inline constexpr std::int32_t kOpCount = 30;
+inline constexpr std::int32_t kOpCount = 31;
 
 /// Upper bound on the evaluation stack depth of a valid program.
 inline constexpr std::size_t kMaxStackDepth = std::size_t{1} << 16;
@@ -83,6 +93,20 @@ struct Instruction {
     Op op;
     std::int32_t arg;
 };
+
+/// Piecewise-linear table read by Op::Table: strictly increasing finite times,
+/// one finite value per time (at least one point), and an optional repetition
+/// (period > 0: a time t >= origin is folded into [origin, origin + period)).
+struct Table {
+    std::vector<double> times;
+    std::vector<double> values;
+    double period = 0.0;
+    double origin = 0.0;
+};
+
+/// Value of a validated table at time t (see Op::Table). `slopes` holds the
+/// size() - 1 segment slopes (v_{i+1} - v_i) / (t_{i+1} - t_i).
+double table_value(const Table& table, const std::vector<double>& slopes, double t) noexcept;
 
 /// Programs are immutable after construction and safe to evaluate from several
 /// threads at once. enable_shared_from_this lets the Python bindings hand the
@@ -97,8 +121,20 @@ public:
     Program(const std::int32_t* opcodes, const std::int32_t* args, std::size_t size, std::vector<double> consts,
             std::int32_t n_unknowns, bool time_dependent);
 
+    /// As above, with the tables read by TABLE instructions. Also throws
+    /// mna::Error(NetlistFatal) for a TABLE operand outside [0, tables.size()),
+    /// TABLE in a program that is not time dependent, and an invalid table
+    /// (no point, times and values of different lengths, a non-finite time or
+    /// value, times not strictly increasing, a negative or non-finite period,
+    /// a non-finite origin).
+    Program(const std::int32_t* opcodes, const std::int32_t* args, std::size_t size, std::vector<double> consts,
+            std::int32_t n_unknowns, bool time_dependent, std::vector<Table> tables);
+
     const std::vector<Instruction>& code() const noexcept { return code_; }
     const std::vector<double>& consts() const noexcept { return consts_; }
+    const std::vector<Table>& tables() const noexcept { return tables_; }
+    /// Segment slopes of tables()[k] (size() - 1 entries).
+    const std::vector<double>& table_slopes(std::size_t k) const noexcept { return slopes_[k]; }
     std::int32_t n_unknowns() const noexcept { return n_unknowns_; }
     bool time_dependent() const noexcept { return time_dependent_; }
     /// Largest stack depth reached while evaluating.
@@ -111,6 +147,8 @@ public:
 private:
     std::vector<Instruction> code_;
     std::vector<double> consts_;
+    std::vector<Table> tables_;
+    std::vector<std::vector<double>> slopes_;
     std::vector<std::int32_t> unknowns_;
     std::vector<std::int32_t> load_pos_;
     std::int32_t n_unknowns_;

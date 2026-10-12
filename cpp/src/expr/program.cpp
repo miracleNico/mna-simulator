@@ -39,6 +39,7 @@ std::size_t operand_count(Op op, std::int32_t arg) noexcept {
         case Op::Const:
         case Op::LoadX:
         case Op::LoadT:
+        case Op::Table:
             return 0;
         case Op::Neg:
         case Op::Sqrt:
@@ -104,6 +105,7 @@ const char* op_name(Op op) noexcept {
         case Op::Or: return "or";
         case Op::Not: return "not";
         case Op::Select: return "select";
+        case Op::Table: return "table";
     }
     return "?";
 }
@@ -141,11 +143,80 @@ double np_heaviside(double x, double h0) noexcept {
     return x;  // NaN
 }
 
+double table_value(const Table& table, const std::vector<double>& slopes, double t) noexcept {
+    if (table.period > 0.0 && t >= table.origin) {
+        t = table.origin + py_mod(t - table.origin, table.period);  // NaN for t = inf
+    }
+    if (std::isnan(t)) {
+        return t;
+    }
+    const std::vector<double>& times = table.times;
+    if (t <= times.front()) {
+        return table.values.front();
+    }
+    if (t >= times.back()) {
+        return table.values.back();
+    }
+    // times[i] <= t < times[i + 1]
+    const auto it = std::upper_bound(times.begin(), times.end(), t);
+    const auto i = static_cast<std::size_t>(it - times.begin()) - 1;
+    return table.values[i] + slopes[i] * (t - times[i]);
+}
+
+namespace {
+
+/// Validates one table and returns its segment slopes.
+std::vector<double> table_slopes_checked(const Table& table, std::size_t k) {
+    const std::string where = "table " + std::to_string(k) + ": ";
+    const std::size_t n = table.times.size();
+    if (n == 0) {
+        invalid(where + "no points");
+    }
+    if (table.values.size() != n) {
+        invalid(where + std::to_string(n) + " times but " + std::to_string(table.values.size()) + " values");
+    }
+    for (std::size_t i = 0; i < n; ++i) {
+        if (!std::isfinite(table.times[i])) {
+            invalid(where + "time " + std::to_string(i) + " is not finite");
+        }
+        if (!std::isfinite(table.values[i])) {
+            invalid(where + "value " + std::to_string(i) + " is not finite");
+        }
+        if (i > 0 && !(table.times[i] > table.times[i - 1])) {
+            invalid(where + "times must be strictly increasing (point " + std::to_string(i) + ")");
+        }
+    }
+    if (!std::isfinite(table.period) || table.period < 0.0) {
+        invalid(where + "the period must be finite and non-negative");
+    }
+    if (!std::isfinite(table.origin)) {
+        invalid(where + "the repetition origin must be finite");
+    }
+    std::vector<double> slopes(n - 1);
+    for (std::size_t i = 0; i + 1 < n; ++i) {
+        slopes[i] = (table.values[i + 1] - table.values[i]) / (table.times[i + 1] - table.times[i]);
+        if (!std::isfinite(slopes[i])) {
+            invalid(where + "segment " + std::to_string(i) + " is too steep (its slope is not finite)");
+        }
+    }
+    return slopes;
+}
+
+}  // namespace
+
 Program::Program(const std::int32_t* opcodes, const std::int32_t* args, std::size_t size, std::vector<double> consts,
                  std::int32_t n_unknowns, bool time_dependent)
-    : consts_(std::move(consts)), n_unknowns_(n_unknowns), time_dependent_(time_dependent) {
+    : Program(opcodes, args, size, std::move(consts), n_unknowns, time_dependent, {}) {}
+
+Program::Program(const std::int32_t* opcodes, const std::int32_t* args, std::size_t size, std::vector<double> consts,
+                 std::int32_t n_unknowns, bool time_dependent, std::vector<Table> tables)
+    : consts_(std::move(consts)), tables_(std::move(tables)), n_unknowns_(n_unknowns), time_dependent_(time_dependent) {
     if (n_unknowns < 0) {
         invalid("n_unknowns must be non-negative");
+    }
+    slopes_.reserve(tables_.size());
+    for (std::size_t k = 0; k < tables_.size(); ++k) {
+        slopes_.push_back(table_slopes_checked(tables_[k], k));
     }
     if (size == 0) {
         invalid("empty program");
@@ -180,6 +251,15 @@ Program::Program(const std::int32_t* opcodes, const std::int32_t* args, std::siz
             case Op::LoadT:
                 if (!time_dependent_) {
                     invalid(where + ": load_t in a program that is not time dependent");
+                }
+                break;
+            case Op::Table:
+                if (!time_dependent_) {
+                    invalid(where + ": table in a program that is not time dependent");
+                }
+                if (arg < 0 || static_cast<std::size_t>(arg) >= tables_.size()) {
+                    invalid(where + ": table index " + std::to_string(arg) + " out of range for " +
+                            std::to_string(tables_.size()) + " tables");
                 }
                 break;
             case Op::Select:
@@ -261,6 +341,14 @@ void evaluate_dual(const Program& program, const double* x, double t, const std:
                 h[sp] = 0;
                 ++sp;
                 break;
+            case Op::Table: {
+                // Independent of the unknowns: a constant in every derivative direction.
+                const auto table = static_cast<std::size_t>(in.arg);
+                v[sp] = table_value(program.tables()[table], program.table_slopes(table), t);
+                h[sp] = 0;
+                ++sp;
+                break;
+            }
             case Op::LoadX: {
                 v[sp] = x[in.arg];
                 const std::int32_t pos = load_pos[pc];

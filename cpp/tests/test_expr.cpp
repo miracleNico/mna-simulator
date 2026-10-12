@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -364,4 +365,130 @@ TEST_CASE("evaluate_with_gradient maps arbitrary wrt lists") {
     mna::expr::evaluate_gradient_unknowns(p, x, 0.0, &value, gu);
     CHECK(gu[0] == 5.0);
     CHECK(gu[1] == 3.0);
+}
+
+namespace {
+
+Program table_program(std::vector<mna::expr::Table> tables, std::int32_t index = 0, bool time_dependent = true) {
+    const std::int32_t ops[1] = {static_cast<std::int32_t>(Op::Table)};
+    const std::int32_t args[1] = {index};
+    return Program(ops, args, 1, {}, 0, time_dependent, std::move(tables));
+}
+
+mna::expr::Table make_table(std::vector<double> times, std::vector<double> values, double period = 0.0,
+                            double origin = 0.0) {
+    mna::expr::Table table;
+    table.times = std::move(times);
+    table.values = std::move(values);
+    table.period = period;
+    table.origin = origin;
+    return table;
+}
+
+}  // namespace
+
+TEST_CASE("table: linear interpolation with the first and last values held") {
+    const Program p = table_program({make_table({1.0, 2.0, 4.0}, {0.0, 3.0, -1.0})});
+    CHECK(p.tables().size() == 1);
+    CHECK(mna::expr::evaluate(p, nullptr, -5.0) == 0.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 1.0) == 0.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 1.5) == 0.0 + 3.0 * 0.5);
+    CHECK(mna::expr::evaluate(p, nullptr, 2.0) == 3.0);  // a corner gives its value exactly
+    CHECK(mna::expr::evaluate(p, nullptr, 3.0) == 3.0 + (-4.0 / 2.0) * 1.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 4.0) == -1.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 1e9) == -1.0);
+    CHECK(mna::expr::evaluate(p, nullptr, kInf) == -1.0);
+    CHECK(mna::expr::evaluate(p, nullptr, -kInf) == 0.0);
+    CHECK(std::isnan(mna::expr::evaluate(p, nullptr, kNaN)));
+    // One point: a constant.
+    const Program one = table_program({make_table({0.5}, {2.5})});
+    CHECK(mna::expr::evaluate(one, nullptr, 0.0) == 2.5);
+    CHECK(mna::expr::evaluate(one, nullptr, 7.0) == 2.5);
+}
+
+TEST_CASE("table: periodic repetition folds t >= origin into [origin, origin + period)") {
+    // Trapezoid 1 -> 5 starting at td = 1, period 10 (a PULSE(1 5 1 1 1 2 10)).
+    const Program p = table_program({make_table({1.0, 2.0, 4.0, 5.0}, {1.0, 5.0, 5.0, 1.0}, 10.0, 1.0)});
+    CHECK(mna::expr::evaluate(p, nullptr, 0.0) == 1.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 1.5) == 3.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 11.5) == 3.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 13.0) == 5.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 8.0) == 1.0);    // after the last corner of the period
+    CHECK(mna::expr::evaluate(p, nullptr, 11.0) == 1.0);   // the fold point is the origin
+    CHECK(mna::expr::evaluate(p, nullptr, 1001.5) == 3.0);
+    CHECK(std::isnan(mna::expr::evaluate(p, nullptr, kInf)));
+    // Repetition from an interior origin (SPICE PWL R=): [2, 4) repeats after t = 4.
+    const Program r = table_program({make_table({0.0, 2.0, 3.0, 4.0}, {7.0, 0.0, 1.0, 0.0}, 2.0, 2.0)});
+    CHECK(mna::expr::evaluate(r, nullptr, 1.0) == 3.5);
+    CHECK(mna::expr::evaluate(r, nullptr, 3.0) == 1.0);
+    CHECK(mna::expr::evaluate(r, nullptr, 5.0) == 1.0);
+    CHECK(mna::expr::evaluate(r, nullptr, 4.5) == 0.5);
+}
+
+TEST_CASE("table: mixed with other instructions, several tables, zero derivative") {
+    // table0(t) - 2 * table1(t) + x0
+    const std::int32_t ops[] = {static_cast<std::int32_t>(Op::Table), static_cast<std::int32_t>(Op::Const),
+                                static_cast<std::int32_t>(Op::Table), static_cast<std::int32_t>(Op::Mul),
+                                static_cast<std::int32_t>(Op::Sub),   static_cast<std::int32_t>(Op::LoadX),
+                                static_cast<std::int32_t>(Op::Add)};
+    const std::int32_t args[] = {0, 0, 1, 0, 0, 0, 0};
+    const Program p(ops, args, 7, {2.0}, 1, true,
+                    {make_table({0.0, 1.0}, {0.0, 1.0}), make_table({0.0, 2.0}, {4.0, 0.0})});
+    const double x[1] = {10.0};
+    CHECK(mna::expr::evaluate(p, x, 0.5) == 0.5 - 2.0 * 3.0 + 10.0);
+    double value = 0.0;
+    double grad = 0.0;
+    const std::int32_t wrt = 0;
+    mna::expr::evaluate_with_gradient(p, x, 0.5, &wrt, 1, &value, &grad);
+    CHECK(value == 0.5 - 2.0 * 3.0 + 10.0);
+    CHECK(grad == 1.0);
+    const double ts[3] = {0.0, 1.0, 2.0};
+    double out[3] = {};
+    const Program q = table_program({make_table({0.0, 1.0}, {0.0, 1.0}), make_table({0.0, 2.0}, {4.0, 0.0})}, 1);
+    mna::expr::evaluate_many(q, ts, 3, out);
+    CHECK(out[0] == 4.0);
+    CHECK(out[1] == 2.0);
+    CHECK(out[2] == 0.0);
+}
+
+TEST_CASE("table: a 1e5-point table") {
+    std::vector<double> times(100000);
+    std::vector<double> values(100000);
+    for (std::size_t i = 0; i < times.size(); ++i) {
+        times[i] = static_cast<double>(i) * 1e-9;
+        values[i] = (i % 2 == 0) ? 0.0 : 3.3;
+    }
+    const Program p = table_program({make_table(times, values)});
+    CHECK(mna::expr::evaluate(p, nullptr, times[12345]) == 3.3);
+    CHECK(mna::expr::evaluate(p, nullptr, times[12346]) == 0.0);
+    CHECK(mna::expr::evaluate(p, nullptr, 0.5 * (times[12345] + times[12346])) == doctest::Approx(1.65));
+}
+
+TEST_CASE("table: validation") {
+    auto rejects = [](auto&& build) {
+        try {
+            build();
+        } catch (const mna::Error& e) {
+            CHECK(e.code() == mna::ErrorCode::NetlistFatal);
+            return true;
+        }
+        return false;
+    };
+    CHECK(rejects([] { table_program({}); }));                                       // index out of range
+    CHECK(rejects([] { table_program({make_table({0.0}, {1.0})}, 1); }));            // index out of range
+    CHECK(rejects([] { table_program({make_table({0.0}, {1.0})}, -1); }));
+    CHECK(rejects([] { table_program({make_table({0.0}, {1.0})}, 0, false); }));     // not time dependent
+    CHECK(rejects([] { table_program({make_table({}, {})}); }));                     // empty
+    CHECK(rejects([] { table_program({make_table({0.0, 1.0}, {1.0})}); }));          // lengths differ
+    CHECK(rejects([] { table_program({make_table({0.0, 0.0}, {1.0, 2.0})}); }));     // not increasing
+    CHECK(rejects([] { table_program({make_table({1.0, 0.0}, {1.0, 2.0})}); }));
+    CHECK(rejects([] { table_program({make_table({0.0, kNaN}, {1.0, 2.0})}); }));
+    CHECK(rejects([] { table_program({make_table({0.0, 1.0}, {1.0, kNaN})}); }));
+    CHECK(rejects([] { table_program({make_table({0.0, 1.0}, {1.0, kInf})}); }));
+    CHECK(rejects([] { table_program({make_table({0.0, 1.0}, {1.0, 2.0}, -1.0)}); }));
+    CHECK(rejects([] { table_program({make_table({0.0, 1.0}, {1.0, 2.0}, kInf)}); }));
+    CHECK(rejects([] { table_program({make_table({0.0, 1.0}, {1.0, 2.0}, 1.0, kNaN)}); }));
+    CHECK(rejects([] { table_program({make_table({0.0, 1e-300}, {-1e300, 1e300})}); }));  // slope overflows
+    CHECK_FALSE(rejects([] { table_program({make_table({0.0, 1.0}, {1.0, 2.0}, 0.5, 0.0)}); }));
+    CHECK(std::string(mna::expr::op_name(Op::Table)) == "table");
 }

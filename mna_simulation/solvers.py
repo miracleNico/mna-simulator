@@ -174,12 +174,25 @@ def compile_nl_functions(
     return compile_device_functions(f_str_vector, size, level1_mos_devices, level1_bjt_devices)
 
 
-def compile_time_source_func(b_time_str_vector: np.ndarray):
-    """Compile time-domain source expressions into a callable ``evaluate(t) -> (n, 1)``."""
+def _compile_time_program(text: str, tables: tuple[object, ...]):
+    """The time program of one ``b_time_str`` row; rows that read a table placeholder get the tables."""
 
     from .native.expressions import compile_expression
 
+    if tables and "__table_" in text:
+        return compile_expression(text, time_dependent=True, n_unknowns=0, tables=tables)
+    return compile_expression(text, time_dependent=True, n_unknowns=0)
+
+
+def compile_time_source_func(b_time_str_vector: np.ndarray, tables: tuple[object, ...] = ()):
+    """Compile time-domain source expressions into a callable ``evaluate(t) -> (n, 1)``.
+
+    ``tables``: the resolved :class:`~mna_simulation.native.expressions.TimeTable` data of
+    the ``__table_k(t)`` placeholders (``table_sources.resolve_tables``); default none.
+    """
+
     size = b_time_str_vector.shape[0]
+    tables = tuple(tables)
     rows: list[int] = []
     handles: list[object] = []
     for row, expr_str in enumerate(b_time_str_vector.flatten()):
@@ -187,7 +200,7 @@ def compile_time_source_func(b_time_str_vector: np.ndarray):
         if text == "0":
             continue
         rows.append(row)
-        handles.append(compile_expression(text, time_dependent=True, n_unknowns=0).handle)
+        handles.append(_compile_time_program(text, tables).handle)
     evaluate_program = _native_core().evaluate_program
     no_unknowns = np.zeros(0)
     entries = list(zip(rows, handles))
@@ -408,11 +421,13 @@ def _problem_circuit(problem: MnaProblem, nonlinear: bool):
     return circuit, 0.0
 
 
-def _time_sources(b_time_str_vector: np.ndarray) -> tuple[np.ndarray, list[object]]:
-    """``(rows, programs)``: one compiled time program per non-"0" row (as ``compile_time_source_func``)."""
+def _time_sources(b_time_str_vector: np.ndarray, tables: tuple[object, ...] = ()) -> tuple[np.ndarray, list[object]]:
+    """``(rows, programs)``: one compiled time program per non-"0" row (as ``compile_time_source_func``).
 
-    from .native.expressions import compile_expression
+    ``tables``: the resolved table data of the ``__table_k(t)`` placeholders (default none).
+    """
 
+    tables = tuple(tables)
     rows: list[int] = []
     programs: list[object] = []
     for row, expr in enumerate(np.asarray(b_time_str_vector, dtype=object).reshape(-1)):
@@ -420,8 +435,41 @@ def _time_sources(b_time_str_vector: np.ndarray) -> tuple[np.ndarray, list[objec
         if text == "0":
             continue
         rows.append(row)
-        programs.append(compile_expression(text, time_dependent=True, n_unknowns=0).handle)
+        programs.append(_compile_time_program(text, tables).handle)
     return np.asarray(rows, dtype=np.int64), programs
+
+
+def transient_tables(problem: MnaProblem, t_step: float, t_stop: float) -> tuple[object, ...]:
+    """The problem's table sources resolved for a transient run (``tr``/``tf`` = 0 -> ``t_step``, ...)."""
+
+    from .table_sources import resolve_tables
+
+    return resolve_tables(problem.metadata, float(t_step), float(t_stop))
+
+
+def transient_grid(
+    problem: MnaProblem,
+    t_stop: float,
+    t_step: float,
+    tables: tuple[object, ...] = (),
+    breakpoints: bool = True,
+) -> np.ndarray:
+    """The transient time grid: the uniform grid, merged with the table breakpoints when ``breakpoints``.
+
+    Every corner of every table source inside ``[0, t_stop]`` becomes a grid point, plus
+    ``table_sources.RAMP_POINTS`` points across each ramp shorter than ``t_step``; points
+    closer than the core's grid tolerance are merged (``table_sources.merge_breakpoints``).
+    Without table sources (or with ``breakpoints=False``) this is ``_transient_time_points``.
+    """
+
+    t_points = _transient_time_points(t_stop, t_step)
+    if not breakpoints or not tables:
+        return t_points
+    from .table_sources import merge_breakpoints
+
+    return merge_breakpoints(
+        t_points, tables, float(t_stop), float(t_step), rel_tol=float(_native_core().TIME_GRID_REL_TOL)
+    )
 
 
 def _krylov_arguments(
@@ -613,6 +661,7 @@ def solve_transient(
     progress: Callable[[int, float, np.ndarray], object] | None = None,
     progress_every: int = 0,
     diagnostics: list[str] | None = None,
+    breakpoints: bool = True,
 ) -> WaveformResult:
     """Solve the transient response with Backward Euler in the native core.
 
@@ -621,12 +670,18 @@ def solve_transient(
     from that Newton starting point (:func:`newton_start`). The whole stepping loop runs in
     ``_core.solve_transient`` without the GIL; ``progress(step, t, x)`` (optional) is called
     every ``progress_every`` steps and after the last one.
+
+    Table sources (``PULSE``/``PWL`` records, request stimuli) are resolved for this
+    ``t_step``/``t_stop``; with ``breakpoints`` (the default) their corners are merged
+    into the uniform grid (:func:`transient_grid`) and ``WaveformResult.time`` is the
+    merged grid. Without table sources the grid is the uniform one, as before.
     """
 
     size = len(problem.index_map.node_names) + len(problem.index_map.branch_names)
     nonlinear = _problem_is_nonlinear(problem)
     circuit, gmin = _problem_circuit(problem, nonlinear)
-    rows, programs = _time_sources(problem.b_time_str)
+    tables = transient_tables(problem, t_step, t_stop)
+    rows, programs = _time_sources(problem.b_time_str, tables)
     b_dc = np.ascontiguousarray(np.asarray(problem.b_dc, dtype=float).reshape(-1))
     linear_kwargs = {
         "use_krylov": use_krylov,
@@ -660,7 +715,7 @@ def solve_transient(
     else:
         x_prev = _validated_state(init_cond, size)
 
-    t_points = _transient_time_points(t_stop, t_step)
+    t_points = transient_grid(problem, t_stop, t_step, tables, breakpoints)
     kwargs = _krylov_arguments(size, use_krylov, krylov_tol, krylov_max_iter, krylov_restart, krylov_rank, krylov_method)
     try:
         values, info = core.solve_transient(
@@ -972,11 +1027,13 @@ def reconstruct_time_domain(
     return _native_core().hb_reconstruct(coefficients, int(num_vars), int(H), float(omega_0), times, int(num_threads))
 
 
-def _hb_time_sources(b_time_str_vector: np.ndarray) -> tuple[np.ndarray, list[object]]:
-    """``(rows, programs)`` of the non-"0" rows of ``b_time_str`` (as ``compile_time_source_func`` compiles them)."""
+def _hb_time_sources(b_time_str_vector: np.ndarray, tables: tuple[object, ...] = ()) -> tuple[np.ndarray, list[object]]:
+    """``(rows, programs)`` of the non-"0" rows of ``b_time_str`` (as ``compile_time_source_func`` compiles them).
 
-    from .native.expressions import compile_expression
+    ``tables``: the resolved table data of the ``__table_k(t)`` placeholders (default none).
+    """
 
+    tables = tuple(tables)
     rows: list[int] = []
     programs: list[object] = []
     for row, expr_str in enumerate(np.asarray(b_time_str_vector, dtype=object).reshape(-1)):
@@ -984,8 +1041,26 @@ def _hb_time_sources(b_time_str_vector: np.ndarray) -> tuple[np.ndarray, list[ob
         if text == "0":
             continue
         rows.append(row)
-        programs.append(compile_expression(text, time_dependent=True, n_unknowns=0).handle)
+        programs.append(_compile_time_program(text, tables).handle)
     return np.asarray(rows, dtype=np.int64), programs
+
+
+def hb_tables(problem: MnaProblem, omega_0: float, H: int) -> tuple[object, ...]:
+    """The problem's table sources resolved for harmonic balance.
+
+    The table is sampled at the ``K = 2H + 1`` collocation points of one period
+    ``T = 2 pi / omega_0``; a ``PULSE`` ``tr``/``tf`` of 0 is one sample spacing ``T / K``
+    and a ``pw`` of 0 is ``T``.
+    """
+
+    from .table_sources import resolve_tables
+
+    metadata = problem.metadata
+    if not metadata or not metadata.get("_time_tables"):
+        return ()
+    period = 2.0 * np.pi / float(omega_0) if omega_0 else 0.0
+    samples = 2 * int(H) + 1
+    return resolve_tables(metadata, period / samples if samples > 0 else 0.0, period)
 
 
 def _hb_krylov_info(
@@ -1087,7 +1162,7 @@ def solve_harmonic_balance(
     num_vars = int(np.asarray(problem.b_dc).shape[0])
     harmonics = int(H)
     freq_dim = 2 * harmonics + 1
-    rows, programs = _hb_time_sources(problem.b_time_str)
+    rows, programs = _hb_time_sources(problem.b_time_str, hb_tables(problem, omega_0, harmonics))
 
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
     level1_devices = problem.level1_mos_devices

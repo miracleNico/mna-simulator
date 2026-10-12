@@ -22,9 +22,32 @@ from .solvers import (
     solve_ac,
     solve_dc_nr,
     solve_transient,
+    transient_tables,
 )
 from .solvers import solve_operating_point
+from .table_sources import public_metadata, stimulus_op_rhs
 from .utils import parse_value
+
+
+def breakpoints_enabled(options: AnalysisOptions) -> bool:
+    """The ``breakpoints`` option (default ``True``: table corners are merged into the transient grid)."""
+
+    return bool(getattr(options, "breakpoints", True))
+
+
+def op_rhs(problem: MnaProblem) -> np.ndarray:
+    """Right-hand side of ``.op``: ``b_dc`` plus each request stimulus at ``t = 0``.
+
+    Without stimuli this is ``problem.b_dc`` itself (the same array, as before).
+    """
+
+    extra = stimulus_op_rhs(problem.metadata)
+    if not extra:
+        return problem.b_dc
+    rhs = np.array(problem.b_dc, dtype=float, copy=True)
+    for row, value in extra:
+        rhs[row] += value
+    return rhs
 
 
 def _linear_solver_kwargs(options: AnalysisOptions, stats: list[dict[str, object]] | None = None) -> dict[str, object]:
@@ -44,7 +67,7 @@ def _result_metadata(
     options: AnalysisOptions,
     stats: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    metadata = dict(problem.metadata)
+    metadata = public_metadata(problem.metadata)
     metadata["nonlinear_device_count"] = len(problem.level1_mos_devices) + len(problem.level1_bjt_devices)
     metadata["nonlinear_mos_device_count"] = len(problem.level1_mos_devices)
     metadata["nonlinear_bjt_device_count"] = len(problem.level1_bjt_devices)
@@ -456,7 +479,7 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
         diagnostics: list[str] = []
         solution = solve_operating_point(
             problem,
-            problem.b_dc,
+            op_rhs(problem),
             max_iter=options.max_iter,
             v_tol=options.v_tol,
             f_tol=options.f_tol,
@@ -514,9 +537,11 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
                     max_iter=options.max_iter,
                     v_tol=options.v_tol,
                     f_tol=options.f_tol,
+                    breakpoints=breakpoints_enabled(options),
                 )
                 metadata = _result_metadata(problem, options, krylov_stats)
                 metadata.update(mor_metadata)
+                metadata["time_points"] = int(len(waveform.time))
                 return SimulationResult(
                     mode=options.mode,
                     status="ok",
@@ -542,12 +567,14 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
                 f_tol=options.f_tol,
                 init_cond=init_cond,
                 linear_kwargs=linear_kwargs,
+                breakpoints=breakpoints_enabled(options),
             )
             if options.mor_method == "tpwl":
                 mor_metadata["mor_fallback_reason"] = "TPWL/POD is nonlinear transient MOR; linear circuits route to Linear Krylov MOR."
             metadata = _result_metadata(problem, options, krylov_stats)
             metadata.update(mor_metadata)
             metadata["op_used"] = False
+            metadata["time_points"] = int(len(waveform.time))
             return SimulationResult(
                 mode=options.mode,
                 status="ok",
@@ -567,7 +594,7 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
         op_used = False
         op_solution: np.ndarray | None = None
         if initial_state is None and has_level1_devices:
-            b_time_func = compile_time_source_func(problem.b_time_str)
+            b_time_func = compile_time_source_func(problem.b_time_str, transient_tables(problem, t_step, t_stop))
             op_solution = solve_operating_point(
                 problem,
                 problem.b_dc + b_time_func(0.0),
@@ -592,10 +619,12 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
             init_cond=transient_start,
             num_threads=options.num_threads,
             diagnostics=diagnostics,
+            breakpoints=breakpoints_enabled(options),
             **linear_kwargs,
         )
         metadata = _result_metadata(problem, options, krylov_stats)
         metadata["op_used"] = op_used
+        metadata["time_points"] = int(len(waveform.time))
         if op_solution is not None:
             metadata["operating_point"] = {
                 "labels": labels,

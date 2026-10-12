@@ -16,6 +16,7 @@ from .solvers import (
     resolve_krylov_rank,
     solve_harmonic_balance,
 )
+from .table_sources import public_metadata
 from .utils import parse_value
 
 
@@ -131,7 +132,7 @@ def run_advanced_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simu
     )
 
     labels = problem.metadata.get("labels", [])
-    metadata = dict(problem.metadata)
+    metadata = public_metadata(problem.metadata)
     metadata.update({"base_frequency_hz": f0, "harmonics": harmonics})
     metadata["hb_solver"] = {
         key: hb_stats[key]

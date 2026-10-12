@@ -288,6 +288,8 @@ nb::tuple solve_transient(const Circuit& circuit, In1D<double> x0, In1D<double> 
 
 void bind_analyses_basic(nb::module_& m) {
     m.attr("PARALLEL_DEVICE_MIN_COUNT") = mna::analyses::kParallelDeviceMinCount;
+    // Relative snapping tolerance of transient_time_points (also used to merge breakpoints).
+    m.attr("TIME_GRID_REL_TOL") = mna::analyses::kTimeGridRelTol;
 
     m.def("transient_time_points", &transient_time_points, "t_stop"_a, "t_step"_a,
           "Fixed-step transient grid (bitwise port of solvers._transient_time_points). Raises\n"

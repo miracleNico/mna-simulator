@@ -19,6 +19,7 @@ from .device_models import (
     source_expression,
 )
 from .errors import CircuitSimulatorError, error_handler
+from .table_sources import STIMULUS_KEY, STIMULUS_OP_KEY, TIME_TABLES_KEY, TableSpec, table_source_terms, table_spec
 from .utils import format_voltage_labels, parse_value
 
 
@@ -455,6 +456,9 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
     f_str: list[list[Any] | None] = [None] * size
     solver_f_str: list[list[Any] | None] = [None] * size
     b_time_str: list[list[Any] | None] = [None] * size
+    # Table sources (MIXED_SIGNAL.md D1): placeholder __table_k(t) in b_time_str <-> time_tables[k].
+    time_tables: list[TableSpec] = []
+    stimulus_op_rhs: list[tuple[int, float]] = []
     b_dc = np.zeros((size, 1), dtype=float)
     b_ac = np.zeros((size, 1), dtype=complex)
     controlling_branch_map: dict[str, int] = {}
@@ -721,6 +725,17 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             # node1 to node2, an inductor satisfies v(node1)-v(node2)-L di/dt=0.
             entry_c(branch_idx, branch_idx, -parse_value(component.value or "0"))
             controlling_branch_map[component.name] = branch_idx
+        elif comp_type == "I" and component.metadata and (spec := table_spec(component)) is not None:
+            dc, phasor, expression = table_source_terms(component, spec, time_tables)
+            if j != -1:
+                b_dc[j] += dc
+            if k != -1:
+                b_dc[k] -= dc
+            if phasor:
+                stamp_numeric_rhs(b_ac, j, phasor, positive=True)
+                stamp_numeric_rhs(b_ac, k, phasor, positive=False)
+            _add_symbolic(b_time_str, j, expression, positive=True)
+            _add_symbolic(b_time_str, k, expression, positive=False)
         elif comp_type == "I":
             if (component.subtype or "").upper() == "DC":
                 current = parse_value(component.value or "0")
@@ -744,6 +759,18 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
                 expression = source_expression(component)
                 _add_symbolic(b_time_str, j, expression, positive=True)
                 _add_symbolic(b_time_str, k, expression, positive=False)
+        elif comp_type == "V" and component.metadata and (spec := table_spec(component)) is not None:
+            branch_idx = get_branch_index(component.name)
+            stamp_voltage_source(branch_idx, j, k)
+            controlling_branch_map[component.name] = branch_idx
+            dc, phasor, expression = table_source_terms(component, spec, time_tables)
+            b_dc[branch_idx] += dc
+            if phasor:
+                stamp_numeric_rhs(b_ac, branch_idx, phasor, positive=True)
+            _add_symbolic(b_time_str, branch_idx, expression, positive=True)
+            if STIMULUS_KEY in component.metadata and spec.table is not None:
+                # A request stimulus enters .op with its value at t = 0 (it has no DC part).
+                stimulus_op_rhs.append((branch_idx, float(spec.table(0.0))))
         elif comp_type == "V":
             branch_idx = get_branch_index(component.name)
             stamp_voltage_source(branch_idx, j, k)
@@ -873,6 +900,11 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
     if card_devices:
         # JSON-safe: name, type, equation set, card name, native table, internal nodes.
         metadata["card_devices"] = [device.summary() for device in card_devices]
+    if time_tables:
+        # Not JSON-safe: the result metadata replaces these by a summary (table_sources.public_metadata).
+        metadata[TIME_TABLES_KEY] = time_tables
+    if stimulus_op_rhs:
+        metadata[STIMULUS_OP_KEY] = stimulus_op_rhs
     native = _compile_native(
         size,
         gmin,
