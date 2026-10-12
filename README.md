@@ -126,6 +126,12 @@ Return JSON:
 python -m mna_simulation.cli run path/to/circuit.cir --json
 ```
 
+Read `.include`/`.lib` files from extra directories (searched after the directory of the including file; repeatable):
+
+```bash
+python -m mna_simulation.cli run path/to/deck.cir --lib vendor/models --lib ~/spice/lib
+```
+
 Run on the frozen pre-migration Python core (`--core python`; the default is `--core cpp`, or `MNA_CORE` when set):
 
 ```bash
@@ -182,7 +188,24 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MNA_NUM_THREADS=4 python -m uvicorn app
 - Transistors: `QNPN`, `QPNP`, `NMOS`, and `PMOS` default to physical Level-1 models, with small-signal compatibility still available.
 - Physical BJT syntax: `Q1 c b e QNPN LEVEL1 is bf br vaf var cje cjc rb re rc` and PNP equivalent.
 - Physical MOS syntax: `M1 d g s NMOS LEVEL1 beta vth lambda cgs cgd` and PMOS equivalent.
+- SPICE model cards and subcircuit macromodels: see [Netlist dialect](#netlist-dialect).
 - Schematic-only frontend helpers: `SUBCKT`, `NODE`, `LABEL`, `GND`.
+
+### Netlist dialect
+
+The parser reads the forms above and the SPICE constructs used by vendor model cards and subcircuit macromodels. A netlist that uses `.model`, `.subckt`/`X`, `.param`/`{...}`, `.include`/`.lib`, `.global`, `+` continuations or `;`/`$` comments goes through the SPICE front end (`mna_simulation/spice/`), which flattens it into the same component records; netlists without them are parsed exactly as before.
+
+- **No title line.** The first line is a netlist line like every other (comment a deck's title out with `*`). `.end` ends the netlist.
+- **Lexing.** `*` and `#` start a comment line, `;` starts an inline comment, `$` does when it follows whitespace. A line starting with `+` continues the previous line (comment lines may sit in between). Keywords, model and subcircuit names, parameter keys and node names are case-insensitive: `in` and `IN` are one net, labelled with the spelling of its first occurrence. Component names stay case-sensitive (`R1` and `r1` are two resistors), but a controlling-source name (`F1 a b v1 2`) finds `V1`. Values take the SPICE scale factors (`T G MEG K M MIL U N P F`, any case) and ignore a trailing unit word (`10kOhm`, `5V`, `1uF`, `100nS`, `10mA`, `1kHz`); other trailing letters stay an error (`1x`). Node names may contain `.`, `+` and `-` (`X1.out`, `IN+`).
+- **Model cards.** `.model NAME TYPE(k=v ...)` (parenthesised or not, `k = v` allowed) with types `D`, `NPN`, `PNP`, `NMOS`, `PMOS` (MOS `LEVEL` 1, 2 or 3; 2 and 3 map to the Level-1 equations with a diagnostic) and the passive cards `R`/`C`/`L` (give the value an instance omits) and `RES`/`CAP`/`IND` (multiply the instance value). Devices name the card after their terminals: `D1 a k D1N4148 [area] [AREA=]` (a diode's only multiplier is its area; `M=` is dropped with a diagnostic), `Q1 c b e [substrate] Q2N2222 [area] [M=]`, `M1 d g s [bulk] NMOD [L= W= M= AD= AS= PD= PS= NRD= NRS=]` (three terminals: bulk = source), `R1 a b [value] RMOD [M=] [TC1=]`. Card parameters are copied into the record (`HIERARCHY_AND_MODELS_PLAN.md` section 3.2 is the contract; the device equations that evaluate them are phase M2). A device line without a model name keeps its meaning (`D1 a k 1e-15`, `Q1 c b e QNPN LEVEL1 ...`).
+- **Subcircuits.** `.subckt NAME ports [PARAMS:] k=v ...` / `.ends [NAME]`, nested definitions local to their parent, `Xname nodes NAME [PARAMS:] k=v ...`. Instances are flattened with hierarchical names: `X1.R1` for components, `X1.n` for internal nets (deeper: `X1.X2.R1`); ports take the parent's nets; `0` and `.global` nets are never prefixed; result labels show the flattened names (`V(X1.out)`).
+- **Parameters.** `.param name=value` (top level or inside a `.subckt`), `PARAMS:` defaults overridden per instance, and `{expression}` anywhere a value goes: numbers with suffixes, `+ - * / ** ^`, comparisons, `c ? a : b`, `sqrt exp ln log log10 abs min max pow int floor ceil if(c,a,b)` (and `sin cos tan asin acos atan sinh cosh tanh sgn`), other parameters in scope, `pi` and `e`. The evaluator is a small parser, not Python `eval`.
+- **Libraries.** `.include "file"`, `.lib "file" section` with `.lib section` ... `.endl` blocks. A netlist file (`parse_netlist_file`, `mna-sim run`) resolves paths relative to the including file, then in the directories given with `--lib PATH` (repeatable); `run-text` resolves relative to the current directory. Netlist text sent to the HTTP API cannot read files: an `.include`/`.lib` there is an error that asks for the library to be pasted into the netlist (a pasted `.lib section` block is skipped with a diagnostic; remove its `.lib`/`.endl` lines to use it).
+- **Sources.** `V1 a b 5` (DC), `DC x`, `AC mag [phase]`, combinations (`V1 a b DC 5 AC 1 0`), `SIN(vo va freq [td theta phase])`, `PULSE(v1 v2 td tr tf pw per)`, `PWL(t1 v1 t2 v2 ...) [R=t] [TD=t]`, `EXP(v1 v2 td1 tau1 td2 tau2)`, with or without parentheses. `.op` uses the DC value, `.ac` the AC magnitude and phase, `.tran` and `.hb` the waveform (the DC value when there is none). Omitted (or zero) rise/fall times and time constants take the `.tran` step, pulse width and period the stop time, a SIN frequency `1/t_stop`, from the netlist's last `.tran` (without one: ideal edges, a pulse that does not end, no repetition). The dialect's own forms keep their meaning: `SIN amp freq` (two values, no parentheses) is this simulator's sine, and it is also the `.ac` stimulus, which a SPICE `SIN(...)` is not. Independent current sources keep this simulator's sign (current into the first node), also inside subcircuits, where a diagnostic points it out.
+- **Analyses.** `.tran` with one or two values keeps this simulator's order (`.tran <t_stop> [<t_step>]`; a diagnostic flags `t_stop < t_step`, the SPICE order); three or four values are SPICE's `tstep tstop tstart [tmax]` (`tstart`, `tmax` and `uic` ignored with a diagnostic). `.ac dec|oct|lin n f1 f2`: `lin` is exact; `dec`/`oct` run as a linear sweep from `f1` to `f2` with `n` points per decade/octave in total (`.ac dec 10 1 1meg`: 61 points), with a diagnostic.
+- **Ignored with a diagnostic** (in the response's `diagnostics`): `.options`, `.temp`, `.nodeset`, `.ic`, `.probe`, `.print`, `.plot`, `.save`, `.backanno`, `.step`, `.meas`, `.four`, `.noise`, `.tf`, `.dc` sweeps (run as `.op`), `.control` blocks, card parameters the equations do not use (or not yet), temperature coefficients, substrate nodes, unused cards of unsupported types, ignored instance parameters (`OFF`, `IC=`, ...).
+- **Errors** (`NETLIST_FATAL` naming the line, the file of an included line and the subcircuit instance): an undefined model or subcircuit, a referenced card of an unsupported type or MOS `LEVEL` above 3 (BSIM, ...), a wrong card type, instance port-count mismatch, recursive subcircuits or includes, duplicate definitions, unresolved parameters, `.func`, `.if`/`.else`/`.endif`, `.alter`, `TABLE`/`LAPLACE`/`VALUE`/`POLY` controlled sources, `B` sources with `V=`/`I=`, `PWL FILE=`, `SFFM`/`AM`/`TRNOISE` sources, switches `S`/`W`, transmission lines `T`/`O`/`U`, coupling `K`, JFETs `J` and MESFETs `Z`.
+- **Python core mode.** `MNA_CORE=python` / `--core python` runs the frozen pre-migration parser, which knows none of these constructs (and no vendor-model devices).
 
 ## Supported Analysis Modes
 

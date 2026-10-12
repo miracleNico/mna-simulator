@@ -7,6 +7,7 @@ import numpy as np
 import re
 
 from .api.contracts import ComponentRecord
+from .spice.sources import render_transient, source_terms
 from .utils import parse_value
 
 V_T = "0.025"
@@ -19,9 +20,18 @@ def _periodize_time_symbol(expression: str, period: float) -> str:
 
 
 def source_expression(component: ComponentRecord) -> str:
-    """Build the time-domain expression string for a source."""
+    """Build the time-domain expression string for a source.
+
+    SPICE forms (``PULSE``, ``PWL``, ``EXP`` and the parenthesised ``SIN``, recognised by
+    their ``metadata``) render as piecewise-linear / exponential / sinusoidal expressions
+    of ``t`` (``spice.sources``); the dialect's own forms keep their expressions.
+    """
 
     subtype = (component.subtype or "").upper()
+    if component.metadata:
+        waveform = render_transient(subtype, component.metadata)
+        if waveform is not None:
+            return waveform
     amplitude = parse_value(component.value or "0")
 
     if subtype == "SIN":
@@ -51,6 +61,17 @@ def source_expression(component: ComponentRecord) -> str:
         return f"({_periodize_time_symbol(expression, period)})"
 
     return "0"
+
+
+def spice_source_terms(component: ComponentRecord) -> tuple[float, complex, str | None]:
+    """``(dc, ac phasor, time expression or None)`` of a SPICE-form ``V``/``I`` record.
+
+    A SPICE-form record is one with ``metadata`` (``DC x AC mag phase``, ``PULSE``,
+    ``PWL``, ``EXP``, ``SIN(...)``); ``.op`` uses ``dc``, ``.ac`` the phasor, and
+    ``.tran``/``.hb`` ``dc`` plus the time expression (the waveform minus ``dc``).
+    """
+
+    return source_terms((component.subtype or "").upper(), component.value, component.metadata)
 
 
 def diode_current_expression(component: ComponentRecord, j_expr: str, k_expr: str) -> str:

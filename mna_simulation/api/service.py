@@ -70,8 +70,13 @@ class SimulationService:
 
         return self._budget if self._budget is not None else default_budget()
 
-    def run_request(self, request: AnalysisRequest) -> SimulationResponse:
-        """Run a request and convert the result to a JSON-safe response."""
+    def run_request(self, request: AnalysisRequest, *, include_resolver=None) -> SimulationResponse:  # noqa: ANN001
+        """Run a request and convert the result to a JSON-safe response.
+
+        ``include_resolver`` lets netlist text read ``.include``/``.lib`` files (the CLI
+        passes one for netlist files; HTTP requests have none, so their netlists must be
+        self-contained). The parser's diagnostics come first in ``response.diagnostics``.
+        """
 
         generated_netlist: str | None = None
         if request.schematic is not None:
@@ -82,6 +87,8 @@ class SimulationService:
             )
             circuit = converted.circuit
             generated_netlist = converted.netlist_text
+        elif include_resolver is not None:
+            circuit = self.backend.parse_text(request.netlist_text, include_resolver=include_resolver)
         else:
             circuit = self.backend.parse_text(request.netlist_text)
         try:
@@ -156,7 +163,7 @@ class SimulationService:
             mode=result.mode,
             status=result.status,
             labels=result.labels,
-            diagnostics=result.diagnostics,
+            diagnostics=[*getattr(circuit, "diagnostics", ()), *result.diagnostics],
             metadata=result.metadata,
             dc_solution=dc_solution,
             waveform=waveform,

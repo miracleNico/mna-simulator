@@ -44,6 +44,9 @@ class CircuitIR:
     components: list[ComponentRecord]
     directives: list["DirectiveRecord"] = field(default_factory=list)
     source_text: str = ""
+    # Parser notes on constructs that were read but ignored or approximated (unused card
+    # parameters, .options, .dc sweeps, ...); the service puts them in the response.
+    diagnostics: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

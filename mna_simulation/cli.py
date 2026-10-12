@@ -7,9 +7,10 @@ import json
 from pathlib import Path
 
 from .api.contracts import AnalysisMode, AnalysisRequest
-from .api.service import CORE_ENV_VAR, CORES, create_service
+from .api.service import CORE_ENV_VAR, CORES, SimulationService, create_service
 from .errors import CircuitSimulatorError
 from .native.threads import ENV_VAR, coerce_num_threads
+from .spice.frontend import FileIncludeResolver
 
 
 def _threads_arg(value: str) -> int | str:
@@ -39,6 +40,17 @@ def _add_threads_option(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_lib_option(parser: argparse.ArgumentParser, relative_to: str) -> None:
+    parser.add_argument(
+        "--lib",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="PATH",
+        help=f"Directory searched for .include/.lib files after {relative_to} (repeatable).",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser."""
 
@@ -55,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     _add_threads_option(run_parser)
+    _add_lib_option(run_parser, "the directory of the including file")
 
     text_parser = subparsers.add_parser("run-text", help="Run a simulation from inline netlist text.")
     text_parser.add_argument("netlist_text", help="Raw netlist text.")
@@ -66,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     text_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     _add_threads_option(text_parser)
+    _add_lib_option(text_parser, "the current directory")
 
     return parser
 
@@ -115,12 +129,20 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "run":
             text = args.path.read_text(encoding="utf-8")
+            resolver = FileIncludeResolver(search_dirs=args.lib, root=args.path)
         else:
             text = args.netlist_text
+            resolver = FileIncludeResolver(search_dirs=args.lib)
 
         mode = AnalysisMode(args.mode) if args.mode else None
         options = {} if args.threads is None else {"num_threads": args.threads}
-        response = service.run_request(AnalysisRequest(netlist_text=text, mode=mode, options=options))
+        request = AnalysisRequest(netlist_text=text, mode=mode, options=options)
+        if isinstance(service, SimulationService):
+            # .include/.lib resolve next to the netlist file (or the current directory), then --lib.
+            response = service.run_request(request, include_resolver=resolver)
+        else:
+            # The frozen Python core has its own (pre-SPICE) parser.
+            response = service.run_request(request)
         _print_response(response, as_json=args.json)
         return 0
     except CircuitSimulatorError as exc:

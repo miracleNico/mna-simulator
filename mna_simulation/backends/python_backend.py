@@ -239,11 +239,11 @@ class PythonBackend:
             supports_cpp_acceleration=False,
         )
 
-    def parse_text(self, netlist_text: str) -> CircuitIR:
-        return parse_netlist_text(netlist_text)
+    def parse_text(self, netlist_text: str, *, include_resolver=None) -> CircuitIR:  # noqa: ANN001
+        return parse_netlist_text(netlist_text, include_resolver=include_resolver)
 
-    def parse_file(self, path: str | Path) -> CircuitIR:
-        return parse_netlist_file(path)
+    def parse_file(self, path: str | Path, *, search_dirs=()) -> CircuitIR:  # noqa: ANN001
+        return parse_netlist_file(path, search_dirs=search_dirs)
 
     def build_options(self, circuit: CircuitIR, overrides: dict | None = None, mode: AnalysisMode | None = None) -> AnalysisOptions:
         # ``.dyn`` is a UI-only mode that is executed as a ``.tran`` on the backend;
