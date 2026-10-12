@@ -521,7 +521,24 @@ with them within noise. Its headline rows, reference -> core at one thread (core
 | Reduced AC / reduced transient | 333 / 748 ms | 7.1 / 10.5 ms | | 47x / 71x |
 
 Every unit passes parity; every perf-gate floor (`tests/perf/test_perf_gate.py`) is met on it.
-A Windows baseline needs an idle Windows machine and is still pending.
+
+The Windows baseline `benchmarks/results/baseline-windows.md` / `.json` is the same run
+(`--threads 1,4`, 7 repetitions) at commit `4b0d65a` on an idle 16-thread Windows 11 laptop
+(Ryzen 9 6900HS, AC power, Turbo mode, MSVC 19.38 Release, Python 3.14.2, NumPy 2.5.4, SciPy
+1.18.1; CPU utilisation 12.6% on average during the run, the benchmark included). Every unit
+passes parity and every floor is met there too. Absolute times are about 0.5x to 0.75x the Linux VM's on
+both sides; the 1-thread speedups are 0.56x (Krylov GMRES) to 1.38x (RLC circuit build) of the
+Linux ones. Headline rows, reference -> core at one thread (core at four threads):
+
+| Unit | Reference | Core 1 thread | Core 4 threads | Speedup |
+| --- | ---: | ---: | ---: | ---: |
+| SRAM 622-MOS device evaluation | 1.64 ms | 0.043 ms | 1.31 ms (thread start-up dominates) | 38x |
+| SRAM `.op` | 29.6 ms | 2.3 ms | 2.4 ms | 12.6x |
+| SRAM `.tran 6n 0.25n` | 456 ms | 4.4 ms | 4.2 ms | 103x |
+| BJT `.tran` 2000 steps | 663 ms | 3.1 ms | 3.1 ms | 211x |
+| RLC 1035 `.tran` 40 steps, dense / Krylov | 1118 / 346 ms | 4.2 / 8.0 ms | 4.7 / 8.1 ms | 264x / 43x |
+| RLC 1035 `.ac` 100 points | 6342 ms | 34.6 ms | 10.3 ms | 183x (616x at 4 threads) |
+| HB mixer H = 205 / H = 64 | 2531 / 164 ms | 388 / 18.4 ms | 301 / 18.2 ms | 6.5x / 8.9x |
 
 ### 10.1 What landed, per phase
 
@@ -548,7 +565,7 @@ Against the "with native kernel" column of section 8:
 | RLC 23x23 `.tran` 40 steps | <= 0.02 s | 8.5 ms |
 | RLC 23x23 `.ac` 100 points | <= 0.1 s | 60 ms; 20 ms at 4 threads |
 | BJT 3-stage `.tran` 2001 steps | <= 0.05 s | 4.4 ms |
-| HB mixer H = 205 | <= 0.5 s (matrix-free) | 0.65 s at one thread, 0.54 s at four, with dense device blocks; matrix-free HB not done (10.4) |
+| HB mixer H = 205 | <= 0.5 s (matrix-free) | 0.65 s at one thread, 0.54 s at four, with dense device blocks (0.39 s and 0.30 s on the Windows baseline laptop); matrix-free HB not done (10.4) |
 | 4 concurrent SRAM runs, batch wall | <= 1.2 s | 0.15 s (4.9x the time of one run: the request is GIL-bound Python glue, 10.2); 4 concurrent HB mixer runs 1.10x the time of one |
 | `pytest` | <= 4 s | not comparable: the default suite now also runs the differential corpus and the binding tests: 2909 passed and 62 skipped in 156 s after P3b |
 

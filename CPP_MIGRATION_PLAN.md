@@ -14,7 +14,10 @@ solvers, linear MOR, TPWL) runs in `mna_simulation._core`, result metadata repor
 Python 3.12 and 3.13, ctest, ASan/UBSan, C++ coverage) and the Wheels workflow passed on `dev` at
 `04c46a3` (P5 and P6a) and at `0c46c39` (P3b). Speedups below are reference time / core time at one core thread from the idle-machine
 baseline `benchmarks/results/baseline-linux.md` (commit `057478f`, 4-CPU Linux VM, load average
-0.06; every unit at parity, every perf-gate floor met).
+0.06; every unit at parity, every perf-gate floor met). The Windows baseline
+`benchmarks/results/baseline-windows.md` (commit `4b0d65a`, idle 16-thread Windows 11 laptop, MSVC
+Release) also has every unit at parity and every floor met; its 1-thread speedups are 0.56x
+(Krylov GMRES) to 1.38x (RLC circuit build) of the Linux ones.
 
 | Phase | State | Evidence |
 | --- | --- | --- |
@@ -23,7 +26,7 @@ baseline `benchmarks/results/baseline-linux.md` (commit `057478f`, 4-CPU Linux V
 | P2 Linear algebra and `.op` | done | `tests/test_native_linalg.py`, `tests/test_native_newton.py`, `tests/test_krylov_solvers.py`, `.op` differential; SRAM `.op` 14x (exit criterion 5x); RLC direct solve 39x real, 80x complex |
 | P3 Transient, AC, operating points | done | `tests/test_native_transient.py`, `tests/test_native_ac.py`, `.tran`/`.ac` differential including the 1035-unknown mesh; SRAM `.tran` 123x, BJT 2001 steps 354x, RLC `.tran` 272x, RLC `.ac` 174x plus 3.0x from 4 threads (floor 1.5x) |
 | P3b Convergence improvements | done | `tests/test_native_convergence.py`, `cpp/tests/test_pnjlim.cpp`, corpus `Deviation`s checked by `differential.compare.check_deviation`; rulings and details in 2.4.1 and 2.6 |
-| P4 Harmonic balance | done, one target open | `tests/test_native_hb.py` (every corpus `hb` analysis within 1e-6, the 205-harmonic mixer included), `tests/test_harmonic_balance.py`; mixer 6.8x (floor 2x), but 0.65 s at one thread and 0.54 s at four on the idle machine against the 0.5 s exit target: recheck on the idle-machine baseline |
+| P4 Harmonic balance | done, one target open | `tests/test_native_hb.py` (every corpus `hb` analysis within 1e-6, the 205-harmonic mixer included), `tests/test_harmonic_balance.py`; mixer 6.8x (floor 2x), but 0.65 s at one thread and 0.54 s at four on the idle Linux VM against the 0.5 s exit target; the idle Windows laptop (`baseline-windows`) meets it at 0.39 s and 0.30 s, so the target holds on faster hardware only |
 | P5 MOR | done | `tests/test_native_mor.py`, `tests/test_mor.py`, MOR differential (three analyses against the oracle's full-order solution, 2.4.1); MOR basis 30x, TPWL training 131x, reduced AC 47x, reduced transient 80x |
 | P6 Cut-over and hardening | done (deviations below) | front end (P6a, `tests/test_front_end_fast_path.py`: SRAM build 20x, parse 3.5x); thread budget, `num_threads`, UI control, metadata, CLI `--threads` (`tests/test_thread_budget.py`, `tests/test_thread_options.py`, `tests/test_server_api.py`); `benchmarks/compare_backends.py` and `tests/perf/test_perf_gate.py` (every floor met on the interim baseline and in a `--run-perf` run after P3b, shared machine); `tests/test_determinism.py` (every corpus analysis bitwise identical at 1 and 4 threads); `tests/test_native_leaks.py` (250 SRAM runs, RSS growth below 20 MB); README, STRUCT, USER_GUIDE, PERFORMANCE_PLAN |
 | P7 Optional | not started | known limitations and candidates in `PERFORMANCE_PLAN.md` sections 10.3 and 10.4 |
@@ -43,8 +46,8 @@ P6 notes:
   0.153 s. A process pool or less Python glue would lower the SRAM ratio (P7).
 - **Wheels.** The Wheels workflow builds the abi3 wheels for Linux and Windows and runs the full
   suite against the installed wheel under CPython 3.12 (cibuildwheel) and 3.13 (a second job).
-- **Baselines.** The idle-machine `benchmarks/results/baseline-linux.{json,md}` is committed; a
-  Windows baseline needs an idle Windows machine and is pending.
+- **Baselines.** The idle-machine `benchmarks/results/baseline-linux.{json,md}` (commit `057478f`)
+  and `benchmarks/results/baseline-windows.{json,md}` (commit `4b0d65a`) are committed.
 - **Smaller deviations from the P6 deliverables.** ASan/UBSan and coverage cover ctest only (no
   pytest subset under the sanitizers, no coverage threshold); KLU/BTF stay statically linked
   (`cpp/third_party/README.md` records the LGPL reasoning) instead of a shared library in the

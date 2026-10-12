@@ -484,7 +484,7 @@ Each module exercises one native unit through its binding and its Python facade,
 - Writes JSON `schema_version` 1 (host with platform, CPUs, versions, `core_version`/`build_info`, git commit, load average and a warning above 0.5; methodology; per-unit timings, speedups, parity) and prints a Markdown table (`n/a (P<n>)` for units without a native side).
 
 ### `benchmarks/results/`
-- Output directory of `compare_backends.py`; run files are git-ignored. Committed: `baseline-linux.json` and `.md`, a full run (`--threads 1,4`, 7 repetitions) on an idle 4-CPU Linux VM at commit `057478f` (after P3b); `baseline-windows.json` is pending an idle Windows machine. `README.md` documents the format and the policy.
+- Output directory of `compare_backends.py`; run files are git-ignored. Committed: `baseline-linux.json` and `.md`, a full run (`--threads 1,4`, 7 repetitions) on an idle 4-CPU Linux VM at commit `057478f` (after P3b), and `baseline-windows.json` and `.md`, the same run on an idle 16-thread Windows 11 laptop (MSVC Release) at commit `4b0d65a`. `README.md` documents the format and the policy.
 
 ### `benchmarks/prototypes/`
 - Research prototypes behind the plan: vectorized NumPy, Numba, and pybind11 C++ Level-1 MOS kernels, a kernel comparison harness, and a cached sparse-LU versus dense solve benchmark. Not imported by the package.

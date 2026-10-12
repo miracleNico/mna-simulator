@@ -45,8 +45,13 @@ work.
 Committed now: `baseline-linux.json` and `baseline-linux.md`, a full run
 (`--threads 1,4`, 7 repetitions) at commit `057478f` (after P3b) on an idle
 4-CPU Linux VM (load average 0.06). `PERFORMANCE_PLAN.md` section 10 and the
-`CPP_MIGRATION_PLAN.md` status quote it. A Windows baseline
-(`baseline-windows.json`) needs an idle Windows machine and is still pending.
+`CPP_MIGRATION_PLAN.md` status quote it. `baseline-windows.json` and
+`baseline-windows.md` are the same run (`--threads 1,4`, 7 repetitions) at
+commit `4b0d65a` on an idle 16-thread Windows 11 laptop (Ryzen 9 6900HS, AC
+power, Turbo mode, MSVC 19.38 Release, Python 3.14). Windows reports no load
+average, so the Markdown header records the CPU utilisation sampled during
+the run instead (mean 12.6%, the benchmark included). Every unit is at parity
+and every perf-gate floor is met on both baselines.
 
 ## Measure on an idle machine
 
