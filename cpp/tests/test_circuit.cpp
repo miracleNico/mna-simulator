@@ -159,9 +159,9 @@ TEST_CASE("device footprints join the pattern; ground entries get slot -1") {
     for (std::int32_t s = 0; s < c.nnz(); ++s) {
         CHECK(g[static_cast<std::size_t>(s)] == (s == c.slot(0, 0) ? 1e-3 : 0.0));
     }
-    // Assembly map: global order diodes, behavioral, MOS, BJT.
+    // Assembly map: global order diodes, behavioral, MOS, BJT (then the empty model-card classes).
     const auto& m = c.assembly();
-    CHECK(m.class_begin == std::array<std::int64_t, 5>{0, 1, 2, 3, 4});
+    CHECK(m.class_begin == std::array<std::int64_t, 8>{0, 1, 2, 3, 4, 4, 4, 4});
     CHECK(m.f_offset == std::vector<std::int64_t>{0, 2, 4, 6, 9});
     CHECK(m.j_offset == std::vector<std::int64_t>{0, 4, 8, 14, 23});
 }

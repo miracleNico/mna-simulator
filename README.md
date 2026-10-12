@@ -184,6 +184,18 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MNA_NUM_THREADS=4 python -m uvicorn app
 - Physical MOS syntax: `M1 d g s NMOS LEVEL1 beta vth lambda cgs cgd` and PMOS equivalent.
 - Schematic-only frontend helpers: `SUBCKT`, `NODE`, `LABEL`, `GND`.
 
+### Vendor model cards
+
+Diodes, BJTs and MOSFETs can carry the parameters of a SPICE `.model` card (`HIERARCHY_AND_MODELS_PLAN.md` 3.2, phase M2). A component selects the equation set with `metadata["model"]` and carries the card values as text in `metadata` (lowercase keys, SPICE suffixes such as `2.52n`, `100MEG`, `4pF`); missing keys take the SPICE defaults. Until the SPICE-dialect parser lands, such components are built as `ComponentRecord`s in Python. All three equation sets use `vt = k T / q` at 27 °C (`8.617333262e-5 * 300.15`, about 0.025865 V); the existing `LEVEL1` and ideal-diode paths keep 0.02585 V and 0.025 V. Every exponential continues linearly beyond `|v / (n vt)| = 80` (value and slope continuous), so Newton never sees `inf`.
+
+| `metadata["model"]` | Device | Honoured in this phase | Recorded, used later (phase M4) |
+| --- | --- | --- | --- |
+| `spice` | `D` | `is n rs bv ibv cjo`, instance `area`; SPICE3f5 currents: `is (exp(v / (n vt)) - 1)` forward, the smooth reverse region below `-3 n vt`, breakdown `-is exp(-(bv_eff + v) / vt)` with SPICE's continuity-shifted `bv_eff`; `cjo` as a constant capacitor | `vj m fc tt eg xti tnom` (`m` is the grading coefficient here, not a multiplier) |
+| `gummel_poon` | `QNPN`, `QPNP` | `is bf nf br nr vaf var ikf ikr ise ne isc nc rb re rc cje cjc`, instance `area` and `m`; Gummel-Poon DC (base charge `qb` from `q1` (Early) and `q2` (high injection), leakage diodes), `cje`/`cjc` as zero-bias constant capacitors | `tf tr xtf vtf itf ptf vje mje vjc mjc xcjc fc xtb eg xti tnom rbm irb`; the substrate node is ignored |
+| `spice_level1` | `NMOS`, `PMOS` | `vto kp lambda gamma phi cgso cgdo cgbo`, instance `w l m` (`beta = kp w / l m`); LEVEL 1, 2 and 3 cards use the Level-1 equations with body effect `vth = vto + gamma (sqrt(phi - vbs) - sqrt(phi))` (held at its `vbs = 0` value for `vbs > 0`); the fourth node (`ctrl_node2`) is the bulk, three-node instances put it on the source; overlap capacitances `cgso w`, `cgdo w`, `cgbo l` | bulk junctions (`cbd cbs cj cjsw pb mj mjsw js`), Level 2/3 terms, `rd`/`rs` (not stamped) |
+
+`area` scales `is ise isc ikf ikr ibv cjo cje cjc` up and `rs rb re rc` down; `m` multiplies a BJT's area and a MOS's `beta` and overlap capacitances. Series resistances get internal nodes named `<component>#<terminal>`: `D1#a` for a diode's `rs`, `Q1#b`, `Q1#c`, `Q1#e` for `rb`, `rc`, `re` (only when positive). They are numbered after the sorted circuit nodes and before the branch currents, appear in the result labels (`V(D1#a)`) and get node-to-ground gmin like any node. `.op` reports the operating point of every card device (region, currents, conductances, internal nodes) in `metadata["device_operating_points"]`, and `metadata["card_devices"]` lists them. The kernels are `cpp/include/mna/devices/{spice_diode,gummel_poon,mos_card}.hpp`; `tests/device_reference/` holds an independent NumPy reference.
+
 ## Supported Analysis Modes
 
 - `.op` / `.dc`

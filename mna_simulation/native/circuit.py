@@ -13,7 +13,18 @@ and every device Jacobian footprint. Table layout of the spec dict passed to
              "sign": int32 (+1 NMOS, -1 PMOS)},
      "bjt": {"collector", "base", "emitter": int64, "is", "bf", "br", "vaf", "var": float64,
              "sign": int32 (+1 NPN, -1 PNP)},
-     "behavioral": {"node_p", "node_n": int64, "programs": [_core.Program, ...]}}
+     "behavioral": {"node_p", "node_n": int64, "programs": [_core.Program, ...]},
+     "spice_diodes": {"anode", "cathode": int64, "is", "n", "bv", "ibv": float64},
+     "gummel_poon": {"collector", "base", "emitter": int64, "is", "bf", "nf", "br", "nr", "vaf", "var",
+                     "ikf", "ikr", "ise", "ne", "isc", "nc": float64, "sign": int32 (+1 NPN, -1 PNP)},
+     "mos4": {"drain", "gate", "source", "bulk": int64, "beta", "vto", "lambda", "gamma", "phi": float64,
+              "sign": int32 (+1 NMOS, -1 PMOS)}}
+
+The last three are the model-card devices of ``HIERARCHY_AND_MODELS_PLAN.md`` 3.2 (phase M2;
+``cpp/include/mna/devices/{spice_diode,gummel_poon,mos_card}.hpp``): every parameter is
+already scaled by the instance area / multiplier, ``bv``/``vaf``/``var``/``ikf``/``ikr`` may be
+``inf`` (not given), ``vto`` is the card's VTO (the kernel applies the PMOS sign) and the
+terminals are the intrinsic ones (the builder's internal nodes when series resistances exist).
 
 ``node_count`` (P3b, ``CPP_MIGRATION_PLAN.md`` 2.4.1): the unknowns ``[0, node_count)``
 are node voltages; the core appends one unit node-to-ground stamp per node to the gmin
@@ -46,8 +57,11 @@ __all__ = [
     "build_circuit",
     "compile_device_functions",
     "diode_table",
+    "gummel_poon_table",
     "infer_node_count",
+    "mos4_table",
     "mos_table",
+    "spice_diode_table",
     "triplets",
 ]
 
@@ -124,6 +138,44 @@ def bjt_table(devices: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
     }
 
 
+SPICE_DIODE_COLUMNS = ("is", "n", "bv", "ibv")
+GUMMEL_POON_COLUMNS = ("is", "bf", "nf", "br", "nr", "vaf", "var", "ikf", "ikr", "ise", "ne", "isc", "nc")
+MOS4_COLUMNS = ("beta", "vto", "lambda", "gamma", "phi")
+
+
+def _device_columns(
+    devices: Sequence[dict[str, Any]], nodes: tuple[str, ...], values: tuple[str, ...]
+) -> dict[str, np.ndarray]:
+    table: dict[str, np.ndarray] = {}
+    for key in nodes:
+        table[key] = np.asarray([int(d[key]) for d in devices], dtype=np.int64).reshape(-1)
+    for key in values:
+        table[key] = np.asarray([float(d[key]) for d in devices], dtype=np.float64).reshape(-1)
+    return table
+
+
+def spice_diode_table(devices: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """Table of SPICE diode dictionaries (keys anode/cathode/is/n/bv/ibv, area already applied)."""
+
+    return _device_columns(devices, ("anode", "cathode"), SPICE_DIODE_COLUMNS)
+
+
+def gummel_poon_table(devices: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """Table of Gummel-Poon BJT dictionaries (intrinsic collector/base/emitter, card values, type)."""
+
+    table = _device_columns(devices, ("collector", "base", "emitter"), GUMMEL_POON_COLUMNS)
+    table["sign"] = _signs([d["type"] for d in devices], "QPNP")
+    return table
+
+
+def mos4_table(devices: Sequence[dict[str, Any]]) -> dict[str, np.ndarray]:
+    """Table of four-terminal card MOS dictionaries (drain/gate/source/bulk, beta/vto/lambda/gamma/phi, type)."""
+
+    table = _device_columns(devices, ("drain", "gate", "source", "bulk"), MOS4_COLUMNS)
+    table["sign"] = _signs([d["type"] for d in devices], "PMOS")
+    return table
+
+
 def behavioral_table(node_p: Sequence[int], node_n: Sequence[int], programs: Sequence[Program]) -> dict[str, Any]:
     return {
         "node_p": _int64(node_p),
@@ -148,6 +200,9 @@ def infer_node_count(
     mos: dict[str, np.ndarray] | None = None,
     bjt: dict[str, np.ndarray] | None = None,
     behavioral: dict[str, Any] | None = None,
+    spice_diodes: dict[str, np.ndarray] | None = None,
+    gummel_poon: dict[str, np.ndarray] | None = None,
+    mos4: dict[str, np.ndarray] | None = None,
 ) -> int:
     """Number of node-voltage unknowns of a builder-ordered circuit (nodes first, then branch currents).
 
@@ -171,6 +226,9 @@ def infer_node_count(
         (mos, ("drain", "gate", "source")),
         (bjt, ("collector", "base", "emitter")),
         (behavioral, ("node_p", "node_n")),
+        (spice_diodes, ("anode", "cathode")),
+        (gummel_poon, ("collector", "base", "emitter")),
+        (mos4, ("drain", "gate", "source", "bulk")),
         (gmin_stamps, ("rows", "cols")),
     ):
         for key in keys:
@@ -220,6 +278,9 @@ def build_circuit(
     bjt: dict[str, np.ndarray] | None = None,
     behavioral: dict[str, Any] | None = None,
     node_count: int | None = None,
+    spice_diodes: dict[str, np.ndarray] | None = None,
+    gummel_poon: dict[str, np.ndarray] | None = None,
+    mos4: dict[str, np.ndarray] | None = None,
 ) -> Any:
     """Compile the tables into a ``_core.Circuit`` handle (see the module docstring for the layout).
 
@@ -229,7 +290,17 @@ def build_circuit(
 
     if node_count is None:
         node_count = infer_node_count(
-            n, G=G, C=C, gmin_stamps=gmin_stamps, diodes=diodes, mos=mos, bjt=bjt, behavioral=behavioral
+            n,
+            G=G,
+            C=C,
+            gmin_stamps=gmin_stamps,
+            diodes=diodes,
+            mos=mos,
+            bjt=bjt,
+            behavioral=behavioral,
+            spice_diodes=spice_diodes,
+            gummel_poon=gummel_poon,
+            mos4=mos4,
         )
     spec: dict[str, Any] = {"n": int(n), "gmin": float(gmin), "node_count": int(node_count)}
     for key, table in (
@@ -240,6 +311,9 @@ def build_circuit(
         ("mos", mos),
         ("bjt", bjt),
         ("behavioral", behavioral),
+        ("spice_diodes", spice_diodes),
+        ("gummel_poon", gummel_poon),
+        ("mos4", mos4),
     ):
         if table is not None:
             spec[key] = table

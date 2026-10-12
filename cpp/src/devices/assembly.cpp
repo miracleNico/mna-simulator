@@ -8,7 +8,10 @@
 
 #include "mna/devices/bjt_level1.hpp"
 #include "mna/devices/diode.hpp"
+#include "mna/devices/gummel_poon.hpp"
+#include "mna/devices/mos_card.hpp"
 #include "mna/devices/mos_level1.hpp"
+#include "mna/devices/spice_diode.hpp"
 #include "mna/expr/program.hpp"
 #include "mna/threads.hpp"
 
@@ -98,11 +101,68 @@ void eval_bjt(const Circuit::Bjt& bv, const double* x, std::int64_t begin, std::
     }
 }
 
+void eval_spice_diodes(const Circuit::SpiceDiodes& dv, const double* x, std::int64_t begin, std::int64_t end,
+                       std::int64_t d0, const Circuit::AssemblyMap& m, double* fs, double* js) {
+    for (std::int64_t i = begin; i < end; ++i) {
+        const auto u = static_cast<std::size_t>(i);
+        const double v = voltage(x, dv.anode[u]) - voltage(x, dv.cathode[u]);
+        const devices::SpiceDiodeEval r = devices::spice_diode(dv.is[u], dv.n[u], dv.bv_eff[u], v);
+        double* f = fs + m.f_offset[static_cast<std::size_t>(d0 + i)];
+        double* j = js + m.j_offset[static_cast<std::size_t>(d0 + i)];
+        f[0] = r.current;
+        f[1] = -r.current;
+        j[0] = r.conductance;
+        j[1] = -r.conductance;
+        j[2] = -r.conductance;
+        j[3] = r.conductance;
+    }
+}
+
+void eval_gummel_poon(const Circuit::GummelPoon& bv, const double* x, std::int64_t begin, std::int64_t end,
+                      std::int64_t d0, const Circuit::AssemblyMap& m, double* fs, double* js) {
+    for (std::int64_t i = begin; i < end; ++i) {
+        const auto u = static_cast<std::size_t>(i);
+        const devices::BjtEval r =
+            devices::gummel_poon(bv.sign[u], bv.params[u], voltage(x, bv.collector[u]), voltage(x, bv.base[u]),
+                                 voltage(x, bv.emitter[u]));
+        double* f = fs + m.f_offset[static_cast<std::size_t>(d0 + i)];
+        double* j = js + m.j_offset[static_cast<std::size_t>(d0 + i)];
+        for (int row = 0; row < 3; ++row) {
+            f[row] = r.i[row];
+            for (int col = 0; col < 3; ++col) {
+                j[3 * row + col] = r.d[row][col];
+            }
+        }
+    }
+}
+
+void eval_mos_card(const Circuit::MosCard& mv, const double* x, std::int64_t begin, std::int64_t end,
+                   std::int64_t d0, const Circuit::AssemblyMap& m, double* fs, double* js) {
+    for (std::int64_t i = begin; i < end; ++i) {
+        const auto u = static_cast<std::size_t>(i);
+        const devices::Mos4Eval r = devices::mos_card(
+            mv.sign[u], mv.beta[u], mv.vto[u], mv.lambda[u], mv.gamma[u], mv.phi[u], voltage(x, mv.drain[u]),
+            voltage(x, mv.gate[u]), voltage(x, mv.source[u]), voltage(x, mv.bulk[u]));
+        double* f = fs + m.f_offset[static_cast<std::size_t>(d0 + i)];
+        double* j = js + m.j_offset[static_cast<std::size_t>(d0 + i)];
+        f[0] = r.ids;
+        f[1] = -r.ids;
+        j[0] = r.d_drain;
+        j[1] = r.d_gate;
+        j[2] = r.d_source;
+        j[3] = r.d_bulk;
+        j[4] = -r.d_drain;
+        j[5] = -r.d_gate;
+        j[6] = -r.d_source;
+        j[7] = -r.d_bulk;
+    }
+}
+
 /// Phase 2 for the outputs [begin, end) of one gather plan. Each output is the
 /// sequential (device-order) sum of its entries within each assembly group,
-/// and the group sums are added in group order: ((0 + g0) + g1) + g2. With at
+/// and the group sums are added in group order: (((0 + g0) + g1) + g2) + g3. With at
 /// most one group present that is the plain sequential sum, computed by a
-/// branch-free scatter. `acc` (3 doubles per output) is only used when
+/// branch-free scatter. `acc` (kAssemblyGroups doubles per output) is only used when
 /// several groups are present; chunks touch disjoint parts of out and acc.
 void gather_range(const Circuit::Gather& g, int groups_present, const double* scratch, std::int64_t begin,
                   std::int64_t end, double* out, double* acc) {
@@ -171,6 +231,15 @@ void evaluate_device_range(const Circuit& circuit, const double* x, double t, st
     }
     if (clip(cb[3], cb[4], b, e)) {
         eval_bjt(circuit.bjt(), x, b, e, cb[3], m, f_scratch, j_scratch);
+    }
+    if (clip(cb[4], cb[5], b, e)) {
+        eval_spice_diodes(circuit.spice_diodes(), x, b, e, cb[4], m, f_scratch, j_scratch);
+    }
+    if (clip(cb[5], cb[6], b, e)) {
+        eval_gummel_poon(circuit.gummel_poon(), x, b, e, cb[5], m, f_scratch, j_scratch);
+    }
+    if (clip(cb[6], cb[7], b, e)) {
+        eval_mos_card(circuit.mos4(), x, b, e, cb[6], m, f_scratch, j_scratch);
     }
 }
 
@@ -254,6 +323,71 @@ OperatingPoints operating_points(const Circuit& circuit, const double* x) {
         op.bjt_go[i] = r.d[0][0];
         op.bjt_rpi[i] = std::fabs(r.d[1][1]) > 1e-30 ? 1.0 / r.d[1][1] : std::numeric_limits<double>::infinity();
         op.bjt_region[i] = static_cast<std::int32_t>(devices::bjt_level1_region(bv.sign[i], vc, vb, ve));
+    }
+
+    const Circuit::SpiceDiodes& sd = circuit.spice_diodes();
+    const std::size_t nsd = sd.anode.size();
+    op.spice_diode_vd.resize(nsd);
+    op.spice_diode_id.resize(nsd);
+    op.spice_diode_gd.resize(nsd);
+    op.spice_diode_bv_eff = sd.bv_eff;
+    op.spice_diode_region.resize(nsd);
+    for (std::size_t i = 0; i < nsd; ++i) {
+        const double v = voltage(x, sd.anode[i]) - voltage(x, sd.cathode[i]);
+        const devices::SpiceDiodeEval r = devices::spice_diode(sd.is[i], sd.n[i], sd.bv_eff[i], v);
+        op.spice_diode_vd[i] = v;
+        op.spice_diode_id[i] = r.current;
+        op.spice_diode_gd[i] = r.conductance;
+        op.spice_diode_region[i] = static_cast<std::int32_t>(devices::spice_diode_region(sd.n[i], sd.bv_eff[i], v));
+    }
+
+    const Circuit::GummelPoon& gp = circuit.gummel_poon();
+    const std::size_t ng = gp.collector.size();
+    op.gp_ic.resize(ng);
+    op.gp_ib.resize(ng);
+    op.gp_ie.resize(ng);
+    op.gp_gm.resize(ng);
+    op.gp_go.resize(ng);
+    op.gp_rpi.resize(ng);
+    op.gp_region.resize(ng);
+    for (std::size_t i = 0; i < ng; ++i) {
+        const double vc = voltage(x, gp.collector[i]);
+        const double vb = voltage(x, gp.base[i]);
+        const double ve = voltage(x, gp.emitter[i]);
+        const devices::BjtEval r = devices::gummel_poon(gp.sign[i], gp.params[i], vc, vb, ve);
+        op.gp_ic[i] = r.i[0];
+        op.gp_ib[i] = r.i[1];
+        op.gp_ie[i] = r.i[2];
+        op.gp_gm[i] = r.d[0][1];
+        op.gp_go[i] = r.d[0][0];
+        op.gp_rpi[i] = std::fabs(r.d[1][1]) > 1e-30 ? 1.0 / r.d[1][1] : std::numeric_limits<double>::infinity();
+        op.gp_region[i] = static_cast<std::int32_t>(devices::bjt_level1_region(gp.sign[i], vc, vb, ve));
+    }
+
+    const Circuit::MosCard& mc = circuit.mos4();
+    const std::size_t nc = mc.drain.size();
+    op.mos4_ids.resize(nc);
+    op.mos4_gds.resize(nc);
+    op.mos4_gm.resize(nc);
+    op.mos4_d_source.resize(nc);
+    op.mos4_gmbs.resize(nc);
+    op.mos4_vth.resize(nc);
+    op.mos4_region.resize(nc);
+    for (std::size_t i = 0; i < nc; ++i) {
+        const double vd = voltage(x, mc.drain[i]);
+        const double vg = voltage(x, mc.gate[i]);
+        const double vs = voltage(x, mc.source[i]);
+        const double vb = voltage(x, mc.bulk[i]);
+        const devices::Mos4Eval r = devices::mos_card(mc.sign[i], mc.beta[i], mc.vto[i], mc.lambda[i], mc.gamma[i],
+                                                      mc.phi[i], vd, vg, vs, vb);
+        op.mos4_ids[i] = r.ids;
+        op.mos4_gds[i] = r.d_drain;
+        op.mos4_gm[i] = r.d_gate;
+        op.mos4_d_source[i] = r.d_source;
+        op.mos4_gmbs[i] = r.d_bulk;
+        op.mos4_vth[i] = devices::mos_card_vth(mc.sign[i], mc.vto[i], mc.gamma[i], mc.phi[i], vd, vs, vb);
+        op.mos4_region[i] = static_cast<std::int32_t>(
+            devices::mos_card_region(mc.sign[i], mc.vto[i], mc.gamma[i], mc.phi[i], vd, vg, vs, vb));
     }
     return op;
 }
