@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import collections
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .api.contracts import AnalysisMode, CircuitIR, ComponentRecord, DirectiveRecord
 from .errors import NetlistError, error_handler
+from .spice.context import ParseContext
+from .spice.model_cards import EQUATION_SETS, MOS_INSTANCE_KEYS, MULTIPLIER_CARD_TYPES, TEMPERATURE_KEYS
+from .spice.sources import SourceError, fill_transient_defaults, parse_source_spec
+from .spice.values import fine_tokens, format_number, is_value, merge_assignments, normalize_value
 from .utils import parse_value
 
 V_T = "0.025"
@@ -51,12 +56,13 @@ class Component:
     EXPLICIT_TYPE_PATTERN = re.compile(rf"^{NAME_EXPLICIT_TYPE}$", re.IGNORECASE)
     INDEPENDENT_VAL_PATTERN = re.compile(f"^{NUMBER}({SCIENTIFIC_NOTATION}|{METRIC_SUFFIXES})?$")
     DEPENDENT_VAL_PATTERN = re.compile(f"^{NUMBER}({SCIENTIFIC_NOTATION}|{METRIC_SUFFIXES})?$")
-    # Node name: anything that's a plain identifier or "0" (ground).
-    NODE_PATTERN = re.compile(r"^[A-Za-z0-9_]+$")
+    # Node name: letters, digits and ``_``, plus ``.`` (flattened subcircuit nets such as
+    # ``X1.out``) and ``+``/``-`` (vendor port names such as ``IN+``); "0" is ground.
+    NODE_PATTERN = re.compile(r"^[A-Za-z0-9_.+\-]+$")
     DUTY_CYCLE = re.compile(r"^(\d+(\.\d*)?|\.\d+)(%)?$")
 
     @classmethod
-    def from_parts(cls, parts: list[str]) -> "Component":
+    def from_parts(cls, parts: list[str], context: ParseContext | None = None) -> "Component":
         """Create and validate a component from netlist tokens.
 
         Supports two name forms:
@@ -64,11 +70,17 @@ class Component:
           2. ``feedback:R`` — name and type explicitly decoupled.
 
         Both produce a ``Component`` with the requested ``type``. The remaining
-        tokens are parsed exactly as before for that type.
+        tokens are parsed exactly as before for that type; the SPICE forms (model
+        references, source functions, instance parameters, unit letters) are read on
+        top of that. ``context`` supplies the ``.model`` cards in scope, collects
+        diagnostics and names the line in new error messages (a fresh
+        :class:`~mna_simulation.spice.context.ParseContext` when omitted).
         """
 
         if not parts:
             error_handler("NETLIST_FATAL: Empty component definition.")
+        if context is None:
+            context = ParseContext()
 
         name, type_ = _name_and_type(parts[0])
 
@@ -76,19 +88,19 @@ class Component:
         component.type = type_
 
         if component.type in {"R", "C", "L"}:
-            cls._parse_passive(component, parts)
+            cls._parse_passive(component, parts, context)
         elif component.type in {"V", "I"}:
-            cls._parse_source(component, parts)
+            cls._parse_source(component, parts, context)
         elif component.type in {"VCVS", "VCCS", "CCVS", "CCCS"}:
-            cls._parse_dependent(component, parts)
+            cls._parse_dependent(component, parts, context)
         elif component.type == "D":
-            cls._parse_diode(component, parts)
+            cls._parse_diode(component, parts, context)
         elif component.type in {"QNPN", "QPNP"}:
-            cls._parse_bjt(component, parts)
+            cls._parse_bjt(component, parts, context)
         elif component.type in {"NMOS", "PMOS"}:
-            cls._parse_mos(component, parts)
+            cls._parse_mos(component, parts, context)
         elif component.type == "B":
-            cls._parse_behavioral(component, parts)
+            cls._parse_behavioral(component, parts, context)
         elif component.type == "GND":
             cls._parse_ground(component, parts)
         else:
@@ -130,14 +142,118 @@ class Component:
         return _SINGLE_LETTER_TYPES.get(initial)
 
     @classmethod
-    def _parse_passive(cls, component: "Component", parts: list[str]) -> None:
-        if len(parts) != 4:
+    def _parse_passive(cls, component: "Component", parts: list[str], context: ParseContext) -> None:
+        # R1 a b value                              (the dialect's own form)
+        # R1 a b MODEL | R1 a b [value] [MODEL] [k=v ...]   (SPICE: model card, M=, TC1=, R=)
+        if len(parts) == 4:
+            token: str | None = parts[3]
+            if not _independent_value_ok(token):
+                if context.has_models and not is_value(token) and context.lookup_model(token) is not None:
+                    token = None  # a model card: read below
+                else:
+                    token = normalize_value(token)
+            if token is not None:
+                component.node1, component.node2, component.value = parts[1], parts[2], token
+                cls._validate_distinct_nodes(component)
+                return
+        if len(parts) < 4:
             error_handler(f"NETLIST_FATAL: '{component.name}' expected 4 parts, got {len(parts)}")
-        component.node1, component.node2, component.value = parts[1], parts[2], parts[3]
+        component.node1, component.node2 = parts[1], parts[2]
         cls._validate_distinct_nodes(component)
+        key = component.type.lower()  # type: ignore[union-attr]  # r / c / l
+        value: str | None = None
+        card = None
+        options: dict[str, str] = {}
+        for token in merge_assignments(parts[3:]):
+            if "=" in token:
+                option, _, option_value = token.partition("=")
+                options[option.lower()] = option_value
+            elif value is None and card is None and is_value(token):
+                value = normalize_value(token)
+            elif card is None and not is_value(token):
+                card = context.require_model(token, component.name, (component.type,))  # type: ignore[arg-type]
+            else:
+                error_handler(f"NETLIST_FATAL: '{component.name}' expected 4 parts, got {len(parts)}")
+        if value is None and key in options:
+            value = normalize_value(options.pop(key))
+        multiplier = options.pop("m", None)
+        temperature = sorted(k for k in options if k in TEMPERATURE_KEYS or k in {"temp", "dtemp"})
+        ignored = sorted(k for k in options if k not in temperature)
+        if temperature:
+            context.diagnose(
+                f"{context.where()}: '{component.name}': temperature coefficients {', '.join(temperature)} are ignored"
+            )
+        if ignored:
+            context.diagnose(f"{context.where()}: '{component.name}': instance parameters {', '.join(ignored)} are ignored")
+        number: float | None = None
+        if card is not None:
+            card_value = card.params.get(key)
+            if card.type in MULTIPLIER_CARD_TYPES:
+                if value is None:
+                    context.error(f"'{component.name}' has no value (model '{card.name}' only scales it)")
+                if card_value is not None and parse_value(card_value) != 1.0:
+                    number = parse_value(value) * parse_value(card_value)
+            elif value is None:
+                if card_value is None:
+                    context.error(f"'{component.name}' has no value and model '{card.name}' gives no {key.upper()}=")
+                value = card_value
+        if value is None or not is_value(value):
+            context.error(f"'{component.name}' has no value")
+        if multiplier is not None:
+            factor = parse_value(cls._option_value(multiplier, "M", component.name, context))
+            if factor == 0.0:
+                context.error(f"'{component.name}' has M=0")
+            base = parse_value(value) if number is None else number
+            number = base * factor if key == "c" else base / factor
+        component.value = value if number is None else format_number(number)
+
+    @staticmethod
+    def _option_value(text: str, label: str, name: str, context: ParseContext) -> str:
+        value = normalize_value(text)
+        if not is_value(value):
+            context.error(f"'{name}' has invalid {label} value '{text}'")
+        return value
+
+    # Source forms of the dialect itself and their token counts (``V1 a b DC 5``, ...).
+    _LEGACY_SOURCE_PARTS = {"DC": (5,), "AC": (5,), "SIN": (6,), "COS": (6,), "STEP": (6, 7), "FUNC": (6,)}
 
     @classmethod
-    def _parse_source(cls, component: "Component", parts: list[str]) -> None:
+    def _parse_source(cls, component: "Component", parts: list[str], context: ParseContext) -> None:
+        keyword = parts[3].upper() if len(parts) > 3 else ""
+        legacy_counts = cls._LEGACY_SOURCE_PARTS.get(keyword)
+        if (
+            len(parts) < 4
+            or (len(parts) == 4 and legacy_counts is not None)
+            or keyword in {"COS", "STEP", "FUNC"}
+            or (
+                legacy_counts is not None
+                and len(parts) in legacy_counts
+                and (keyword != "SIN" or ("(" not in parts[4] and "(" not in parts[5]))
+            )
+        ):
+            cls._parse_legacy_source(component, parts)
+            return
+        # SPICE forms: a bare DC value, DC/AC combinations, SIN(...), PULSE(...), PWL(...), EXP(...).
+        component.node1 = parts[1]
+        component.node2 = parts[2]
+        cls._validate_distinct_nodes(component)
+        try:
+            spec = parse_source_spec(fine_tokens(" ".join(parts[3:])))
+        except SourceError as exc:
+            if exc.invalid_subtype is not None:
+                error_handler(f"COMPONENT_ERROR: '{component.name}' has invalid subtype '{exc.invalid_subtype}'.")
+            context.error(f"'{component.name}': {exc}")
+        component.subtype = spec.subtype
+        component.value = spec.value
+        component.value2 = spec.value2
+        component.metadata = spec.metadata
+        if spec.needs_defaults:
+            context.needs_defaults = True
+        for message in spec.diagnostics:
+            context.diagnose(f"{context.where()}: '{component.name}': {message}")
+
+    @classmethod
+    def _parse_legacy_source(cls, component: "Component", parts: list[str]) -> None:
         if len(parts) < 5:
             error_handler(f"COMPONENT_ERROR: '{component.name}' expected at least 5 parts, got {len(parts)}")
 
@@ -149,26 +265,26 @@ class Component:
         if component.subtype == "DC":
             if len(parts) != 5:
                 error_handler(f"COMPONENT_ERROR: '{component.name}' expected 5 parts, got {len(parts)}")
-            component.value = parts[4]
+            component.value = normalize_value(parts[4])
         elif component.subtype == "AC":
             if len(parts) != 5:
                 error_handler(f"COMPONENT_ERROR: '{component.name}' expected 5 parts, got {len(parts)}")
-            component.value = parts[4]
+            component.value = normalize_value(parts[4])
         elif component.subtype in {"SIN", "COS"}:
             if len(parts) != 6:
                 error_handler(f"COMPONENT_ERROR: '{component.name}' expected 6 parts, got {len(parts)}")
-            component.value = parts[4]
-            component.value2 = parts[5]
+            component.value = normalize_value(parts[4])
+            component.value2 = normalize_value(parts[5])
         elif component.subtype == "STEP":
             if len(parts) not in {6, 7}:
                 error_handler(f"COMPONENT_ERROR: '{component.name}' expected 6 or 7 parts, got {len(parts)}")
-            component.value = parts[4]
-            component.value2 = parts[5]
+            component.value = normalize_value(parts[4])
+            component.value2 = normalize_value(parts[5])
             component.value3 = parts[6] if len(parts) == 7 else None
         elif component.subtype == "FUNC":
             if len(parts) != 6:
                 error_handler(f"COMPONENT_ERROR: '{component.name}' expected 6 parts, got {len(parts)}")
-            component.value = parts[4]
+            component.value = normalize_value(parts[4])
             component.value2 = parts[5].strip()
         else:
             error_handler(
@@ -176,12 +292,14 @@ class Component:
             )
 
     @classmethod
-    def _parse_dependent(cls, component: "Component", parts: list[str]) -> None:
+    def _parse_dependent(cls, component: "Component", parts: list[str], context: ParseContext) -> None:
         # Accept both bare and SPICE-style forms:
         #   E1 n+ n- c+ c- gain               (6 tokens)
         #   E1 n+ n- VCVS c+ c- gain          (7 tokens, with explicit type)
         #   F1 n+ n- ctrl gain                (5 tokens)
         #   F1 n+ n- CCCS ctrl gain           (6 tokens, with explicit type)
+        # Behavioural forms (TABLE, LAPLACE, VALUE, POLY, ...) are rejected by name.
+        check_behavioural_element(parts, context)
         type_token = component.type or ""
         body = parts[1:]
         if body and body[2:3] and body[2].upper() == type_token:
@@ -203,26 +321,149 @@ class Component:
         if component.type in {"VCVS", "VCCS"}:
             component.ctrl_node1 = body[2]
             component.ctrl_node2 = body[3]
-            component.value = body[4]
+            component.value = normalize_value(body[4])
             if component.ctrl_node1 == component.ctrl_node2:
                 error_handler(
                     f"COMPONENT_ERROR: '{component.name}' control nodes must be different."
                 )
         else:
             component.ctrl_source = body[2]
-            component.value = body[3]
+            context.ctrl_refs = True  # resolved case-insensitively once every name is known
+            component.value = normalize_value(body[3])
 
     @classmethod
-    def _parse_diode(cls, component: "Component", parts: list[str]) -> None:
+    def _parse_diode(cls, component: "Component", parts: list[str], context: ParseContext) -> None:
+        #   D1 anode cathode [Is]                       (ideal Shockley diode of the dialect)
+        #   D1 anode cathode MODEL [area] [AREA=] [M=]  (SPICE diode card)
+        if len(parts) >= 4 and not _independent_value_ok(parts[3]) and not is_value(parts[3]):
+            card = context.require_model(parts[3], component.name, ("D",))
+            component.node1 = parts[1]
+            component.node2 = parts[2]
+            cls._validate_distinct_nodes(component)
+            area, _ = cls._instance_area(component.name, parts[4:], context, multiplier=False)
+            component.value = card.params.get("is", "1e-14")
+            component.metadata = cls._card_metadata(card, area)
+            return
         if len(parts) not in {3, 4}:
             error_handler(f"COMPONENT_ERROR: '{component.name}' expected 3 or 4 parts, got {len(parts)}")
         component.node1 = parts[1]
         component.node2 = parts[2]
-        component.value = parts[3] if len(parts) == 4 else I_S
+        component.value = normalize_value(parts[3]) if len(parts) == 4 else I_S
         cls._validate_distinct_nodes(component)
 
+    @staticmethod
+    def _card_metadata(card, area: str | None = None) -> dict[str, str]:  # noqa: ANN001
+        """``metadata`` of a device using ``card``: every card parameter plus the common keys."""
+
+        metadata = dict(card.params)
+        metadata["model"] = EQUATION_SETS[card.canonical_type]
+        metadata["model_name"] = card.name
+        if area is not None:
+            metadata["area"] = area
+        return metadata
+
     @classmethod
-    def _parse_bjt(cls, component: "Component", parts: list[str]) -> None:
+    def _instance_area(
+        cls, name: str, tokens: list[str], context: ParseContext, multiplier: bool
+    ) -> tuple[str | None, str | None]:
+        """``(area, m)`` of a diode/BJT instance tail (``[area] [AREA=a] [M=m] [OFF] [IC=..]``).
+
+        A BJT's ``M=`` is the instance multiplier (``metadata["m"]``). A diode has no
+        instance multiplier besides the area (its ``metadata["m"]`` is the card's grading
+        coefficient, ruling M2): ``M=`` on a diode line is dropped with a diagnostic.
+        """
+
+        area: str | None = None
+        count: str | None = None
+        ignored: list[str] = []
+        for token in merge_assignments(tokens):
+            if "=" in token:
+                key, _, text = token.partition("=")
+                key = key.lower()
+                if key == "area":
+                    area = cls._option_value(text, "area", name, context)
+                elif key == "m" and multiplier:
+                    count = cls._option_value(text, "M", name, context)
+                elif key == "m":
+                    context.diagnose(
+                        f"{context.where()}: '{name}': instance multiplier M= dropped (a diode scales with its area "
+                        f"factor; the card's M is the grading coefficient)"
+                    )
+                else:
+                    ignored.append(key)
+            elif token.upper() == "OFF":
+                ignored.append("off")
+            elif area is None and is_value(token):
+                area = normalize_value(token)
+            else:
+                context.error(f"'{name}': unexpected '{token}' after the model name")
+        if ignored:
+            context.diagnose(f"{context.where()}: '{name}': instance parameters {', '.join(sorted(ignored))} are ignored")
+        return area, count
+
+    @staticmethod
+    def _model_index(name: str, parts: list[str], context: ParseContext, keywords: frozenset[str]) -> int | None:
+        """Index of the model token of a 3/4-terminal SPICE device line, ``None`` for the dialect's own forms.
+
+        The model is the token after the three terminals (index 4) or after a fourth
+        terminal (BJT substrate, MOS bulk; index 5). A token naming a card in scope wins;
+        otherwise the dialect's keyword and numeric forms keep their meaning, and any
+        other identifier is an undefined model (``NETLIST_FATAL`` naming it).
+        """
+
+        def model_like(token: str | None) -> bool:
+            return token is not None and "=" not in token and not is_value(token)
+
+        first = parts[4] if len(parts) > 4 else None
+        if first is None:
+            return None
+        second = parts[5] if len(parts) > 5 else None
+        if context.has_models:
+            if model_like(first) and context.lookup_model(first) is not None:
+                return 4
+            if model_like(second) and context.lookup_model(second) is not None:  # type: ignore[arg-type]
+                return 5
+        if first.upper() in keywords:
+            return None
+        second_named = model_like(second) and second.upper() not in keywords | {"OFF"}  # type: ignore[union-attr]
+        if is_value(first) and not second_named:
+            return None
+        missing = second if second_named else first
+        context.error(f"model '{missing}' is not defined (referenced by '{name}')")
+        return None  # unreachable
+
+    @classmethod
+    def _parse_bjt(cls, component: "Component", parts: list[str], context: ParseContext) -> None:
+        #   Q1 collector base emitter [substrate] MODEL [area] [AREA=] [M=]   (SPICE Gummel-Poon card)
+        index = None
+        if context.has_models or (len(parts) > 4 and parts[4].upper() not in _BJT_KEYWORDS):
+            index = cls._model_index(component.name, parts, context, _BJT_KEYWORDS)
+        if index is not None:
+            card = context.require_model(parts[index], component.name, ("NPN", "PNP"))
+            component.type = "QNPN" if card.canonical_type == "NPN" else "QPNP"
+            component.subtype = component.type
+            component.node1 = parts[1]
+            component.ctrl_node1 = parts[2]
+            component.node2 = parts[3]
+            if component.node1 == component.node2:
+                error_handler(f"COMPONENT_ERROR: '{component.name}' collector and emitter must be different.")
+            if index == 5:
+                component.ctrl_node2 = parts[4]
+                context.diagnose(
+                    f"{context.where()}: '{component.name}': substrate node '{parts[4]}' is not modelled"
+                )
+            area, multiplier = cls._instance_area(component.name, parts[index + 1 :], context, multiplier=True)
+            component.value = card.params.get("is", "1e-16")
+            component.value2 = card.params.get("bf", "100")
+            component.value3 = card.params.get("br", "1")
+            component.metadata = cls._card_metadata(card, area)
+            if multiplier is not None:
+                component.metadata["m"] = multiplier
+            return
+        cls._parse_legacy_bjt(component, parts)
+
+    @classmethod
+    def _parse_legacy_bjt(cls, component: "Component", parts: list[str]) -> None:
         # Physical Level-1 BJT:
         #   Q1 collector base emitter QNPN LEVEL1 is bf br vaf var cje cjc rb re rc
         #   Q1 collector base emitter LEVEL1 is bf br vaf var cje cjc rb re rc
@@ -283,7 +524,44 @@ class Component:
         component.metadata["re"] = params[7] if len(params) >= 8 else "0"
 
     @classmethod
-    def _parse_mos(cls, component: "Component", parts: list[str]) -> None:
+    def _parse_mos(cls, component: "Component", parts: list[str], context: ParseContext) -> None:
+        #   M1 drain gate source [bulk] MODEL [L=] [W=] [M=] [AD=] [AS=] [PD=] [PS=] [NRD=] [NRS=]
+        #   (SPICE NMOS/PMOS card, LEVEL 1-3; a three-terminal instance has bulk = source)
+        index = None
+        if context.has_models or (len(parts) > 4 and parts[4].upper() not in _MOS_KEYWORDS):
+            index = cls._model_index(component.name, parts, context, _MOS_KEYWORDS)
+        if index is not None:
+            card = context.require_model(parts[index], component.name, ("NMOS", "PMOS"))
+            component.type = card.canonical_type
+            component.subtype = component.type
+            component.node1 = parts[1]
+            component.ctrl_node1 = parts[2]
+            component.node2 = parts[3]
+            if component.node1 == component.node2:
+                error_handler(f"COMPONENT_ERROR: '{component.name}' drain and source must be different.")
+            if index == 5:
+                component.ctrl_node2 = parts[4]
+            metadata = cls._card_metadata(card)
+            ignored: list[str] = []
+            for token in merge_assignments(parts[index + 1 :]):
+                key, separator, text = token.partition("=")
+                key = key.lower()
+                if separator and key in MOS_INSTANCE_KEYS:
+                    metadata[key] = cls._option_value(text, key.upper(), component.name, context)
+                elif separator or key == "off":
+                    ignored.append(key)
+                else:
+                    context.error(f"'{component.name}': unexpected '{token}' after the model name")
+            if ignored:
+                context.diagnose(
+                    f"{context.where()}: '{component.name}': instance parameters {', '.join(sorted(ignored))} are ignored"
+                )
+            component.metadata = metadata
+            return
+        cls._parse_legacy_mos(component, parts)
+
+    @classmethod
+    def _parse_legacy_mos(cls, component: "Component", parts: list[str]) -> None:
         # Physical Level-1 MOS:
         #   M1 drain gate source NMOS LEVEL1 beta vth lambda cgs cgd
         # Small-signal MOS:
@@ -335,7 +613,8 @@ class Component:
         component.metadata["cbd"] = params[6] if len(params) >= 7 else "0"
 
     @classmethod
-    def _parse_behavioral(cls, component: "Component", parts: list[str]) -> None:
+    def _parse_behavioral(cls, component: "Component", parts: list[str], context: ParseContext) -> None:
+        check_behavioural_element(parts, context)
         if len(parts) != 4:
             error_handler(f"COMPONENT_ERROR: '{component.name}' expected 4 parts, got {len(parts)}")
         component.node1 = parts[1]
@@ -391,8 +670,11 @@ class Component:
                 )
 
         if self.type in {"V", "I"}:
-            if self.subtype not in {"AC", "COS", "SIN", "DC", "FUNC", "STEP"}:
+            if self.subtype not in {"AC", "COS", "SIN", "DC", "FUNC", "STEP", "PULSE", "PWL", "EXP"}:
                 error_handler(f"NETLIST_FATAL: '{self.name}' has invalid subtype '{self.subtype}'.")
+            if self.metadata:
+                # SPICE forms: every value was checked while the specification was read.
+                return True
             if self.subtype in {"DC", "AC"} and not _independent_value_ok(self.value or ""):
                 error_handler(f"NETLIST_FATAL: '{self.name}' has invalid value '{self.value}'.")
             if self.subtype in {"SIN", "COS", "STEP"}:
@@ -407,6 +689,10 @@ class Component:
         if self.type in {"R", "C", "L", "D"}:
             if not _independent_value_ok(self.value or ""):
                 error_handler(f"NETLIST_FATAL: '{self.name}' has invalid value format '{self.value}'.")
+            return True
+
+        if self.type in {"QNPN", "QPNP", "NMOS", "PMOS"} and self.metadata.get("model") in _CARD_EQUATION_SETS:
+            # SPICE model cards: the card and instance values were checked when they were read.
             return True
 
         if self.type in {"QNPN", "QPNP"}:
@@ -581,6 +867,56 @@ def _check_distinct_nodes(name: str, node1: str | None, node2: str | None) -> No
         error_handler(f"COMPONENT_ERROR: '{name}' has conflict in nodes: '{node1, node2}'")
 
 
+# ``metadata["model"]`` of the devices built from SPICE ``.model`` cards.
+_CARD_EQUATION_SETS = frozenset(EQUATION_SETS.values())
+# Tokens after the terminals that select the dialect's own transistor forms.
+_BJT_KEYWORDS = frozenset({"QNPN", "QPNP", "LEVEL1", "SMALLSIG", "SMALL_SIGNAL", "HYBRID_PI"})
+_MOS_KEYWORDS = frozenset({"NMOS", "PMOS", "LEVEL1", "SMALLSIG", "SMALL_SIGNAL"})
+
+# SPICE element letters this simulator does not model: (what, fewest tokens of a real
+# element line). Shorter lines keep the "Cannot infer type" error of the dialect.
+UNSUPPORTED_ELEMENTS = {
+    "J": ("JFETs (J elements)", 5),
+    "Z": ("MESFETs (Z elements)", 5),
+    "S": ("voltage-controlled switches (S elements)", 6),
+    "W": ("current-controlled switches (W elements)", 5),
+    "T": ("lossless transmission lines (T elements)", 5),
+    "O": ("lossy transmission lines (O elements)", 6),
+    "U": ("uniform RC lines (U elements)", 5),
+    "K": ("coupled inductors (K elements)", 4),
+    "P": ("coupled multiconductor lines (P elements)", 5),
+    "Y": ("transmission lines (Y elements)", 5),
+    "A": ("XSPICE code models (A elements)", 3),
+    "N": ("Verilog-A devices (N elements)", 3),
+}
+# Behavioural controlled-source forms that would change the answer if ignored
+# (``E1 o 0 TABLE {V(i)} = ...``, ``VALUE={...}``, ``POLY(2) ...``, ``LAPLACE=...``).
+_BEHAVIOURAL_FORM = re.compile(r"(?<![\w.])(TABLE|LAPLACE|VALUE|POLY|FREQ|CHEBYSHEV)\s*[=({]", re.IGNORECASE)
+
+
+def check_unsupported_element(name: str, parts: list[str], context: ParseContext) -> None:
+    """``NETLIST_FATAL`` for a SPICE element type this simulator does not model (J, Z, S, W, T, O, U, K, ...)."""
+
+    initial = name[:1].upper() if name[:1].isascii() else ""
+    unsupported = UNSUPPORTED_ELEMENTS.get(initial)
+    if unsupported is not None and len(parts) >= unsupported[1]:
+        context.error(f"'{name}': {unsupported[0]} are not supported")
+
+
+def check_behavioural_element(parts: list[str], context: ParseContext) -> None:
+    """``NETLIST_FATAL`` for TABLE/LAPLACE/VALUE/POLY controlled sources and ``B ... V=``/``I=`` sources."""
+
+    name = parts[0] if parts else ""
+    initial = name[:1].upper()
+    if initial == "B":
+        if len(parts) >= 4 and re.match(r"^[VvIi]\s*=", " ".join(parts[3:])):
+            context.error(f"'{name}': behavioural B sources with V=/I= expressions are not supported")
+        return
+    match = _BEHAVIOURAL_FORM.search(" ".join(parts[3:]))
+    if match is not None:
+        context.error(f"'{name}': {match.group(1).upper()} controlled sources are not supported")
+
+
 @dataclass(slots=True)
 class Netlist:
     """Validated netlist container.
@@ -612,6 +948,8 @@ class Netlist:
                 self.other_nodes.extend([component.ctrl_node1, component.ctrl_node2 or "0"])
         elif component.type in {"QNPN", "QPNP", "NMOS", "PMOS"}:
             self.other_nodes.extend([component.node1 or "0", component.node2 or "0", component.ctrl_node1 or "0"])
+            if component.ctrl_node2:  # substrate / bulk of a SPICE-card transistor
+                self.other_nodes.append(component.ctrl_node2)
         else:
             self.other_nodes.extend([component.node1 or "0", component.node2 or "0"])
 
@@ -695,30 +1033,96 @@ _SAME_TERMINALS_MESSAGE = {
 }
 
 
+# Directives handled by the SPICE front end (``spice.frontend``): the plain line loop
+# restarts there when it meets one.
+_FRONTEND_DIRECTIVES = frozenset(
+    {".model", ".subckt", ".ends", ".param", ".include", ".inc", ".lib", ".endl", ".global", ".control", ".endc"}
+)
+# Directives that would change the answer if ignored: NETLIST_FATAL naming the line.
+_FATAL_DIRECTIVES = {
+    ".func": "user-defined functions are not supported (use .param or write the expression inline)",
+    ".if": "conditional netlists (.if/.elseif/.else/.endif) are not supported",
+    ".elseif": "conditional netlists (.if/.elseif/.else/.endif) are not supported",
+    ".else": "conditional netlists (.if/.elseif/.else/.endif) are not supported",
+    ".endif": "conditional netlists (.if/.elseif/.else/.endif) are not supported",
+    ".alter": "alternative runs (.alter) are not supported",
+}
+# Harmless directives: ignored with a diagnostic.
+_IGNORED_DIRECTIVES = {
+    ".options": "simulator options are not supported",
+    ".option": "simulator options are not supported",
+    ".opt": "simulator options are not supported",
+    ".temp": "the circuit is simulated at 27 C",
+    ".nodeset": "node sets are not supported",
+    ".ic": "initial conditions are not supported yet",
+    ".probe": "outputs are selected by the client",
+    ".print": "outputs are selected by the client",
+    ".plot": "outputs are selected by the client",
+    ".save": "outputs are selected by the client",
+    ".width": "outputs are selected by the client",
+    ".backanno": "back-annotation is not supported",
+    ".step": "parameter sweeps are not supported",
+    ".meas": "measurements are not supported",
+    ".measure": "measurements are not supported",
+    ".four": "Fourier analysis is not supported",
+    ".noise": "noise analysis is not supported",
+    ".tf": "transfer-function analysis is not supported",
+    ".sens": "sensitivity analysis is not supported",
+    ".pz": "pole-zero analysis is not supported",
+    ".disto": "distortion analysis is not supported",
+    ".title": "titles are not used",
+}
+# SPICE needs arguments for these: the bare directive stays an unsupported directive.
+_DIRECTIVES_NEEDING_ARGUMENTS = frozenset(
+    {".noise", ".tf", ".four", ".meas", ".measure", ".step", ".temp", ".ic", ".nodeset", ".print", ".plot", ".sens", ".pz", ".disto"}
+)
+# A line that only the SPICE front end reads: continuation, subcircuit instance, or a
+# front-end directive (searched only after the plain loop failed).
+_FRONTEND_MARKERS = re.compile(
+    r"^[ \t]*(?:\+|[xX]|\.(?:model|subckt|ends|param|include|inc|lib|endl|global|control|endc)\b)",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+class _NeedsFrontend(Exception):
+    """The plain line loop met a construct only the SPICE front end reads (it restarts there)."""
+
+
 def parse_directive(line: str) -> DirectiveRecord:
-    """Parse a single simulator directive line."""
+    """Parse a single analysis directive line (``.op``, ``.dc``, ``.tran``, ``.ac``, ``.hb``)."""
+
+    try:
+        directive = _parse_control_line(line, ParseContext())
+    except _NeedsFrontend:
+        directive = None  # .model, .subckt, ...: netlist structure, not an analysis
+    if directive is None:
+        error_handler(f"NETLIST_FATAL: Unsupported directive '{line}'.")
+    return directive
+
+
+def _directive_value(token: str) -> float:
+    return parse_value(normalize_value(token))
+
+
+def _parse_control_line(line: str, context: ParseContext) -> DirectiveRecord | None:
+    """A directive line: an analysis record, ``None`` for an ignored directive (diagnostic), or an error."""
 
     parts = line.split()
     command = parts[0].lower()
 
-    if command == ".op" or command == ".dc":
+    if command == ".op":
+        return DirectiveRecord(mode=AnalysisMode.OP, raw_line=line)
+
+    if command == ".dc":
+        if len(parts) > 1:
+            context.diagnose(f"{context.where()}: '.dc' sweeps are not supported: the circuit runs as .op at its source values")
         return DirectiveRecord(mode=AnalysisMode.OP, raw_line=line)
 
     if command == ".tran":
-        if len(parts) not in {2, 3}:
-            error_handler("NETLIST_FATAL: Use .tran <time> (<step_time>).")
-        params = {"t_stop": parse_value(parts[1]), "t_step": parse_value(parts[2]) if len(parts) == 3 else parse_value("0.01m")}
-        return DirectiveRecord(mode=AnalysisMode.TRAN, params=params, raw_line=line)
+        return _parse_tran(line, parts, context)
 
     if command == ".ac":
-        if len(parts) != 4:
-            error_handler("NETLIST_FATAL: Use .ac <start_freq> <stop_freq> <points>.")
-        params = {
-            "f_start": parse_value(parts[1]),
-            "f_stop": parse_value(parts[2]),
-            "points": int(parse_value(parts[3])),
-        }
-        return DirectiveRecord(mode=AnalysisMode.AC, params=params, raw_line=line)
+        return _parse_ac(line, parts, context)
 
     if command == ".hb":
         params: dict[str, float | int] = {"harmonics": 16}
@@ -727,17 +1131,97 @@ def parse_directive(line: str) -> DirectiveRecord:
             if re.match(r"^\d+$", args[0]):
                 params["harmonics"] = int(args[0])
             else:
-                params["time_window"] = parse_value(args[0])
+                params["time_window"] = _directive_value(args[0])
         elif len(args) >= 2:
-            params["harmonics"] = int(parse_value(args[0]))
-            params["time_window"] = parse_value(args[1])
+            params["harmonics"] = int(_directive_value(args[0]))
+            params["time_window"] = _directive_value(args[1])
         return DirectiveRecord(mode=AnalysisMode.HB, params=params, raw_line=line)
+
+    if command in _FRONTEND_DIRECTIVES:
+        raise _NeedsFrontend(command)
+    reason = _FATAL_DIRECTIVES.get(command)
+    if reason is not None:
+        context.error(f"{command}: {reason}")
+    reason = _IGNORED_DIRECTIVES.get(command)
+    if reason is not None and (len(parts) > 1 or command not in _DIRECTIVES_NEEDING_ARGUMENTS):
+        context.diagnose(f"{context.where()}: '{command}' ignored ({reason})")
+        return None
 
     error_handler(f"NETLIST_FATAL: Unsupported directive '{line}'.")
 
 
-def parse_netlist_text(netlist_text: str) -> CircuitIR:
+def _parse_tran(line: str, parts: list[str], context: ParseContext) -> DirectiveRecord:
+    """``.tran <t_stop> [<t_step>]`` (the dialect's order) or SPICE ``.tran tstep tstop tstart [tmax]``."""
+
+    args = parts[1:]
+    if any(arg.lower() == "uic" for arg in args):
+        args = [arg for arg in args if arg.lower() != "uic"]
+        context.diagnose(f"{context.where()}: '.tran ... uic' ignored (initial conditions are not supported yet)")
+    if len(args) in (1, 2):
+        params = {
+            "t_stop": _directive_value(args[0]),
+            "t_step": _directive_value(args[1]) if len(args) == 2 else parse_value("0.01m"),
+        }
+        if len(args) == 2 and 0.0 < params["t_stop"] < params["t_step"]:
+            context.diagnose(
+                f"{context.where()}: '.tran {args[0]} {args[1]}' is read as .tran <t_stop> <t_step> "
+                f"(t_stop={args[0]}, t_step={args[1]}); SPICE writes the step first"
+            )
+        return DirectiveRecord(mode=AnalysisMode.TRAN, params=params, raw_line=line)
+    if len(args) in (3, 4):
+        # Three or four values: SPICE order, .tran tstep tstop tstart [tmax].
+        params = {"t_stop": _directive_value(args[1]), "t_step": _directive_value(args[0])}
+        if _directive_value(args[2]) != 0.0:
+            context.diagnose(f"{context.where()}: .tran start time {args[2]} ignored (results start at t = 0)")
+        if len(args) == 4:
+            context.diagnose(f"{context.where()}: .tran maximum step {args[3]} ignored (the step is fixed)")
+        return DirectiveRecord(mode=AnalysisMode.TRAN, params=params, raw_line=line)
+    error_handler("NETLIST_FATAL: Use .tran <time> (<step_time>).")
+
+
+def _parse_ac(line: str, parts: list[str], context: ParseContext) -> DirectiveRecord:
+    """``.ac <f_start> <f_stop> <points>`` (linear) or SPICE ``.ac dec|oct|lin <n> <f_start> <f_stop>``."""
+
+    if len(parts) == 5 and parts[1].lower() in {"dec", "oct", "lin"}:
+        sweep = parts[1].lower()
+        count = _directive_value(parts[2])
+        f_start = _directive_value(parts[3])
+        f_stop = _directive_value(parts[4])
+        if sweep == "lin":
+            points = int(count)
+        else:
+            if f_start <= 0.0 or f_stop <= 0.0:
+                context.error(f"'.ac {sweep}' needs positive start and stop frequencies")
+            span = math.log10(f_stop / f_start) if sweep == "dec" else math.log2(f_stop / f_start)
+            points = max(1, int(round(count * abs(span))) + 1)
+            context.diagnose(
+                f"{context.where()}: '{line}' runs as a linear sweep from {f_start:g} Hz to {f_stop:g} Hz "
+                f"with {points} points (logarithmic sweeps are not supported)"
+            )
+        params = {"f_start": f_start, "f_stop": f_stop, "points": points}
+        return DirectiveRecord(mode=AnalysisMode.AC, params=params, raw_line=line)
+    if len(parts) != 4:
+        error_handler("NETLIST_FATAL: Use .ac <start_freq> <stop_freq> <points>.")
+    params = {
+        "f_start": _directive_value(parts[1]),
+        "f_stop": _directive_value(parts[2]),
+        "points": int(_directive_value(parts[3])),
+    }
+    return DirectiveRecord(mode=AnalysisMode.AC, params=params, raw_line=line)
+
+
+def parse_netlist_text(netlist_text: str, *, include_resolver=None) -> CircuitIR:  # noqa: ANN001
     """Parse multiline netlist text into a validated IR.
+
+    The dialect of ``README.md`` ("Netlist dialect") is read in one pass by
+    :func:`_parse_netlist_lines`. A netlist that uses the structural SPICE constructs
+    (``+`` continuations, ``;``/``$`` comments, ``.model``, ``.subckt``/``X``,
+    ``.param``/``{...}``, ``.include``/``.lib``, ``.global``) goes through the SPICE
+    front end (``mna_simulation.spice.frontend``), which flattens it into the same
+    records. ``include_resolver(path, including_file)`` returns ``(resolved_name, text)``
+    for ``.include``/``.lib``; without one (netlist text, the HTTP API) those lines are
+    a ``NETLIST_FATAL`` error asking for the library to be pasted into the netlist
+    (``parse_netlist_file`` resolves files).
 
     Lines of the types in ``_TAIL_START`` that repeat the parameter tokens of an
     earlier line of the same type (``... PMOS LEVEL1 0.7m 0.4 0.02 2f 1f``, ``4f``,
@@ -748,6 +1232,30 @@ def parse_netlist_text(netlist_text: str) -> CircuitIR:
     through ``Component.from_parts``.
     """
 
+    if type(netlist_text) is str and ("{" in netlist_text or ";" in netlist_text or "$" in netlist_text):
+        return _parse_spice_netlist(netlist_text, include_resolver)
+    try:
+        return _parse_netlist_lines(netlist_text)
+    except _NeedsFrontend:
+        return _parse_spice_netlist(netlist_text, include_resolver)
+    except NetlistError:
+        # A model card, subcircuit or parameter defined further down may be what the
+        # failing line needs: the front end reads the whole netlist first.
+        if type(netlist_text) is str and _FRONTEND_MARKERS.search(netlist_text):
+            return _parse_spice_netlist(netlist_text, include_resolver)
+        raise
+
+
+def _parse_spice_netlist(netlist_text: str, include_resolver) -> CircuitIR:  # noqa: ANN001
+    from .spice.frontend import parse_spice_netlist
+
+    return parse_spice_netlist(netlist_text, include_resolver)
+
+
+def _parse_netlist_lines(netlist_text: str) -> CircuitIR:
+    """The single-pass parser of the netlist dialect (see :func:`parse_netlist_text`)."""
+
+    context = ParseContext()
     netlist = Netlist()
     directives: list[DirectiveRecord] = []
     records = netlist.components
@@ -764,15 +1272,20 @@ def parse_netlist_text(netlist_text: str) -> CircuitIR:
     tail_start = _TAIL_START
     # (type, tail tokens) -> the first record parsed from them
     prototypes: dict[tuple[str, tuple[str, ...]], ComponentRecord] = {}
+    lines = netlist_text.splitlines()
+    line_iter = iter(lines)
+    context.lines = (len(lines), line_iter)  # messages compute the current line number on demand
 
-    for raw_line in netlist_text.splitlines():
+    for raw_line in line_iter:
         line = raw_line.strip()
         if not line or line.startswith("*") or line.startswith("#"):
             continue
         if line[0] == ".":  # only such a line can lower() to ".end"
             if line.lower() == ".end":
                 break
-            directives.append(parse_directive(line))
+            directive = _parse_control_line(line, context)
+            if directive is not None:
+                directives.append(directive)
             continue
 
         parts = line.split()
@@ -785,8 +1298,13 @@ def parse_netlist_text(netlist_text: str) -> CircuitIR:
         if name.isascii() and name.isidentifier() and name[0] != "_":
             type_ = single_letter_types.get(name[0].upper()) or get_type(name)
             if type_ is None:
+                if name[0] in "xX":
+                    raise _NeedsFrontend(name)
+                check_unsupported_element(name, parts, context)
                 name, type_ = _name_and_type(name)  # raises "Cannot infer type"
         else:
+            if name[0] == "+":
+                raise _NeedsFrontend(name)
             name, type_ = _name_and_type(name)
         start = tail_start.get(type_)
         key = None
@@ -844,16 +1362,104 @@ def parse_netlist_text(netlist_text: str) -> CircuitIR:
                     extend_other_nodes((node1, node2))
                 continue
 
-        record = Component.from_parts(parts).to_record()
-        if key is not None:
+        record = Component.from_parts(parts, context).to_record()
+        if context.needs_defaults:
+            # A SPICE waveform waiting for the .tran defaults: never shared as a prototype.
+            context.needs_defaults = False
+            context.deferred.append(record)
+        elif key is not None:
             prototypes[key] = record
         add_component(record)
 
+    return finish_netlist(netlist, directives, netlist_text, context)
+
+
+def finish_netlist(netlist: Netlist, directives: list[DirectiveRecord], source_text: str, context: ParseContext) -> CircuitIR:
+    """Netlist-wide steps shared by both parsers, then the ``CircuitIR``.
+
+    Node names are matched case-insensitively and keep the spelling of their first
+    occurrence; controlling-source names resolve case-insensitively; SPICE waveforms
+    get their ``.tran`` defaults; then the topological checks of ``Netlist.validate``.
+    """
+
+    records = netlist.components
     if not records:
         raise NetlistError("No components entered in netlist.")
-
+    _fold_node_case(netlist)
+    if context.ctrl_refs:
+        _resolve_controlling_sources(records)
+    if context.deferred:
+        _fill_transient_defaults(context.deferred, directives)
     netlist.validate()
-    return CircuitIR(components=records, directives=directives, source_text=netlist_text)
+    return CircuitIR(components=records, directives=directives, source_text=source_text, diagnostics=context.diagnostics)
+
+
+def _fold_node_case(netlist: Netlist) -> None:
+    """Give every spelling of a node (``in``, ``IN``) the spelling of its first occurrence."""
+
+    # Cheap common case: no node name has an upper-case letter, so no two spellings differ by case.
+    joined = "".join(netlist.other_nodes) + "".join(netlist.current_source_nodes)
+    joined += "".join(map("".join, netlist.voltage_source_node_sets))
+    if joined == joined.lower():
+        return
+    names = set(netlist.other_nodes)
+    names.update(netlist.current_source_nodes)
+    names.update(*netlist.voltage_source_node_sets)
+    if len(set(map(str.lower, names))) == len(names):
+        return
+    records = netlist.components
+    canonical: dict[str, str] = {}
+    for record in records:
+        for node in (record.node1, record.node2, record.ctrl_node1, record.ctrl_node2):
+            if node is not None:
+                canonical.setdefault(node.lower(), node)
+    for record in records:
+        if record.node1 is not None:
+            record.node1 = canonical[record.node1.lower()]
+        if record.node2 is not None:
+            record.node2 = canonical[record.node2.lower()]
+        if record.ctrl_node1 is not None:
+            record.ctrl_node1 = canonical[record.ctrl_node1.lower()]
+        if record.ctrl_node2 is not None:
+            record.ctrl_node2 = canonical[record.ctrl_node2.lower()]
+        if record.type != "GND" and record.node1 is not None and record.node1 == record.node2:
+            error_handler(f"COMPONENT_ERROR: '{record.name}' has conflict in nodes: '{record.node1, record.node2}'")
+    fresh = Netlist()
+    for record in records:
+        fresh.add_component(record)
+    netlist.voltage_source_node_sets[:] = fresh.voltage_source_node_sets
+    netlist.current_source_nodes[:] = fresh.current_source_nodes
+    netlist.other_nodes[:] = fresh.other_nodes
+
+
+def _resolve_controlling_sources(records: list[ComponentRecord]) -> None:
+    """``F1 a b v1 2`` controls through ``V1``: an inexact-case name maps to the branch of that name."""
+
+    exact: set[str] = set()
+    folded: dict[str, str] = {}
+    for record in records:
+        if record.type in {"V", "VCVS", "CCVS", "L"}:
+            exact.add(record.name)
+            folded.setdefault(record.name.lower(), record.name)
+    for record in records:
+        if record.type in {"CCCS", "CCVS"}:
+            source = record.ctrl_source
+            if source and source not in exact:
+                record.ctrl_source = folded.get(source.lower(), source)
+
+
+def _fill_transient_defaults(records: list[ComponentRecord], directives: list[DirectiveRecord]) -> None:
+    """Omitted PULSE/EXP/SIN times take the step and stop time of the netlist's last ``.tran``."""
+
+    tran = next((directive for directive in reversed(directives) if directive.mode == AnalysisMode.TRAN), None)
+    if tran is None:
+        return
+    t_step = float(tran.params["t_step"])
+    t_stop = float(tran.params["t_stop"])
+    for record in records:
+        frequency = fill_transient_defaults(record.metadata, record.subtype or "", t_step, t_stop)
+        if record.subtype == "SIN":
+            record.value2 = frequency
 
 
 def _invalid_node_name(name: str, node: str) -> None:
@@ -863,11 +1469,19 @@ def _invalid_node_name(name: str, node: str) -> None:
     )
 
 
-def parse_netlist_file(path: str | Path) -> CircuitIR:
-    """Parse a netlist from a `.cir`/`.sp` file."""
+def parse_netlist_file(path: str | Path, *, search_dirs=()) -> CircuitIR:  # noqa: ANN001
+    """Parse a netlist from a `.cir`/`.sp` file.
 
-    text = Path(path).read_text(encoding="utf-8")
-    return parse_netlist_text(text)
+    ``.include``/``.lib`` paths resolve relative to the including file, then in
+    ``search_dirs`` (the CLI's ``--lib`` directories).
+    """
+
+    from .spice.frontend import FileIncludeResolver
+
+    file_path = Path(path)
+    text = file_path.read_text(encoding="utf-8")
+    resolver = FileIncludeResolver(search_dirs=search_dirs, root=file_path)
+    return parse_netlist_text(text, include_resolver=resolver)
 
 
 def select_analysis(circuit: CircuitIR, fallback: AnalysisMode = AnalysisMode.SHOW_MATRIX) -> DirectiveRecord:

@@ -17,6 +17,7 @@ from .device_models import (
     mos_level1_current_template,
     render_mos_level1_current,
     source_expression,
+    spice_source_terms,
 )
 from .errors import CircuitSimulatorError, error_handler
 from .table_sources import STIMULUS_KEY, STIMULUS_OP_KEY, TIME_TABLES_KEY, TableSpec, table_source_terms, table_spec
@@ -737,7 +738,19 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             _add_symbolic(b_time_str, j, expression, positive=True)
             _add_symbolic(b_time_str, k, expression, positive=False)
         elif comp_type == "I":
-            if (component.subtype or "").upper() == "DC":
+            if component.metadata:  # SPICE source form: DC, AC (with phase) and waveform parts
+                dc, phasor, expression = spice_source_terms(component)
+                if j != -1:
+                    b_dc[j] += dc
+                if k != -1:
+                    b_dc[k] -= dc
+                if phasor:
+                    stamp_numeric_rhs(b_ac, j, phasor, positive=True)
+                    stamp_numeric_rhs(b_ac, k, phasor, positive=False)
+                if expression is not None:
+                    _add_symbolic(b_time_str, j, expression, positive=True)
+                    _add_symbolic(b_time_str, k, expression, positive=False)
+            elif (component.subtype or "").upper() == "DC":
                 current = parse_value(component.value or "0")
                 if j != -1:
                     b_dc[j] += current
@@ -775,7 +788,14 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
             branch_idx = get_branch_index(component.name)
             stamp_voltage_source(branch_idx, j, k)
             controlling_branch_map[component.name] = branch_idx
-            if (component.subtype or "").upper() == "DC":
+            if component.metadata:  # SPICE source form: DC, AC (with phase) and waveform parts
+                dc, phasor, expression = spice_source_terms(component)
+                b_dc[branch_idx] += dc
+                if phasor:
+                    stamp_numeric_rhs(b_ac, branch_idx, phasor, positive=True)
+                if expression is not None:
+                    _add_symbolic(b_time_str, branch_idx, expression, positive=True)
+            elif (component.subtype or "").upper() == "DC":
                 b_dc[branch_idx] += parse_value(component.value or "0")
             elif (component.subtype or "").upper() == "AC":
                 stamp_numeric_rhs(b_ac, branch_idx, parse_value(component.value or "0"), positive=True)

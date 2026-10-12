@@ -598,3 +598,28 @@ def test_transient_is_identical_for_every_thread_count() -> None:
         )
         runs.append(np.asarray(result.waveform.values))
     assert np.array_equal(runs[0], runs[1])
+
+
+# ---- process parameters -------------------------------------------------------------------
+
+
+def test_kp_phi_and_gamma_are_derived_from_uo_tox_and_nsub_when_omitted() -> None:
+    from mna_simulation.card_devices import CHARGE, EPS_OX, EPS_SI, NI_300K, prepare_card_devices
+
+    card = {"model": "spice_level1", "vto": "0.7", "uo": "550", "tox": "20n", "nsub": "1e16", "w": "10u", "l": "1u"}
+    (device,) = prepare_card_devices([M("M1", "NMOS", "d", "g", "0", card)])
+    cox = EPS_OX / 20e-9
+    kp = 550e-4 * cox
+    assert device.params["beta"] == pytest.approx(kp * 10.0, rel=1e-12)
+    assert device.params["phi"] == pytest.approx(2.0 * CARD_VT * math.log(1e22 / NI_300K), rel=1e-12)
+    assert device.params["gamma"] == pytest.approx(math.sqrt(2.0 * EPS_SI * CHARGE * 1e22) / cox, rel=1e-12)
+    # A card that gives KP, PHI or GAMMA keeps its own values.
+    explicit = dict(card, kp="1e-4", phi="0.9", gamma="0.3")
+    (device,) = prepare_card_devices([M("M1", "NMOS", "d", "g", "0", explicit)])
+    assert device.params["beta"] == pytest.approx(1e-3, rel=1e-12)
+    assert device.params["phi"] == 0.9 and device.params["gamma"] == 0.3
+    # UO without TOX (or TOX without UO) derives nothing: SPICE's default KP stays.
+    (device,) = prepare_card_devices([M("M1", "NMOS", "d", "g", "0", {"model": "spice_level1", "uo": "550"})])
+    assert device.params["beta"] == pytest.approx(2e-5, rel=1e-12)
+    with pytest.raises(CircuitSimulatorError, match="nsub"):
+        prepare_card_devices([M("M1", "NMOS", "d", "g", "0", {"model": "spice_level1", "nsub": "1e9", "tox": "20n"})])

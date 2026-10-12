@@ -86,13 +86,18 @@ Every analysis runs in the mandatory C++17 extension `mna_simulation._core` (`cp
 - Preserves FUNC expression tails with spaces instead of splitting them into separate tokens.
 - Supports extended BJT/MOS small-signal parameter forms.
 - Supports physical Level-1 BJT/MOS syntax alongside small-signal compatibility syntax.
-- Emits backend-neutral `CircuitIR`.
+- Emits backend-neutral `CircuitIR` (with `diagnostics` for ignored constructs).
+- SPICE dialect (phase M1): device lines that name a `.model` card produce the `spice` / `gummel_poon` / `spice_level1` records of `HIERARCHY_AND_MODELS_PLAN.md` 3.2, SPICE source forms (`DC`/`AC` with phase, `SIN(...)`, `PULSE`, `PWL`, `EXP`), unit letters, case-insensitive node names; the single-pass loop hands netlists with structural SPICE constructs to `mna_simulation/spice/frontend.py`. `parse_netlist_file(path, search_dirs=...)` resolves `.include`/`.lib`.
+
+### `mna_simulation/spice/`
+- `values.py` (SPICE literals, token helpers), `expressions.py` (restricted `.param`/`{...}` evaluator, no `eval`), `model_cards.py` (card parsing, supported/modelled parameter lists), `sources.py` (source specifications, PULSE/PWL/EXP/SIN waveform expressions, `.tran` defaults), `context.py` (per-parse diagnostics, model lookup, line locations), `frontend.py` (lexing, `.include`/`.lib`, `.subckt`/`X` flattening, parameter scopes, `FileIncludeResolver`).
 
 ### `mna_simulation/mna_builder.py`
 - Converts `CircuitIR` to `MnaProblem`.
 - Stamps COO triplets once (P6a fast path) and forms the SciPy CSR `G`/`C` with duplicates summed in stamping order (bit-identical to the reference builder), RHS vectors, the symbolic `f_str`/`b_time_str` display vectors, labels, and branch maps; dense `G`/`C` stay available for `.show_matrix`, small circuits, and tests.
 - Stamps passive devices, sources, controlled sources, diodes, BJTs, and MOSFETs, plus Level-1 device metadata and junction/gate capacitances for transient analysis.
 - Raises `NETLIST_FATAL` "'<name>' has zero resistance" for `R = 0` and a small-signal BJT with `rpi = 0` (2.4.1).
+- SPICE-form `V`/`I` records (non-empty `metadata`: `DC x AC mag phase`, `PULSE`, `PWL`, `EXP`, `SIN(...)`) stamp their DC value into `b_dc`, the AC phasor (with phase) into `b_ac` and the waveform minus the DC value into `b_time_str` (`device_models.spice_source_terms`).
 - `_compile_native` builds `problem.native`, the compiled `_core.Circuit` (gmin-free `G`, `C`, the unit gmin stamps, device tables, behavioral programs) shared by every gmin step.
 - Model-card devices (phase M2, `card_devices.py`): `_build_index_map` numbers their internal nodes (`D1#a`, `Q1#b`, `Q1#c`, `Q1#e`) after the sorted external nodes and before the branch currents and ignores a Gummel-Poon substrate node; the builder stamps the series-resistance conductances, the constant junction / overlap capacitors and gmin, fills the native `spice_diodes`, `gummel_poon` and `mos4` tables, puts a readable placeholder (`I_spice_diode(D1)`, `Ic_gummel_poon(Q1)`, `Id_spice_level1(M1)`) into the display `f_str` (never into `solver_f_str`), and lists the devices in `metadata["card_devices"]`.
 
@@ -417,6 +422,11 @@ Each module exercises one native unit through its binding and its Python facade,
 ### `tests/device_reference/`, `tests/test_spice_devices.py`
 - `device_reference/`: independent NumPy implementations of the phase-M2 equations written from SPICE3f5 (`spice_diode.py` with `breakdown_voltage`, `gummel_poon.py`, `mos_card.py`, the clip in `common.py`); `test_reference_jacobians.py` checks their Jacobians by central differences over bias grids in every region, `test_native_vs_reference.py` compares the native kernels and the compiled-circuit path with them to 1e-12 (boundaries and clip regions included) and checks `gamma = 0` against `eval_mos_level1` bit for bit.
 - `test_spice_devices.py`: model-card circuits built from `ComponentRecord`s: internal nodes and labels, defaults and validation, the 1N4148 law with series resistance, zener breakdown, junction limiting, a 2N2222 common-emitter stage (`.op` beta against the reference, `.ac`, `.tran`, `.hb`, TPWL, linear MOR), a 2N2907 mirror, the NMOS body-effect threshold shift, a CMOS inverter `.tran`, a diode rectifier `.hb`, JSON-safe operating points, and thread-count determinism.
+
+### `tests/test_spice_dialect.py`, `tests/vendor/`, `tests/test_vendor_models.py`
+- `test_spice_dialect.py`: the SPICE front end construct by construct (continuations, comments, case folding, `.model` cards and their diagnostics, nested `.subckt`/`X` flattening and names, `.param`/`{...}` evaluation, `.include`/`.lib` through a temporary directory, the SPICE source forms and their `.op`/`.ac`/`.tran` split, the current-source sign inside subcircuits, every error text) and end-to-end `.model` cards on the phase-M2 equations.
+- `vendor/vendor_parts.lib`: cards and macromodels in the formats manufacturers publish (1N4148 with string-valued bookkeeping fields, 1N4007, a zener, 2N2222A/2N2907A/2N3904, a LEVEL=3 MOS card, a card with UO/TOX and no KP, a VDMOS card, a parameterised op-amp macromodel, a current mirror with an internal bias source).
+- `test_vendor_models.py`: that library end to end through `SimulationService` and the CLI (`--lib`): diode law, rectifier `.tran`, zener regulation, BJT bias and PNP stage, LEVEL=3 switch, derived KP, VDMOS error, op-amp gain and bandwidth, mirror polarity.
 
 ### `tests/test_determinism.py`
 - Every corpus analysis through `SimulationService.run_request` at `num_threads` 1 and 4 (a private 4-thread `ThreadBudget`): the whole response must be bitwise identical (floats compared by bit pattern), except the metadata that reports the thread grant, timings, or memory (`threads_requested`, `threads_used`, `elapsed_ms`, `memory_bytes`, keys ending in `_ms`/`_seconds`). Analyses that raise on both runs are skipped after checking that the errors agree; the NumPy RNG is reseeded and the TPWL cache cleared before every run.

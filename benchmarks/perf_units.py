@@ -226,7 +226,16 @@ def _ir_view(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return (type(value).__name__, [_ir_view(v) for v in value])
     if dataclasses.is_dataclass(value):
-        return (type(value).__name__, [(f.name, _ir_view(getattr(value, f.name))) for f in dataclasses.fields(value)])
+        # ``CircuitIR.diagnostics`` (parser notes, added with the SPICE front end) does not
+        # exist in the oracle; an empty list is left out so equal parses compare equal.
+        return (
+            type(value).__name__,
+            [
+                (f.name, _ir_view(getattr(value, f.name)))
+                for f in dataclasses.fields(value)
+                if not (f.name == "diagnostics" and getattr(value, f.name) == [])
+            ],
+        )
     return ("repr", repr(value))
 
 
