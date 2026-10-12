@@ -8,11 +8,15 @@ for the native time-source programs (``Min``, ``Max``, ``Mod``, ``Piecewise``,
 ``np.heaviside``, ``np.exp``, ``np.sin``), with linear ramps.
 
 Transient defaults follow SPICE: an omitted (or zero) ``tr``/``tf``/``tau`` is the
-analysis step and an omitted (or zero) ``pw``/``per`` is the stop time, an omitted SIN
-frequency is ``1/tstop``. The parser fills them from the netlist's last ``.tran``
-directive (:func:`fill_transient_defaults`); without one they stay ``0`` and the
-renderers read ``0`` as an ideal edge (``tr``/``tf``/``tau``), a pulse that never ends
-(``pw``), a single pulse (``per``) or a constant (SIN frequency).
+analysis step and an omitted (or zero) ``pw``/``per`` is the stop time, an omitted EXP
+``td2`` is ``td1`` plus the step, an omitted SIN frequency is ``1/tstop``. The parser
+fills them from the netlist's last ``.tran`` directive (:func:`fill_transient_defaults`);
+without one they stay ``0`` and the renderers read ``0`` as an ideal edge
+(``tr``/``tf``/``tau``), a pulse that never ends (``pw``), a single pulse (``per``), an
+EXP that does not fall (``td2``) or a constant (SIN frequency).
+
+A line without a ``DC`` value takes, as in SPICE, its waveform's value at t = 0 as the
+``.op`` value (:func:`transient_value`, the renderers' formulas evaluated in Python).
 """
 
 from __future__ import annotations
@@ -296,7 +300,11 @@ def render_pwl(points: list[str], repeat: str | None = None, delay: str | None =
 
 
 def render_exp(values: list[str]) -> str:
-    """``EXP(v1 v2 td1 tau1 td2 tau2)``: rise from ``td1``, fall from ``td2``."""
+    """``EXP(v1 v2 td1 tau1 td2 tau2)``: rise from ``td1``, fall from ``td2``.
+
+    ``td2`` still 0 after the ``.tran`` defaults (SPICE: ``td1`` plus the step) means the
+    netlist has no ``.tran``: the waveform does not fall.
+    """
 
     v1, v2, td1, tau1, td2, tau2 = (parse_value(v) for v in values)
 
@@ -305,7 +313,10 @@ def render_exp(values: list[str]) -> str:
             return f"(1 - np.exp(-{_delayed_time(delay)}/{_num(tau)}))"
         return f"np.heaviside(t - {_num(delay)}, 1)"
 
-    return f"({_num(v1)} + {_num(v2 - v1)}*{edge(td1, tau1)} + {_num(v1 - v2)}*{edge(td2, tau2)})"
+    rise = f"{_num(v1)} + {_num(v2 - v1)}*{edge(td1, tau1)}"
+    if td2 == 0.0:
+        return f"({rise})"
+    return f"({rise} + {_num(v1 - v2)}*{edge(td2, tau2)})"
 
 
 def render_sin(values: list[str]) -> str:
@@ -337,15 +348,99 @@ def render_transient(subtype: str, metadata: dict[str, object]) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Waveform values (the same formulas as the renderers, evaluated in Python)
+# ---------------------------------------------------------------------------
+
+
+def _heaviside(x: float, at_zero: float) -> float:
+    return 1.0 if x > 0.0 else (at_zero if x == 0.0 else 0.0)
+
+
+def _pulse_value(values: list[str], t: float) -> float:
+    v1, v2, td, tr, tf, pw, per = (parse_value(v) for v in values)
+    tau = t if td == 0.0 else max(t - td, 0.0)
+    if per > 0.0:
+        tau = tau % per
+    ramps: list[float] = []
+    gate = 1.0
+    if tr > 0.0:
+        ramps.append(tau / tr)
+    else:
+        gate *= _heaviside(t - td, 1.0)
+    if pw > 0.0:
+        if tf > 0.0:
+            ramps.append((tr + pw + tf - tau) / tf)
+        else:
+            gate *= _heaviside(tr + pw - tau, 0.0)
+    shape = max(0.0, min([1.0, *ramps])) if ramps else 1.0
+    return v1 + (v2 - v1) * shape * gate
+
+
+def _pwl_value(points: list[str], repeat: str | None, delay: str | None, t: float) -> float:
+    numbers = [parse_value(p) for p in points]
+    times, levels = numbers[0::2], numbers[1::2]
+    local = t - (parse_value(delay) if delay else 0.0)
+    if repeat is not None:
+        start, last = parse_value(repeat), times[-1]
+        if not local < last:
+            local = start + (local - last) % (last - start)
+    if local < times[0]:
+        return levels[0]
+    for (t0, v0), (t1, v1) in zip(zip(times, levels), zip(times[1:], levels[1:])):
+        if t1 > t0 and local < t1:
+            return v0 + (v1 - v0) / (t1 - t0) * (local - t0)
+    return levels[-1]
+
+
+def _exp_value(values: list[str], t: float) -> float:
+    v1, v2, td1, tau1, td2, tau2 = (parse_value(v) for v in values)
+
+    def edge(delay: float, tau: float) -> float:
+        if tau > 0.0:
+            return 1.0 - math.exp(-(t if delay == 0.0 else max(t - delay, 0.0)) / tau)
+        return _heaviside(t - delay, 1.0)
+
+    rise = v1 + (v2 - v1) * edge(td1, tau1)
+    return rise if td2 == 0.0 else rise + (v1 - v2) * edge(td2, tau2)
+
+
+def _sin_value(values: list[str], t: float) -> float:
+    vo, va, freq, td, theta, phase = (parse_value(v) for v in values)
+    tau = t if td == 0.0 else max(t - td, 0.0)
+    return vo + va * math.exp(-theta * tau) * math.sin(2.0 * math.pi * freq * tau + math.radians(phase))
+
+
+def transient_value(subtype: str, metadata: dict[str, object], t: float) -> float | None:
+    """Value of a SPICE-form source's waveform at ``t`` (``None`` without a transient function)."""
+
+    if subtype == "PULSE":
+        return _pulse_value(metadata["pulse"], t)  # type: ignore[arg-type]
+    if subtype == "PWL":
+        return _pwl_value(metadata["points"], metadata.get("repeat"), metadata.get("td"), t)  # type: ignore[arg-type]
+    if subtype == "EXP":
+        return _exp_value(metadata["exp"], t)  # type: ignore[arg-type]
+    if subtype == "SIN" and "sin" in metadata:
+        return _sin_value(metadata["sin"], t)  # type: ignore[arg-type]
+    return None
+
+
 def source_terms(subtype: str, value: str | None, metadata: dict[str, object]) -> tuple[float, complex, str | None]:
     """``(dc, ac phasor, time expression)`` of a SPICE-form source record.
 
-    ``.op`` uses ``dc``; ``.ac`` the phasor ``ac_mag * exp(j ac_phase deg)``; ``.tran``
-    and ``.hb`` evaluate ``b_dc + b_time(t)``, so the time expression is the waveform
-    minus ``dc`` (``None`` when the source has no transient function).
+    ``.op`` uses ``dc``: the explicit ``DC`` value, or (as in SPICE) the waveform's value
+    at t = 0 when the line gives none (``PULSE(5 0 ...)`` gives 5). ``.ac`` uses the phasor
+    ``ac_mag * exp(j ac_phase deg)``. ``.tran`` and ``.hb`` evaluate ``b_dc + b_time(t)``,
+    so the time expression is the waveform minus ``dc`` (``None`` when the source has no
+    transient function).
     """
 
-    dc = 0.0 if subtype == "AC" or value is None else parse_value(value)
+    if subtype == "AC":
+        dc = 0.0
+    elif value is not None:
+        dc = parse_value(value)
+    else:
+        dc = transient_value(subtype, metadata, 0.0) or 0.0
     ac: complex = 0j
     if "ac_mag" in metadata:
         magnitude = parse_value(metadata["ac_mag"])  # type: ignore[arg-type]

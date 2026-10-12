@@ -892,6 +892,57 @@ def test_op_uses_dc_ac_uses_the_phasor_and_tran_the_waveform() -> None:
     assert vb[time.searchsorted(20e-6)] == pytest.approx(-2.0, abs=1e-9)  # current into the first node (0)
 
 
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("PULSE(5 0 1u 1u 1u 5u 10u)", 5.0),
+        ("PWL(0 3.3 1u 0)", 3.3),
+        ("SIN(1.5 2 1k)", 1.5),
+        ("SIN(0 2 1k 0 0 30)", 1.0),  # vo + va sin(phase)
+        ("EXP(2 5 1u 1u)", 2.0),
+        ("DC 7 PULSE(5 0 1u 1u 1u 5u 10u)", 7.0),  # an explicit DC value wins for .op
+        ("AC 1 PWL(0 -1 1u 1)", -1.0),
+    ],
+)
+def test_op_without_a_dc_value_uses_the_waveform_at_t0(source: str, expected: float) -> None:
+    text = f"V1 a 0 {source}\nR1 a 0 1k\n"
+    record = parse_netlist_text(text).components[0]
+    assert record.value == (None if not source.startswith("DC") else "7")  # the record keeps "no DC value"
+    assert _op(text + ".op\n")["V(a)"] == pytest.approx(expected, abs=1e-12)
+    # .tran starts from the waveform at t = 0 in every case (b_dc + waveform - dc).
+    tran = SimulationService().run_request(AnalysisRequest(netlist_text=text + ".tran 2u 0.1u\n"))
+    first = tran.waveform["values"][tran.waveform["labels"].index("V(a)")][0]
+    t0 = expected if not source.startswith("DC") else 5.0
+    assert first == pytest.approx(t0, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "PULSE(1 5 2u 1u 2u 3u 10u)",
+        "PULSE(0 1 0)",
+        "PULSE(0 1 1u 0 0 2u)",
+        "PWL(0 0 1u 4 3u 0) R=0 TD=1u",
+        "PWL(1u 2 2u 2 2u 5 4u -1)",
+        "EXP(0 1 1u 1u 5u 2u)",
+        "EXP(2 5 1u 1u)",
+        "SIN(1 2 1k 1m 100 30)",
+    ],
+)
+def test_waveform_values_match_the_rendered_expression(source: str) -> None:
+    from mna_simulation.spice.sources import transient_value
+
+    record = parse_netlist_text(f"V1 a 0 {source}\nR1 a 0 1k\n").components[0]
+    program = compile_expression(source_expression(record), time_dependent=True, n_unknowns=0)
+    for t in (0.0, 0.3e-6, 1e-6, 1.7e-6, 2e-6, 2.5e-6, 4e-6, 6.2e-6, 12.5e-6, 1.3e-3, 7e-3):
+        assert transient_value(record.subtype, record.metadata, t) == pytest.approx(program.evaluate(t=t), abs=1e-12), t
+
+
+def test_op_of_a_current_source_waveform_at_t0() -> None:
+    values = _op("I1 a 0 PULSE(2m 0 1u)\nR1 a 0 1k\n.op\n")
+    assert values["V(a)"] == pytest.approx(2.0)  # top level: current into the first node
+
+
 def test_ac_phase_reaches_the_ac_analysis() -> None:
     service = SimulationService()
     response = service.run_request(AnalysisRequest(netlist_text="V1 a 0 AC 1 90\nR1 a b 1k\nR2 b 0 1k\n.ac 1k 1k 1\n"))
@@ -996,12 +1047,72 @@ def test_short_lines_with_unsupported_letters_keep_the_dialect_error() -> None:
     )
 
 
-def test_current_sources_in_subcircuits_get_a_polarity_diagnostic() -> None:
-    circuit = parse_netlist_text(".subckt BIAS out\nIB out 0 10u\nRB out 0 1k\n.ends\nX1 n BIAS\nX2 m BIAS\n")
-    assert circuit.diagnostics == [
-        "subcircuit BIAS: current source(s) IB drive their current into the first node (this simulator's "
-        "convention, the opposite of SPICE); swap the nodes of a model written for SPICE"
-    ]
+# An op-amp input stage in the vendor style: input bias currents IB+/IB- written for SPICE
+# (positive current flows from the input pin through the source to VEE), a differential
+# input resistance and a single-pole gain stage referenced to the rails.
+OPAMP_BIAS_MACRO = """
+.subckt OPB inp inn vcc vee out PARAMS: ib=100n aol=100k
+IBP inp vee {ib}
+IBN inn vee {ib}
+RIN inp inn 1meg
+EG mid 0 inp inn {aol}
+RO mid out 50
+RS1 vcc 0 1g
+RS2 vee 0 1g
+.ends OPB
+"""
+
+
+def test_current_sources_inside_subcircuits_follow_spice() -> None:
+    # Voltage follower with 1 MEG in series with the + input: the bias current is pulled
+    # out of the + input pin (SPICE), so V(inp) and the output sit 0.1 V *below* the source.
+    text = OPAMP_BIAS_MACRO + "VCC vcc 0 15\nVEE vee 0 -15\nVS src 0 DC 1\nRSRC src inp 1meg\nX1 inp out vcc vee out OPB\n.op\n"
+    circuit = parse_netlist_text(text)
+    records = _by_name(circuit)
+    # Flattened with the nodes swapped: this simulator drives an I record's current into node1.
+    assert (records["X1.IBP"].node1, records["X1.IBP"].node2) == ("vee", "inp")
+    assert records["X1.IBP"].value == repr(100 * 1e-9)
+    assert (records["X1.IBN"].node1, records["X1.IBN"].node2) == ("vee", "out")
+    assert circuit.diagnostics == []
+    values = _op(text)
+    # Current through RSRC flows from src into the + input: (V(src) - V(inp)) / 1meg > 0.
+    i_rsrc = (values["V(src)"] - values["V(inp)"]) / 1e6
+    i_rin = (values["V(inp)"] - values["V(out)"]) / 1e6
+    assert i_rsrc == pytest.approx(i_rin + 100e-9, rel=1e-9)  # KCL with IB+ leaving the + input
+    assert values["V(inp)"] < values["V(src)"]
+    assert values["V(inp)"] == pytest.approx(1.0 - 0.1, abs=1e-5)
+    # VS supplies the bias current: its branch current has the sign of a source delivering current.
+    assert values["I(VS)"] == pytest.approx(-i_rsrc, rel=1e-9)
+    # The same circuit hand-flattened, with the SPICE sources rewritten in this simulator's convention.
+    hand = (
+        "VCC vcc 0 15\nVEE vee 0 -15\nVS src 0 DC 1\nRSRC src inp 1meg\n"
+        "IBP vee inp 100n\nIBN vee out 100n\nRIN inp out 1meg\nEG X1.mid 0 inp out 100k\nRO X1.mid out 50\n"
+        "RS1 vcc 0 1g\nRS2 vee 0 1g\n.op\n"
+    )
+    expected = _op(hand)
+    nodes = [label for label in expected if label.startswith("V(")]
+    assert [values[label] for label in nodes] == pytest.approx([expected[label] for label in nodes], rel=1e-12)
+
+
+def test_current_mirror_macromodel_reference_current_has_the_spice_sign() -> None:
+    # A bias cell: IREF is written for SPICE and pulls 1 mA out of 'vcc' into 'ref'; the
+    # mirror output is a VCCS (SPICE sign: current from node 0 through the source into 'out').
+    text = (
+        ".subckt BIASCELL vcc out\nIREF vcc ref 1m\nRREF ref 0 1k\nGMIR 0 out ref 0 1m\n.ends\n"
+        "VDD vdd 0 5\nX1 vdd o BIASCELL\nRL o 0 2k\n.op\n"
+    )
+    values = _op(text)
+    assert values["V(X1.ref)"] == pytest.approx(1.0, rel=1e-12)  # 1 mA into RREF
+    assert values["V(o)"] == pytest.approx(2.0, rel=1e-12)  # mirrored 1 mA into RL
+    assert values["I(VDD)"] == pytest.approx(-1e-3, rel=1e-12)  # VDD delivers the reference current
+
+
+def test_top_level_current_sources_keep_this_simulators_convention() -> None:
+    plain = _op("I1 n1 0 DC 1m\nR1 n1 0 1k\n.op\n")
+    spice = _op(".subckt LOAD a\nR1 a 0 1k\n.ends\nI1 n1 0 DC 1m ; front end\nX1 n1 LOAD\n.op\n")
+    assert plain["V(n1)"] == pytest.approx(1.0) and spice["V(n1)"] == pytest.approx(1.0)  # into the first node
+    record = _by_name(parse_netlist_text(".subckt LOAD a\nR1 a 0 1k\n.ends\nI1 n1 0 1m\nX1 n1 LOAD\n"))["I1"]
+    assert (record.node1, record.node2) == ("n1", "0")
 
 
 # ---------------------------------------------------------------------------

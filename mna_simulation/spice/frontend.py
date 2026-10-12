@@ -18,6 +18,9 @@ section 3.2):
    (``spice.expressions``), ``X`` instances are flattened recursively (``X1.R1``,
    internal nets ``X1.n``, ports bound to the parent's nets, ``0`` and ``.global`` nets
    kept), every other line is parsed by ``Component.from_parts`` with the cards in scope.
+   Independent ``I`` sources inside a ``.subckt`` body follow SPICE (current from the
+   first node through the source to the second): their nodes are swapped when flattened,
+   while top-level ``I`` lines keep the simulator's convention (current into the first node).
 
 Errors are ``NETLIST_FATAL`` (or the dialect's own codes) naming the line, the file of
 an included line, and the subcircuit instance.
@@ -528,7 +531,6 @@ class _Frontend:
         self.referenced_cards: set[int] = set()
         self.instance_names: dict[str, set[str]] = {}
         self.global_nets: set[str] = set()
-        self.current_sources: dict[int, tuple[_Definition, list[str]]] = {}
         self.global_scope: _Scope | None = None
 
     # -- driver ------------------------------------------------------------
@@ -558,7 +560,6 @@ class _Frontend:
         for line in root.elements:
             self.element(line, root, scope, "", None, ())
 
-        self._report_current_sources()
         self._report_unused_cards(root)
         context.line = None
         context.scope = None
@@ -720,18 +721,23 @@ class _Frontend:
             context.deferred.append(record)
         if node_map is not None and not self._rename(record, prefix, node_map):
             return
-        if record.type == "I" and definition.name is not None:
-            entry = self.current_sources.setdefault(id(definition), (definition, []))
-            if name not in entry[1]:
-                entry[1].append(name)
         self.netlist.add_component(record)
 
     def _rename(self, record: ComponentRecord, prefix: str, node_map: dict[str, str]) -> bool:
-        """Flattened name and nets of a subcircuit element; False when it is dropped."""
+        """Flattened name and nets of a subcircuit element; False when it is dropped.
+
+        An independent current source inside a ``.subckt`` body follows SPICE: positive
+        current flows from its first node through the source to its second node. The
+        simulator drives an ``I`` record's current into its first node, so the flattened
+        record gets the two nodes swapped (top-level ``I`` lines keep the simulator's
+        convention).
+        """
 
         record.name = prefix + record.name
         record.node1 = self.map_node(record.node1, prefix, node_map)
         record.node2 = self.map_node(record.node2, prefix, node_map)
+        if record.type == "I":
+            record.node1, record.node2 = record.node2, record.node1
         record.ctrl_node1 = self.map_node(record.ctrl_node1, prefix, node_map)
         record.ctrl_node2 = self.map_node(record.ctrl_node2, prefix, node_map)
         if (record.type == "CCCS" or record.type == "CCVS") and record.ctrl_source:
@@ -814,14 +820,6 @@ class _Frontend:
             self.element(element, target, child, path + ".", child_map, (*chain, target))
 
     # -- end-of-parse diagnostics ------------------------------------------
-
-    def _report_current_sources(self) -> None:
-        for definition, names in self.current_sources.values():
-            self.context.diagnose(
-                f"subcircuit {definition.name}: current source(s) {', '.join(names)} drive their current into the "
-                f"first node (this simulator's convention, the opposite of SPICE); swap the nodes of a model "
-                f"written for SPICE"
-            )
 
     def _report_unused_cards(self, root: _Definition) -> None:
         unused: list[str] = []
