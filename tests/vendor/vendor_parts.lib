@@ -1,0 +1,53 @@
+* Vendor-format model cards and macromodels for the end-to-end import tests.
+* The cards are in the formats manufacturers and SPICE distributions publish
+* (parameter spelling, parenthesised lists, continuation lines, extra fields the
+* equations do not use). Values are representative of the named parts; the
+* tests check physical behaviour and the parser/builder contract, not datasheet
+* digits.
+
+* --- Diodes -----------------------------------------------------------------
+.model 1N4148 D(Is=2.52n Rs=.568 N=1.752 Cjo=4p M=.4 tt=20n Iave=200m Vpk=75 mfg=OnSemi type=silicon)
+.MODEL D1N4007 D (IS=7.02767n RS=0.0341512 N=1.80803 EG=1.05743 XTI=5 BV=1000 IBV=5e-08
++ CJO=1e-11 VJ=0.7 M=0.5 FC=0.5 TT=1e-07 KF=0 AF=1)
+* 5.1 V zener in the usual card form: a sharp breakdown at BV with IBV at the knee.
+.model DZ5V1 D(Is=1e-14 Rs=1.2 N=1.3 Cjo=120p Bv=5.1 Ibv=5m tt=50n)
+
+* --- Bipolar transistors ----------------------------------------------------
+.model Q2N2222A NPN(IS=14.34f XTI=3 EG=1.11 VAF=74.03 BF=255.9 NE=1.307 ISE=14.34f IKF=.2847 XTB=1.5
++ BR=6.092 NC=2 ISC=0 IKR=0 RC=1 CJC=7.306p MJC=.3416 VJC=.75 FC=.5 CJE=22.01p MJE=.377 VJE=.75
++ TR=46.91n TF=411.1p ITF=.6 VTF=1.7 XTF=3 RB=10)
+.model Q2N2907A PNP(IS=650.6E-18 XTI=3 EG=1.11 VAF=115.7 BF=231.7 NE=1.829 ISE=54.81f IKF=1.079 XTB=1.5
++ BR=3.563 NC=2 ISC=0 IKR=0 RC=.715 CJC=14.76p MJC=.5383 VJC=.75 FC=.5 CJE=19.82p MJE=.3357 VJE=.75
++ TR=111.3n TF=603.7p ITF=.65 VTF=5 XTF=1.7 RB=10)
+.model Q2N3904 NPN(IS=6.734f XTI=3 EG=1.11 VAF=74.03 BF=416.4 NE=1.259 ISE=6.734f IKF=66.78m XTB=1.5
++ BR=.7371 NC=2 ISC=0 IKR=0 RC=1 CJC=3.638p MJC=.3085 VJC=.75 FC=.5 CJE=4.493p MJE=.2593 VJE=.75
++ TR=239.5n TF=301.2p ITF=.4 VTF=4 XTF=2 RB=10)
+
+* --- MOSFETs ----------------------------------------------------------------
+* Small-signal switch in the LEVEL=3 card form (KP given, body effect, overlap caps).
+.MODEL M2N7000 NMOS (LEVEL=3 TOX=100n UO=600 VTO=2.0 KP=170u GAMMA=0.6 PHI=0.6 LAMBDA=0.02
++ RS=1.6 RD=1.3 CGSO=200p CGDO=150p CBD=14p PB=.8 MJ=.5 FC=.5 IS=10f N=1 W=9.6m L=2u)
+* A card that gives UO and TOX but no KP (KP is derived as UO * eps_ox / TOX).
+.model MNOKP NMOS(LEVEL=1 VTO=0.7 UO=550 TOX=20n LAMBDA=0.05 GAMMA=0.4 PHI=0.65)
+* LTspice publishes BS170 as a VDMOS card: not supported, must be a clear error when used.
+.model BS170 VDMOS(Rg=270 Vto=2.8 Rd=1.1 Rs=.3 Rb=.75 Kp=.17 Cgdmax=35p Cgdmin=8p Cgs=28p Cjo=35p Is=10p mfg=Zetex Vds=60 Ron=5 Qg=0.75n)
+
+* --- Macromodels -------------------------------------------------------------
+* Single-pole op-amp macromodel in the style vendors publish: differential input
+* stage, dominant pole, output buffer with resistance, parameters per instance.
+.subckt OPAMP1 inp inn out vcc vee PARAMS: Aol=1e5 GBW=1e6 Rin=1e6 Rout=50
+Rin inp inn {Rin}
+G1 0 p1 inp inn {Aol/1e6}
+R1 p1 0 1e6
+C1 p1 0 {Aol/(2*pi*GBW*1e6)}
+E1 o1 0 p1 0 1
+Rout o1 out {Rout}
+Rps vcc vee 100k
+.ends OPAMP1
+
+* Current mirror whose bias current source sits inside the subcircuit (SPICE polarity).
+.subckt MIRROR in out vcc
+Q1 in in 0 Q2N2222A
+Q2 out in 0 Q2N2222A
+Ibias vcc in 1m
+.ends

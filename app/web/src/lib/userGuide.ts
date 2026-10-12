@@ -98,7 +98,8 @@ export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
     items: [
       "The netlist panel shows the generated netlist for schematic mode.",
       "Editing the netlist asks for confirmation, clears the schematic hierarchy, and switches the next run to raw netlist_text.",
-      "Use raw netlist mode for quick parser checks, FUNC source expressions, or circuits that are easier to type than draw."
+      "Use raw netlist mode for quick parser checks, FUNC source expressions, or circuits that are easier to type than draw.",
+      "Vendor SPICE material can be pasted here: .model cards (D, NPN, PNP, NMOS/PMOS up to LEVEL=3), .subckt macromodels with X instances, .param values and {...} expressions, + continuation lines, and the PULSE/PWL/EXP/SIN(...) source forms. Comment a deck's title line out with *; .include/.lib files cannot be read from the browser, paste the library into the netlist instead. Ignored constructs and unused card parameters are listed in the response diagnostics."
     ]
   },
   {
