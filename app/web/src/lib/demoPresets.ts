@@ -181,8 +181,8 @@ const threeStageOpamp: SchematicPreset = (() => {
       pins: ["in_p", "out", "vcc", "in_n"],
       components: [
         mk({ id: `${prefix}-port-inp`, type: "NODE", name: "in_p", value: "node", x: 80, y: 260 }),
-        mk({ id: `${prefix}-port-inn`, type: "NODE", name: "in_n", value: "node", x: 80, y: 340 }),
-        mk({ id: `${prefix}-port-vcc`, type: "NODE", name: "vcc", value: "node", x: 380, y: 70 }),
+        mk({ id: `${prefix}-port-inn`, type: "NODE", name: "in_n", value: "node", x: 80, y: 340, metadata: { side: "bottom" } }),
+        mk({ id: `${prefix}-port-vcc`, type: "NODE", name: "vcc", value: "node", x: 380, y: 70, metadata: { side: "top" } }),
         mk({ id: `${prefix}-port-out`, type: "NODE", name: "out", value: "node", x: 660, y: 210 }),
         mk({
           id: `${prefix}-q1`,
@@ -243,7 +243,7 @@ const threeStageOpamp: SchematicPreset = (() => {
       pins: ["in", "out", "vcc"],
       components: [
         mk({ id: `${prefix}-port-in`, type: "NODE", name: "in", value: "node", x: 80, y: 240 }),
-        mk({ id: `${prefix}-port-vcc`, type: "NODE", name: "vcc", value: "node", x: 300, y: 70 }),
+        mk({ id: `${prefix}-port-vcc`, type: "NODE", name: "vcc", value: "node", x: 300, y: 70, metadata: { side: "top" } }),
         mk({ id: `${prefix}-port-out`, type: "NODE", name: "out", value: "node", x: 560, y: 180 }),
         mk({
           id: `${prefix}-q1`,
@@ -284,7 +284,7 @@ const threeStageOpamp: SchematicPreset = (() => {
       pins: ["in", "out", "vcc"],
       components: [
         mk({ id: `${prefix}-port-in`, type: "NODE", name: "in", value: "node", x: 80, y: 220 }),
-        mk({ id: `${prefix}-port-vcc`, type: "NODE", name: "vcc", value: "node", x: 300, y: 80 }),
+        mk({ id: `${prefix}-port-vcc`, type: "NODE", name: "vcc", value: "node", x: 300, y: 80, metadata: { side: "top" } }),
         mk({ id: `${prefix}-port-out`, type: "NODE", name: "out", value: "node", x: 560, y: 300 }),
         mk({
           id: `${prefix}-q1`,
@@ -319,9 +319,9 @@ const threeStageOpamp: SchematicPreset = (() => {
   const lvlOut = buildFollowerStage();
 
   /* ------------------- Top level: SUBCKT cascade ----------------------- */
-  // SUBCKT pin ordering follows getPinCoordinates. The differential block uses
-  // four pins so in_p sits left, out sits right, vcc sits on top, and in_n sits
-  // on the bottom where the top level ties it to the local small-signal reference.
+  // SUBCKT pin sides come from the entity's NODE markers (metadata.side). The
+  // differential block puts in_p left, out right, vcc on top, and in_n on the
+  // bottom where the top level ties it to the local small-signal reference.
   const topComponents: CanvasComponent[] = [
     mk({ id: "v-in", type: "V", name: "Vin", value: "0.001", subtype: "SIN", value2: "1k", x: 120, y: 276 }),
     mk({ id: "v-vcc", type: "V", name: "VCC", value: "15", subtype: "DC", x: 120, y: 120 }),
@@ -491,6 +491,19 @@ const largeSramCircuit: SchematicPreset = (() => {
       cellComponents.push(component);
       return component.id;
     };
+    // Ports face the array wiring: bit lines and q on the left, their
+    // complements and vdd on the right, ground and the init ties on top.
+    const portSide: Record<string, string> = {
+      bl: "left",
+      q: "left",
+      wl: "left",
+      blb: "right",
+      qb: "right",
+      vdd: "right",
+      gnd: "top",
+      init_q: "top",
+      init_qb: "top"
+    };
     const addCellPort = (name: string, x: number, y: number) =>
       addCellComponent({
         id: `sram-cell-port-${name}`,
@@ -498,7 +511,8 @@ const largeSramCircuit: SchematicPreset = (() => {
         name,
         value: "node",
         x,
-        y
+        y,
+        metadata: { side: portSide[name] }
       });
     const connectCell = (componentId: string, pin: string, nodeId: string) => {
       cellWires.push(pinWire(`sram-cell-w-${localWireIndex++}`, componentId, pin, nodeId, "n"));

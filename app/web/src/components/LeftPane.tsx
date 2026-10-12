@@ -1,12 +1,23 @@
 import { ReactNode, useEffect, useRef, useState } from "react";
 import {
+  entityContainsLevel,
+  entityPinLayout,
+  entityPorts,
+  nodeMarkerName,
+  validateSubcktInstance
+} from "../lib/hierarchy";
+import {
   AnalysisState,
   BasicAnalysisMode,
   CanvasComponent,
   DeviceType,
+  PIN_SIDES,
   SchematicLevel,
   ThreadSetting,
-  DEVICE_LABELS
+  DEVICE_LABELS,
+  defaultPinSide,
+  isPinSide,
+  subcktPinSide
 } from "../lib/schematic";
 import { drawPalettePreview } from "../lib/symbols";
 
@@ -32,6 +43,12 @@ type Props = {
   onAddLevel: (parentId: string | null) => void;
   onRenameLevel: (id: string, newTitle: string) => void;
   onDeleteLevel: (id: string) => void;
+  /** Start placing an instance of a child entity on the open level. */
+  onInstantiateLevel: (id: string) => void;
+  /** Deep-copy a child entity. */
+  onDuplicateLevel: (id: string) => void;
+  /** Open a child entity (SUBCKT property editor: "Edit ports in entity"). */
+  onOpenEntity: (id: string) => void;
 
   libraryComponents: DeviceType[];
   onStartDrag: (type: DeviceType) => void;
@@ -77,7 +94,12 @@ export function LeftPane(props: Props) {
           onAdd={props.onAddLevel}
           onRename={props.onRenameLevel}
           onDelete={props.onDeleteLevel}
+          onInstantiate={props.onInstantiateLevel}
+          onDuplicate={props.onDuplicateLevel}
         />
+        <div className="hintText">
+          Double-click a subcircuit on the canvas to open it, Alt+Up to go back up. Select parts and press Ctrl+Shift+G to make a subcircuit.
+        </div>
       </CollapsibleSection>
 
       <CollapsibleSection title="Netlist">
@@ -118,7 +140,9 @@ export function LeftPane(props: Props) {
           <PropertyEditor
             component={props.selectedComponent}
             levels={props.levels}
+            hostLevelId={props.activeLevelId}
             onUpdate={(patch) => props.onUpdateComponent(props.selectedComponent!.id, patch)}
+            onOpenEntity={props.onOpenEntity}
             focusToken={props.propertiesFocusToken}
           />
         </CollapsibleSection>
@@ -684,38 +708,30 @@ function SimulationControls({
   );
 }
 
-function HierarchyTree({
-  levels,
-  activeLevelId,
-  onSelect,
-  onAdd,
-  onRename,
-  onDelete
-}: {
-  levels: SchematicLevel[];
-  activeLevelId: string;
+type TreeActions = {
   onSelect: (id: string) => void;
   onAdd: (parentId: string | null) => void;
   onRename: (id: string, newTitle: string) => void;
   onDelete: (id: string) => void;
-}) {
+  onInstantiate: (id: string) => void;
+  onDuplicate: (id: string) => void;
+};
+
+function HierarchyTree({
+  levels,
+  activeLevelId,
+  ...actions
+}: {
+  levels: SchematicLevel[];
+  activeLevelId: string;
+} & TreeActions) {
   const roots = levels.filter((l) => l.parentId === null);
   return (
     <div className="tree">
       {roots.map((root) => (
-        <LevelBranch
-          key={root.id}
-          level={root}
-          depth={0}
-          levels={levels}
-          activeId={activeLevelId}
-          onSelect={onSelect}
-          onAdd={onAdd}
-          onRename={onRename}
-          onDelete={onDelete}
-        />
+        <LevelBranch key={root.id} level={root} depth={0} levels={levels} activeId={activeLevelId} {...actions} />
       ))}
-      <button className="ghostBtn" style={{ marginTop: 8 }} onClick={() => onAdd(null)}>
+      <button className="ghostBtn" style={{ marginTop: 8 }} onClick={() => actions.onAdd(null)}>
         + New top-level
       </button>
     </div>
@@ -727,29 +743,32 @@ function LevelBranch({
   depth,
   levels,
   activeId,
-  onSelect,
-  onAdd,
-  onRename,
-  onDelete
+  ...actions
 }: {
   level: SchematicLevel;
   depth: number;
   levels: SchematicLevel[];
   activeId: string;
-  onSelect: (id: string) => void;
-  onAdd: (parentId: string | null) => void;
-  onRename: (id: string, newTitle: string) => void;
-  onDelete: (id: string) => void;
-}) {
+} & TreeActions) {
+  const { onSelect, onAdd, onRename, onDelete, onInstantiate, onDuplicate } = actions;
   const children = levels.filter((l) => l.parentId === level.id);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(level.title);
+  const isEntity = level.parentId !== null;
+  const action = (handler: () => void) => (e: React.MouseEvent) => {
+    e.stopPropagation();
+    handler();
+  };
   return (
     <>
       <div
         className={`treeItem ${activeId === level.id ? "active" : ""}`}
         onClick={() => onSelect(level.id)}
-        onDoubleClick={() => setRenaming(true)}
+        onDoubleClick={() => {
+          setDraft(level.title);
+          setRenaming(true);
+        }}
+        title={isEntity ? `${level.title}: ports ${entityPorts(level).join(", ") || "none"}` : level.title}
       >
         <span className="treeItem__depth" style={{ width: 8 + depth * 12 }} />
         <span className="treeItem__chev">{children.length ? "▾" : "•"}</span>
@@ -771,40 +790,49 @@ function LevelBranch({
             }}
           />
         ) : (
-          <span>{level.title}</span>
+          <span className="treeItem__title">{level.title}</span>
         )}
+        {isEntity ? (
+          <>
+            <span
+              className="treeItem__add"
+              role="button"
+              aria-label={`Instantiate ${level.title}`}
+              title="Instantiate: place an instance of this entity on the open level (click on the canvas to drop it)"
+              onClick={action(() => onInstantiate(level.id))}
+            >
+              inst
+            </span>
+            <span
+              className="treeItem__add"
+              role="button"
+              aria-label={`Duplicate ${level.title}`}
+              title="Duplicate this entity (contents and sub-entities are copied with new ids)"
+              onClick={action(() => onDuplicate(level.id))}
+            >
+              dup
+            </span>
+          </>
+        ) : null}
         <span
           className="treeItem__add"
-          onClick={(e) => {
-            e.stopPropagation();
-            onAdd(level.id);
-          }}
+          role="button"
+          title="Add an empty sub-entity below this level"
+          onClick={action(() => onAdd(level.id))}
         >
           +sub
         </span>
         <span
           className="treeItem__add"
-          onClick={(e) => {
-            e.stopPropagation();
-            onDelete(level.id);
-          }}
+          role="button"
+          onClick={action(() => onDelete(level.id))}
           title="Delete this level (children are also removed)"
         >
           ×
         </span>
       </div>
       {children.map((c) => (
-        <LevelBranch
-          key={c.id}
-          level={c}
-          depth={depth + 1}
-          levels={levels}
-          activeId={activeId}
-          onSelect={onSelect}
-          onAdd={onAdd}
-          onRename={onRename}
-          onDelete={onDelete}
-        />
+        <LevelBranch key={c.id} level={c} depth={depth + 1} levels={levels} activeId={activeId} {...actions} />
       ))}
     </>
   );
@@ -839,15 +867,27 @@ function LibItem({ type, onClick }: { type: DeviceType; onClick: () => void }) {
 function PropertyEditor({
   component,
   levels,
+  hostLevelId,
   onUpdate,
+  onOpenEntity,
   focusToken
 }: {
   component: CanvasComponent;
   levels: SchematicLevel[];
+  /** Level the component sits on. */
+  hostLevelId: string;
   onUpdate: (patch: Partial<CanvasComponent>) => void;
+  onOpenEntity: (id: string) => void;
   focusToken?: number;
 }) {
   const firstInputRef = useRef<HTMLInputElement | null>(null);
+  // NODE names are port names inside an entity: commit them on Enter/blur so
+  // a half-typed name never renames (or merges) a port.
+  const [nameDraft, setNameDraft] = useState(component.name);
+  useEffect(() => setNameDraft(component.name), [component.id, component.name]);
+  const commitName = () => {
+    if (nameDraft !== component.name) onUpdate({ name: nameDraft });
+  };
   useEffect(() => {
     if (!focusToken) return;
     const el = firstInputRef.current;
@@ -931,6 +971,22 @@ function PropertyEditor({
     pins[index] = value.trim() || `node_${index + 1}`;
     onUpdate({ pins });
   };
+  const hostLevel = levels.find((level) => level.id === hostLevelId);
+  const inEntity = Boolean(hostLevel && hostLevel.parentId !== null);
+  const linkedEntity =
+    isSubckt && component.subcircuitId
+      ? levels.find((level) => level.id === component.subcircuitId && level.parentId !== null)
+      : undefined;
+  const instanceIssue = isSubckt ? validateSubcktInstance(levels, hostLevelId, component) : null;
+  const entityPortList = linkedEntity ? entityPorts(linkedEntity) : [];
+  const entityLayout = linkedEntity ? entityPinLayout(linkedEntity, entityPortList) : null;
+  const nodeSide = isNode && isPinSide(component.metadata?.side) ? component.metadata!.side : "";
+  const updateNodeSide = (side: string) => {
+    const metadata = { ...(component.metadata ?? {}) };
+    if (side) metadata.side = side;
+    else delete metadata.side;
+    onUpdate({ metadata: Object.keys(metadata).length > 0 ? metadata : undefined });
+  };
   return (
     <>
       <div className="formRow">
@@ -938,14 +994,23 @@ function PropertyEditor({
         <input
           ref={firstInputRef}
           className="input"
-          value={component.name}
-          onChange={(e) => onUpdate({ name: e.target.value })}
+          value={isNode ? nameDraft : component.name}
+          onChange={(e) => (isNode ? setNameDraft(e.target.value) : onUpdate({ name: e.target.value }))}
+          onBlur={isNode ? commitName : undefined}
+          onKeyDown={
+            isNode
+              ? (e) => {
+                  if (e.key === "Enter") commitName();
+                  else if (e.key === "Escape") setNameDraft(component.name);
+                }
+              : undefined
+          }
         />
       </div>
       {isSubckt ? (
         <>
           <div className="formRow">
-            <label>entity_name</label>
+            <label>entity</label>
             <select
               className="select"
               value={component.subcircuitId ?? ""}
@@ -953,47 +1018,110 @@ function PropertyEditor({
                 const entity = levels.find((level) => level.id === e.target.value);
                 onUpdate({
                   subcircuitId: e.target.value,
-                  pins: entity?.pins?.length ? [...entity.pins] : component.pins
+                  pins: entity ? entityPorts(entity) : component.pins
                 });
               }}
             >
               <option value="">Unlinked</option>
               {levels
                 .filter((level) => level.parentId !== null)
-                .map((level) => (
-                  <option key={level.id} value={level.id}>
-                    {level.title}
-                  </option>
-                ))}
+                .map((level) => {
+                  const recursive = entityContainsLevel(levels, level.id, hostLevelId);
+                  return (
+                    <option
+                      key={level.id}
+                      value={level.id}
+                      disabled={recursive}
+                      title={recursive ? "This entity contains the level you are on; instancing it here would be recursive." : undefined}
+                    >
+                      {recursive ? `${level.title} (contains this level)` : level.title}
+                    </option>
+                  );
+                })}
             </select>
           </div>
-          <div className="formRow">
-            <label>nodes</label>
-            <input
-              className="input"
-              type="number"
-              min={1}
-              max={24}
-              value={(component.pins ?? []).length}
-              onChange={(e) => updatePinCount(Number(e.target.value))}
-            />
-          </div>
-          {(component.pins ?? []).map((pin, index) => (
-            <div className="formRow" key={`${component.id}-pin-${index}`}>
-              <label>{`node ${index + 1}`}</label>
-              <input
-                className="input"
-                value={pin}
-                onChange={(e) => updatePinName(index, e.target.value)}
-              />
+          {instanceIssue ? (
+            <div className="propIssue" role="alert">
+              <span className="propIssue__badge">!</span>
+              <span>{instanceIssue}</span>
             </div>
-          ))}
+          ) : null}
+          {linkedEntity && entityLayout ? (
+            <>
+              <div className="formRow formRow--top">
+                <label>ports</label>
+                <div className="portList">
+                  {entityPortList.length === 0 ? <span className="hintText">none</span> : null}
+                  {entityPortList.map((pin) => (
+                    <span key={pin} className="portChip" title={`port_${pin}`}>
+                      {pin}
+                      <small>{subcktPinSide(entityLayout, pin)}</small>
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div className="formRow">
+                <button className="ghostBtn" onClick={() => onOpenEntity(linkedEntity.id)}>
+                  Edit ports in entity
+                </button>
+                {instanceIssue && entityPortList.length > 0 ? (
+                  <button className="ghostBtn" onClick={() => onUpdate({ pins: [...entityPortList] })}>
+                    Use entity ports
+                  </button>
+                ) : null}
+              </div>
+              <div className="hintText">
+                Ports are the NODE markers inside the entity: add, rename, move or delete them there and every instance follows.
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="formRow">
+                <label>nodes</label>
+                <input
+                  className="input"
+                  type="number"
+                  min={1}
+                  max={24}
+                  value={(component.pins ?? []).length}
+                  onChange={(e) => updatePinCount(Number(e.target.value))}
+                />
+              </div>
+              {(component.pins ?? []).map((pin, index) => (
+                <div className="formRow" key={`${component.id}-pin-${index}`}>
+                  <label>{`node ${index + 1}`}</label>
+                  <input
+                    className="input"
+                    value={pin}
+                    onChange={(e) => updatePinName(index, e.target.value)}
+                  />
+                </div>
+              ))}
+            </>
+          )}
         </>
       ) : null}
       {isNode ? (
-        <div className="hintText">
-          Same-named Node markers are electrically connected. In a sub-entity, a node named in_1 exposes port_in_1 to matching SUBCKT pins.
-        </div>
+        <>
+          {inEntity ? (
+            <div className="formRow">
+              <label>side</label>
+              <select className="select" value={nodeSide} onChange={(e) => updateNodeSide(e.target.value)}>
+                <option value="">{`auto (${defaultPinSide(nodeMarkerName(component))})`}</option>
+                {PIN_SIDES.map((side) => (
+                  <option key={side} value={side}>
+                    {side}
+                  </option>
+                ))}
+              </select>
+            </div>
+          ) : null}
+          <div className="hintText">
+            {inEntity
+              ? "This marker is a port of the entity: instances get a pin with this name, drawn on the chosen side and ordered by the marker's position. Auto puts names starting with \"in\" on the left, others on the right. Same-named markers are connected."
+              : "Same-named Node markers are electrically connected on this level."}
+          </div>
+        </>
       ) : null}
       {component.type !== "GND" && !isBjt && !isMos && !isSubckt && !isNode && !isLabel ? (
         <div className="formRow">

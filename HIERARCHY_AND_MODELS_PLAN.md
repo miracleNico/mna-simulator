@@ -239,10 +239,11 @@ problem for this simulator.
 
 | Worker | Scope | Status |
 | --- | --- | --- |
-| A (frontend) | Part A, phase H1 | running |
+| A (frontend) | Part A, phase H1 | landed on `dev` (make subcircuit, navigation, entity-owned ports, pin sides, instantiate/duplicate/dissolve, inline checks, vitest suite); follow-up: Run from inside an entity still simulates that entity alone |
 | B (parser) | Part B, phase M1 | running |
-| C (devices) | Part B, phase M2 | running |
-| coordinator | M3 integration, `MIXED_SIGNAL.md`, Worker D (table source + Python stimulus helper) after M1 lands | pending |
+| C (devices) | Part B, phase M2 | landed on `dev` (`cpp/include/mna/devices/{spice_diode,gummel_poon,mos_card}.hpp`, `mna_simulation/card_devices.py`, `tests/device_reference/`, `tests/test_spice_devices.py`) |
+| D (stimulus) | `MIXED_SIGNAL.md` phase D1 | running (parser-owned wiring staged until M1 lands) |
+| coordinator | M3 integration, `MIXED_SIGNAL.md` | assessment written; M3 after M1 |
 
 Each worker reports its branch and commits; the coordinator audits the diff, runs the full
 suite (`python -m pytest -q`, the C++ tests, the differential harness) and merges into `dev`.

@@ -6,7 +6,16 @@
  * should leave the context state as it found it.
  */
 
-import { CanvasComponent, COMPONENT_BOX, DeviceType, GND_BOX, subcktPinLocalOffset } from "./schematic";
+import {
+  CanvasComponent,
+  COMPONENT_BOX,
+  DeviceType,
+  GND_BOX,
+  resolveSubcktLayout,
+  subcktBodySize,
+  subcktPinLocalOffset,
+  subcktPinSide
+} from "./schematic";
 
 export type SymbolTheme = {
   stroke: string;
@@ -328,13 +337,37 @@ function drawMOSFET(
   ctx.restore();
 }
 
-function drawSubckt(ctx: CanvasRenderingContext2D, theme: SymbolTheme, component: CanvasComponent): void {
+/** Extra information the canvas has about a SUBCKT instance (entity title, validation). */
+export type SubcktSymbolInfo = { title?: string | null; issue?: string | null };
+
+/** Local symbol coordinates of a point given relative to the instance centre on screen. */
+function screenToLocal(component: CanvasComponent, x: number, y: number): { x: number; y: number } {
+  const angle = (-(component.rotation || 0) * Math.PI) / 180;
+  const rx = Math.round(x * Math.cos(angle) - y * Math.sin(angle));
+  const ry = Math.round(x * Math.sin(angle) + y * Math.cos(angle));
+  return { x: component.mirrored ? -rx : rx, y: ry };
+}
+
+function fitText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): string {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let cut = text;
+  while (cut.length > 1 && ctx.measureText(`${cut}…`).width > maxWidth) cut = cut.slice(0, -1);
+  return `${cut}…`;
+}
+
+function drawSubckt(
+  ctx: CanvasRenderingContext2D,
+  theme: SymbolTheme,
+  component: CanvasComponent,
+  info: SubcktSymbolInfo = {}
+): void {
+  const pins = component.pins ?? [];
+  const layout = resolveSubcktLayout(pins, component.pinLayout);
+  const { w, h } = subcktBodySize(layout);
   ctx.save();
-  ctx.strokeStyle = theme.stroke;
+  ctx.strokeStyle = info.issue ? "#ff7b7b" : theme.stroke;
   ctx.fillStyle = theme.fill;
   ctx.lineWidth = 1.8;
-  const w = COMPONENT_BOX * 2;
-  const h = COMPONENT_BOX * 2;
   const r = 10;
   ctx.beginPath();
   ctx.moveTo(-w / 2 + r, -h / 2);
@@ -346,35 +379,65 @@ function drawSubckt(ctx: CanvasRenderingContext2D, theme: SymbolTheme, component
   ctx.fill();
   ctx.stroke();
 
-  ctx.fillStyle = theme.label;
-  ctx.font = "600 12px Inter, system-ui, sans-serif";
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  drawUprightText(ctx, component, component.name || "SUBCKT", 0, 0, "center");
-
   // Pin names just inside the body edge, so a hierarchical block reads like
   // an LTspice symbol: every port is identifiable without opening the child.
-  const pins = component.pins ?? [];
   ctx.fillStyle = theme.muted;
   ctx.font = "500 9px Inter, system-ui, sans-serif";
+  let labelRoom = 0;
+  for (const side of ["left", "right"] as const) {
+    for (const pin of layout[side]) labelRoom = Math.max(labelRoom, ctx.measureText(pin).width);
+  }
   for (const pin of pins) {
-    const off = subcktPinLocalOffset(pins, pin);
-    const inset = 8;
+    const off = subcktPinLocalOffset(pins, pin, layout);
+    const side = subcktPinSide(layout, pin);
+    const inset = 6;
     let tx = off.dx;
     let ty = off.dy;
     let align: CanvasTextAlign = "center";
-    if (off.dx <= -w / 2 + 1) {
+    if (side === "left") {
       tx += inset;
       align = "left";
-    } else if (off.dx >= w / 2 - 1) {
+    } else if (side === "right") {
       tx -= inset;
       align = "right";
-    } else if (off.dy <= -h / 2 + 1) {
-      ty += inset;
+    } else if (side === "top") {
+      ty += inset + 3;
     } else {
-      ty -= inset;
+      ty -= inset + 3;
     }
     drawUprightText(ctx, component, pin, tx, ty, align);
+  }
+
+  // Instance name and entity title in the middle, always horizontal on screen.
+  const vertical = component.rotation === 90 || component.rotation === 270;
+  const room = Math.max(24, (vertical ? h : w) - (vertical ? 24 : 2 * (labelRoom + 10)));
+  const title = info.title ?? null;
+  ctx.fillStyle = theme.label;
+  ctx.font = "600 12px Inter, system-ui, sans-serif";
+  const nameAt = screenToLocal(component, 0, title ? -7 : 0);
+  drawUprightText(ctx, component, fitText(ctx, component.name || "SUBCKT", room), nameAt.x, nameAt.y, "center");
+  if (title) {
+    ctx.fillStyle = theme.muted;
+    ctx.font = "500 10px Inter, system-ui, sans-serif";
+    const titleAt = screenToLocal(component, 0, 8);
+    drawUprightText(ctx, component, fitText(ctx, title, room), titleAt.x, titleAt.y, "center");
+  }
+
+  // Validation badge in the top-right corner (as seen on screen).
+  if (info.issue) {
+    const bw = vertical ? h : w;
+    const bh = vertical ? w : h;
+    const at = screenToLocal(component, bw / 2, -bh / 2);
+    ctx.fillStyle = "#ff5c5c";
+    ctx.strokeStyle = theme.fill;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(at.x, at.y, 8, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "700 11px Inter, system-ui, sans-serif";
+    drawUprightText(ctx, component, "!", at.x, at.y + 0.5, "center");
   }
   ctx.restore();
 }
@@ -439,7 +502,8 @@ function drawNodeMarker(ctx: CanvasRenderingContext2D, theme: SymbolTheme, compo
 export function drawComponent(
   ctx: CanvasRenderingContext2D,
   component: CanvasComponent,
-  theme: SymbolTheme = DEFAULT_THEME
+  theme: SymbolTheme = DEFAULT_THEME,
+  subckt?: SubcktSymbolInfo
 ): void {
   ctx.save();
   ctx.translate(component.x, component.y);
@@ -484,7 +548,7 @@ export function drawComponent(
       drawControlledSource(ctx, theme, "H");
       break;
     case "SUBCKT":
-      drawSubckt(ctx, theme, component);
+      drawSubckt(ctx, theme, component, subckt);
       break;
     case "LABEL":
       drawLabel(ctx, theme, component);

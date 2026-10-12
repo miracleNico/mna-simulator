@@ -622,7 +622,8 @@ textarea {
 .treeItem__add {
   margin-left: auto;
   color: var(--text-3);
-  opacity: 0;
+  display: none;
+  cursor: pointer;
   font-size: 11px;
 }
 
@@ -631,7 +632,11 @@ textarea {
 }
 
 .treeItem:hover .treeItem__add {
-  opacity: 1;
+  display: inline;
+}
+
+.treeItem__add:hover {
+  color: var(--accent-2);
 }
 
 /* ---------- Library ---------- */
@@ -1141,4 +1146,159 @@ textarea {
   overflow: hidden;
   clip: rect(0 0 0 0);
   white-space: nowrap;
+}
+
+/* ---------- Hierarchy: breadcrumb, context menu, SUBCKT properties ---------- */
+
+.breadcrumbBar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 10px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line-1);
+  font-size: 12px;
+  color: var(--text-2);
+  overflow: hidden;
+  white-space: nowrap;
+  z-index: 5;
+}
+
+.breadcrumbBar__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.breadcrumbBar__sep {
+  color: var(--text-3);
+  padding: 0 4px;
+}
+
+.breadcrumbBar__link,
+.breadcrumbBar__up {
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  padding: 2px 6px;
+  color: var(--accent-2);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.breadcrumbBar__link:hover,
+.breadcrumbBar__up:hover {
+  background: var(--bg-2);
+}
+
+.breadcrumbBar__current {
+  padding: 2px 6px;
+  color: var(--text-0);
+  font-weight: 600;
+}
+
+.breadcrumbBar__up {
+  margin-left: 8px;
+  color: var(--text-2);
+  border: 1px solid var(--line-2);
+}
+
+.breadcrumbBar__ports {
+  margin-left: auto;
+  padding-left: 12px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.canvasViewport {
+  position: absolute;
+  top: 30px;
+  left: 0;
+  right: 0;
+  bottom: 0;
+}
+
+.contextMenu {
+  position: fixed;
+  margin-top: 0;
+  z-index: 60;
+  outline: none;
+}
+
+.propIssue {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  border: 1px solid rgba(255, 123, 123, 0.5);
+  border-radius: 6px;
+  background: rgba(255, 123, 123, 0.08);
+  color: var(--bad);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.propIssue__badge {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #ff5c5c;
+  color: #fff;
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+
+.formRow--top {
+  align-items: flex-start;
+}
+
+.portList {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.portChip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--line-2);
+  border-radius: 10px;
+  color: var(--text-1);
+  font-size: 11px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.portChip small {
+  color: var(--text-3);
+  font-family: Inter, system-ui, sans-serif;
+  font-size: 9px;
+}
+
+.treeItem__title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.hoverBadge--issue {
+  max-width: 360px;
+  color: var(--bad);
+  border-color: rgba(255, 123, 123, 0.6);
+  white-space: normal;
+  line-height: 1.4;
 }

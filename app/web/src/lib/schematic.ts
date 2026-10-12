@@ -34,6 +34,17 @@ export type ThreadSetting = "auto" | number;
 
 export type Rotation = 0 | 90 | 180 | 270;
 
+/** Side of a SUBCKT symbol a pin is drawn on. */
+export type PinSide = "left" | "right" | "top" | "bottom";
+
+export const PIN_SIDES: readonly PinSide[] = ["left", "right", "top", "bottom"];
+
+/**
+ * Pins of a SUBCKT symbol grouped by side, each list in drawing order
+ * (top to bottom for left/right, left to right for top/bottom).
+ */
+export type SubcktPinLayout = Record<PinSide, string[]>;
+
 export type CanvasComponent = {
   id: string;
   type: DeviceType;
@@ -47,7 +58,18 @@ export type CanvasComponent = {
   ctrlSource?: string;
   subcircuitId?: string;
   pins?: string[];
+  /**
+   * Free-form extras. NODE markers use ``metadata.side`` (left, right, top,
+   * bottom) to pick the side of the SUBCKT symbol their pin is drawn on.
+   */
   metadata?: Record<string, string>;
+  /**
+   * SUBCKT only, derived and never saved: pin sides and order taken from the
+   * linked entity's NODE markers when a level is displayed
+   * (``decorateSubcktInstances`` in ``hierarchy.ts``). Without it the pins
+   * are laid out by name with ``defaultPinSide``.
+   */
+  pinLayout?: SubcktPinLayout;
   x: number;
   y: number;
   rotation: Rotation;
@@ -126,6 +148,8 @@ export type SchematicLevel = {
   junctions?: LevelJunction[];
   /** Parent level id for the hierarchy tree (null = root). */
   parentId: string | null;
+  /** Optional free-text note about the entity; saved with the workspace. */
+  description?: string;
 };
 
 export type SchematicPreset = {
@@ -267,8 +291,7 @@ function transformPinOffset(offset: PinOffset, component: CanvasComponent): PinO
 
 export function getPinCoordinates(component: CanvasComponent, pin: string): { x: number; y: number } {
   if (component.type === "SUBCKT") {
-    // Distribute pins around a rounded rectangle.
-    const off = subcktPinLocalOffset(component.pins ?? [], pin);
+    const off = subcktPinLocalOffset(component.pins ?? [], pin, component.pinLayout);
     const rotated = transformPinOffset(off, component);
     return { x: component.x + rotated.dx, y: component.y + rotated.dy };
   }
@@ -310,12 +333,11 @@ export function componentBounds(component: CanvasComponent): { x: number; y: num
     return { x: component.x - 28, y: component.y - 18, w: 56, h: 36 };
   }
   if (component.type === "SUBCKT") {
-    return {
-      x: component.x - COMPONENT_BOX,
-      y: component.y - COMPONENT_BOX,
-      w: COMPONENT_BOX * 2,
-      h: COMPONENT_BOX * 2
-    };
+    const body = subcktBodySize(resolveSubcktLayout(component.pins ?? [], component.pinLayout));
+    const vertical = component.rotation === 90 || component.rotation === 270;
+    const w = vertical ? body.h : body.w;
+    const h = vertical ? body.w : body.h;
+    return { x: component.x - w / 2, y: component.y - h / 2, w, h };
   }
   return { x: component.x - COMPONENT_BOX / 2, y: component.y - COMPONENT_BOX / 2, w: COMPONENT_BOX, h: COMPONENT_BOX };
 }
@@ -332,6 +354,7 @@ export function createDefaultComponent(
     type === "NMOS" || type === "PMOS" ? "M" :
     type === "LABEL" ? "label" :
     type === "NODE" ? "node" :
+    type === "SUBCKT" ? "X" :
     type;
   return {
     id: `${type.toLowerCase()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
@@ -736,20 +759,88 @@ export function buildSchematicPayload(
 
 /* ---- Editor helpers shared by the canvas, menus, and keyboard handlers --- */
 
-/** Local (un-rotated, un-mirrored) pin offset for a SUBCKT pin slot. */
-export function subcktPinLocalOffset(pins: string[], pin: string): PinOffset {
-  const index = Math.max(0, pins.indexOf(pin));
-  const n = Math.max(1, pins.length);
-  const side = Math.ceil(n / 4);
-  const halfW = COMPONENT_BOX;
-  const halfH = COMPONENT_BOX;
-  const slot = index % side;
-  const spacing = (COMPONENT_BOX * 2) / (side + 1);
-  const ringIndex = Math.floor(index / side);
-  if (ringIndex === 0) return { dx: -halfW, dy: -halfH + spacing * (slot + 1) };
-  if (ringIndex === 1) return { dx: halfW, dy: -halfH + spacing * (slot + 1) };
-  if (ringIndex === 2) return { dx: -halfW + spacing * (slot + 1), dy: -halfH };
-  return { dx: -halfW + spacing * (slot + 1), dy: halfH };
+/* ---- SUBCKT symbol geometry ------------------------------------------- */
+
+/** Vertical distance between pins on the left/right sides. */
+export const SUBCKT_PIN_PITCH = 20;
+/** Horizontal distance between pins on the top/bottom sides (room for the label). */
+export const SUBCKT_PIN_PITCH_TB = 40;
+export const SUBCKT_MIN_WIDTH = 140;
+export const SUBCKT_MIN_HEIGHT = 80;
+
+/**
+ * Side a pin goes to when nothing says otherwise: names starting with ``in``
+ * (``in``, ``in_p``, ``inn`` ...) go left, every other name goes right.
+ */
+export function defaultPinSide(pin: string): PinSide {
+  return /^in/i.test(pin.trim()) ? "left" : "right";
+}
+
+export function isPinSide(value: unknown): value is PinSide {
+  return value === "left" || value === "right" || value === "top" || value === "bottom";
+}
+
+/**
+ * Normalise a pin layout against the instance's pin list: every pin appears
+ * exactly once, pins the layout does not mention go to their default side
+ * (after the listed ones, in pin-list order), unknown names are dropped.
+ */
+export function resolveSubcktLayout(pins: string[], layout?: SubcktPinLayout): SubcktPinLayout {
+  const out: SubcktPinLayout = { left: [], right: [], top: [], bottom: [] };
+  const wanted = new Set(pins);
+  const placed = new Set<string>();
+  if (layout) {
+    for (const side of PIN_SIDES) {
+      for (const pin of layout[side] ?? []) {
+        if (!wanted.has(pin) || placed.has(pin)) continue;
+        placed.add(pin);
+        out[side].push(pin);
+      }
+    }
+  }
+  for (const pin of pins) {
+    if (placed.has(pin)) continue;
+    placed.add(pin);
+    out[defaultPinSide(pin)].push(pin);
+  }
+  return out;
+}
+
+/** Body size of a SUBCKT symbol: it grows with the pin count of its longest side. */
+export function subcktBodySize(layout: SubcktPinLayout): { w: number; h: number } {
+  const rows = Math.max(layout.left.length, layout.right.length);
+  const cols = Math.max(layout.top.length, layout.bottom.length);
+  return {
+    w: Math.max(SUBCKT_MIN_WIDTH, (cols + 1) * SUBCKT_PIN_PITCH_TB),
+    h: Math.max(SUBCKT_MIN_HEIGHT, (rows + 1) * SUBCKT_PIN_PITCH)
+  };
+}
+
+/**
+ * Local (un-rotated, un-mirrored) pin offset for a SUBCKT pin: pins sit on
+ * the body edge of their side, centred on that side and spaced by the pitch,
+ * so they stay on the 10-unit grid whenever the instance does.
+ */
+export function subcktPinLocalOffset(pins: string[], pin: string, layout?: SubcktPinLayout): PinOffset {
+  const resolved = resolveSubcktLayout(pins, layout);
+  const { w, h } = subcktBodySize(resolved);
+  for (const side of PIN_SIDES) {
+    const list = resolved[side];
+    const index = list.indexOf(pin);
+    if (index < 0) continue;
+    const centred = index - (list.length - 1) / 2;
+    if (side === "left") return { dx: -w / 2, dy: centred * SUBCKT_PIN_PITCH };
+    if (side === "right") return { dx: w / 2, dy: centred * SUBCKT_PIN_PITCH };
+    if (side === "top") return { dx: centred * SUBCKT_PIN_PITCH_TB, dy: -h / 2 };
+    return { dx: centred * SUBCKT_PIN_PITCH_TB, dy: h / 2 };
+  }
+  return { dx: 0, dy: 0 };
+}
+
+/** Side of a pin in a resolved layout (``null`` when the pin is not on the symbol). */
+export function subcktPinSide(layout: SubcktPinLayout, pin: string): PinSide | null {
+  for (const side of PIN_SIDES) if (layout[side].includes(pin)) return side;
+  return null;
 }
 
 function coordKey(x: number, y: number): string {

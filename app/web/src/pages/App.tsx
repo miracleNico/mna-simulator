@@ -6,6 +6,26 @@ import { OpResultData, ResultTile } from "../components/ResultTile";
 import { ProbeTarget, SchematicCanvas, SchematicCanvasHandle } from "../components/SchematicCanvas";
 import { Toolbar } from "../components/Toolbar";
 import { DEMO_MENU_GROUPS } from "../lib/demoPresets";
+import {
+  HierarchyError,
+  PortSyncReport,
+  breadcrumbPath,
+  decorateSubcktInstances,
+  describePortSync,
+  dissolveSubcircuit,
+  duplicateEntity,
+  entityContainsLevel,
+  entityPorts,
+  firstHierarchyIssue,
+  instanceTemplate,
+  makeSubcircuitFromSelection,
+  nextSubcktTitle,
+  parentLevelId,
+  remapInstancePinEndpoints,
+  subcktDecorations,
+  syncEntityPorts,
+  withEntityPinLayout
+} from "../lib/hierarchy";
 import { PlotData } from "../lib/plot";
 import {
   AnalysisState,
@@ -18,10 +38,11 @@ import {
   ThreadSetting,
   buildSchematicPayload,
   extractClipboard,
-  normalizeNodeName,
+  getPinCoordinates,
   parseWorkspace,
   serializeWorkspace
 } from "../lib/schematic";
+import { SubcktSymbolInfo } from "../lib/symbols";
 import { USER_GUIDE_SECTIONS } from "../lib/userGuide";
 
 const defaultAnalysis: AnalysisState = {
@@ -220,102 +241,6 @@ function simulationRequestOptions(analysis: AnalysisState): Record<string, unkno
   return options;
 }
 
-function samePins(left: string[], right: string[]): boolean {
-  return left.length === right.length && left.every((pin, index) => pin === right[index]);
-}
-
-function uniquePins(pins: string[]): string[] {
-  const out: string[] = [];
-  const seen = new Set<string>();
-  for (const pin of pins) {
-    if (seen.has(pin)) continue;
-    seen.add(pin);
-    out.push(pin);
-  }
-  return out;
-}
-
-function inferredLevelPins(level: SchematicLevel): string[] {
-  const pins: string[] = [];
-  const seen = new Set<string>();
-  for (const component of level.components) {
-    if (component.type !== "NODE") continue;
-    const pin = normalizeNodeName(component.name || component.value || component.id);
-    if (!seen.has(pin)) {
-      seen.add(pin);
-      pins.push(pin);
-    }
-  }
-  return pins.length > 0 ? pins : level.pins;
-}
-
-function rewriteSubcktPinEndpoints(
-  wires: CanvasWire[],
-  componentId: string,
-  oldPins: string[],
-  newPins: string[]
-): CanvasWire[] {
-  const validPins = new Set(newPins);
-  const renamedPins = new Map<string, string>();
-  for (let i = 0; i < Math.min(oldPins.length, newPins.length); i++) {
-    if (oldPins[i] && newPins[i] && oldPins[i] !== newPins[i]) {
-      renamedPins.set(oldPins[i], newPins[i]);
-    }
-  }
-
-  const resolvePin = (pin: string): string => {
-    const renamed = renamedPins.get(pin);
-    if (renamed) return renamed;
-    if (validPins.has(pin)) return pin;
-
-    const cleaned = normalizeNodeName(pin);
-    const exactNormalized = newPins.find((candidate) => normalizeNodeName(candidate) === cleaned);
-    if (exactNormalized) return exactNormalized;
-
-    const trimmed = cleaned.replace(/_+$/, "");
-    if (trimmed) {
-      const prefixMatch = newPins.find((candidate) => {
-        const normalized = normalizeNodeName(candidate);
-        return normalized === trimmed || normalized.startsWith(trimmed) || cleaned.startsWith(normalized);
-      });
-      if (prefixMatch) return prefixMatch;
-    }
-
-    const oldIndex = oldPins.indexOf(pin);
-    if (oldIndex >= 0 && oldIndex < newPins.length) return newPins[oldIndex];
-    return pin;
-  };
-
-  const rewriteEndpoint = (endpoint: CanvasWire["start"]): CanvasWire["start"] => {
-    if (endpoint.kind !== "pin" || endpoint.componentId !== componentId) return endpoint;
-    const nextPin = resolvePin(endpoint.pin);
-    return nextPin !== endpoint.pin ? { ...endpoint, pin: nextPin } : endpoint;
-  };
-  return wires.map((wire) => ({
-    ...wire,
-    start: rewriteEndpoint(wire.start),
-    end: rewriteEndpoint(wire.end)
-  }));
-}
-
-function syncInstancesForEntity(
-  level: SchematicLevel,
-  entityId: string,
-  oldPins: string[],
-  newPins: string[]
-): SchematicLevel {
-  let wires = level.wires;
-  let changed = false;
-  const components = level.components.map((component) => {
-    if (component.type !== "SUBCKT" || component.subcircuitId !== entityId) return component;
-    const existingPins = component.pins ?? oldPins;
-    wires = rewriteSubcktPinEndpoints(wires, component.id, existingPins, newPins);
-    changed = true;
-    return { ...component, pins: [...newPins] };
-  });
-  return changed ? { ...level, components, wires } : level;
-}
-
 export function App() {
   /* -------------- Hierarchy levels -------------- */
   const [levels, setLevels] = useState<SchematicLevel[]>(() => [
@@ -341,27 +266,51 @@ export function App() {
     []
   );
 
+  /**
+   * Port changes found while applying an edit (set inside the state updater,
+   * shown in the status line after the render). Updaters may run twice in
+   * strict mode; they compute the same report both times.
+   */
+  const portReportRef = useRef<PortSyncReport | null>(null);
+
+  /**
+   * Apply an edit to one level. When that level is an entity whose NODE
+   * markers (= ports) changed, every instance of it follows in the same
+   * state update, so the edit stays a single undo step.
+   */
+  const editLevel = useCallback(
+    (levelId: string, edit: (level: SchematicLevel, all: SchematicLevel[]) => SchematicLevel) => {
+      setLevels((cur) => {
+        const next = cur.map((l) => (l.id === levelId ? edit(l, cur) : l));
+        const synced = syncEntityPorts(cur, next, levelId);
+        if (synced.report) portReportRef.current = synced.report;
+        return synced.levels;
+      });
+    },
+    []
+  );
+
   const setActiveComponents = useCallback(
     (updater: (current: CanvasComponent[]) => CanvasComponent[]) => {
-      setLevels((cur) =>
-        cur.map((l) => (l.id === activeLevelId ? { ...l, components: updater(l.components) } : l))
-      );
+      editLevel(activeLevelId, (l) => ({ ...l, components: updater(l.components) }));
     },
-    [activeLevelId]
+    [activeLevelId, editLevel]
   );
   const setActiveWires = useCallback(
     (updater: (current: CanvasWire[]) => CanvasWire[]) => {
-      setLevels((cur) =>
-        cur.map((l) => (l.id === activeLevelId ? { ...l, wires: updater(l.wires) } : l))
-      );
+      editLevel(activeLevelId, (l) => ({ ...l, wires: updater(l.wires) }));
     },
-    [activeLevelId]
+    [activeLevelId, editLevel]
   );
 
   /* -------------- Analysis & UI state -------------- */
   const [analysis, setAnalysis] = useState<AnalysisState>({ ...defaultAnalysis });
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [pendingDevice, setPendingDevice] = useState<DeviceType | null>(null);
+  /** Fields of the part being placed, e.g. a SUBCKT linked to an entity ("Instantiate"). */
+  const [pendingTemplate, setPendingTemplate] = useState<Partial<CanvasComponent> | null>(null);
+  /** Open canvas context menu (screen position and the part under the cursor). */
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; componentId: string | null } | null>(null);
   const [probeMode, setProbeMode] = useState(false);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState<"idle" | "ok" | "error" | "running">("idle");
@@ -425,6 +374,15 @@ export function App() {
     netlistTextRef.current = netlistText;
     generatedNetlistRef.current = generatedNetlist;
   }, [levels, activeLevelId, netlistMode, netlistText, generatedNetlist]);
+
+  // Report port changes that an edit propagated to instances (see editLevel).
+  useEffect(() => {
+    const report = portReportRef.current;
+    if (!report) return;
+    portReportRef.current = null;
+    const entity = levels.find((l) => l.id === report.entityId);
+    setStatusMsg(describePortSync(report, entity?.title ?? report.entityId));
+  }, [levels]);
 
   const captureSnapshot = useCallback(
     (): EditorSnapshot => ({
@@ -628,6 +586,7 @@ export function App() {
 
   const startDragType = useCallback((type: DeviceType) => {
     setPendingDevice(type);
+    setPendingTemplate(null);
     setProbeMode(false);
     setWireTool(false);
     canvasHandleRef.current?.focus();
@@ -635,6 +594,7 @@ export function App() {
 
   const pickDevice = useCallback((type: DeviceType | null) => {
     setPendingDevice(type);
+    setPendingTemplate(null);
     if (type) {
       setProbeMode(false);
       setWireTool(false);
@@ -723,59 +683,176 @@ export function App() {
   const updateComponent = useCallback(
     (id: string, patch: Partial<CanvasComponent>) => {
       pushEditorHistory();
-      setLevels((cur) => {
-        const activeBefore = cur.find((level) => level.id === activeLevelId);
-        const oldEntityPins = activeBefore
-          ? activeBefore.pins.length > 0 ? activeBefore.pins : inferredLevelPins(activeBefore)
-          : [];
-        let newEntityPins = oldEntityPins;
-        let entityPinsChanged = false;
-
-        const nextLevels = cur.map((level) => {
-          if (level.id !== activeLevelId) return level;
-          const previous = level.components.find((component) => component.id === id);
-          if (!previous) return level;
-
-          const nextComponents = level.components.map((component) =>
-            component.id === id ? { ...component, ...patch } : component
-          );
-
-          let nextWires = level.wires;
-          if (previous.type === "SUBCKT" && patch.pins) {
-            nextWires = rewriteSubcktPinEndpoints(
-              nextWires,
-              id,
-              previous.pins ?? [],
-              patch.pins
-            );
-          }
-
-          let nextLevel: SchematicLevel = { ...level, components: nextComponents, wires: nextWires };
-          if (level.parentId !== null && previous.type === "NODE") {
-            const oldNodePin = normalizeNodeName(previous.name || previous.value || previous.id);
-            const updatedNode = nextComponents.find((component) => component.id === id);
-            const newNodePin = normalizeNodeName(updatedNode?.name || updatedNode?.value || updatedNode?.id || oldNodePin);
-            newEntityPins = oldEntityPins.includes(oldNodePin)
-              ? uniquePins(oldEntityPins.map((pin) => (pin === oldNodePin ? newNodePin : pin)))
-              : inferredLevelPins(nextLevel);
-            if (!samePins(oldEntityPins, newEntityPins)) {
-              entityPinsChanged = true;
-              nextLevel = { ...nextLevel, pins: [...newEntityPins] };
-            }
-          }
-          return nextLevel;
-        });
-
-        if (!entityPinsChanged) return nextLevels;
-        return nextLevels.map((level) =>
-          level.id === activeLevelId
-            ? level
-            : syncInstancesForEntity(level, activeLevelId, oldEntityPins, newEntityPins)
+      editLevel(activeLevelId, (level, all) => {
+        const previous = level.components.find((component) => component.id === id);
+        if (!previous) return level;
+        const components = level.components.map((component) =>
+          component.id === id ? { ...component, ...patch } : component
         );
+        // A SUBCKT pin list edited by hand (unlinked) or replaced by relinking:
+        // move the wire ends to the matching new pins, detach the others.
+        const geometry = withEntityPinLayout(previous, all);
+        const wires =
+          previous.type === "SUBCKT" && patch.pins
+            ? remapInstancePinEndpoints(level.wires, id, previous.pins ?? [], patch.pins, (pin) =>
+                getPinCoordinates(geometry, pin)
+              )
+            : level.wires;
+        return { ...level, components, wires };
       });
     },
-    [activeLevelId, pushEditorHistory]
+    [activeLevelId, editLevel, pushEditorHistory]
   );
+
+  /* -------------- Hierarchy navigation and transforms -------------- */
+
+  /** Open a level: clears the selection and any tool in progress. */
+  const navigateToLevel = useCallback((levelId: string, fit = true) => {
+    setActiveLevelId(levelId);
+    setSelectedIds(new Set());
+    setPendingDevice(null);
+    setPendingTemplate(null);
+    setWireTool(false);
+    setContextMenu(null);
+    if (fit) window.setTimeout(() => canvasHandleRef.current?.zoomToFit(), 0);
+  }, []);
+
+  /** Double-click on an instance: open its entity (or its properties when unlinked). */
+  const descendIntoInstance = useCallback(
+    (componentId: string) => {
+      const instance = activeLevel.components.find((c) => c.id === componentId);
+      const entity = instance?.subcircuitId ? levels.find((l) => l.id === instance.subcircuitId) : undefined;
+      if (!instance || !entity || entity.parentId === null) {
+        setSelectedIds(new Set([componentId]));
+        setPropertiesFocusToken((t) => t + 1);
+        setStatusMsg("This SUBCKT instance is not linked to an entity: pick one in its properties.");
+        return;
+      }
+      navigateToLevel(entity.id);
+      setStatusMsg(`Opened '${entity.title}' (instance ${instance.name}). Alt+Up goes back up.`);
+    },
+    [activeLevel, levels, navigateToLevel]
+  );
+
+  const ascendLevel = useCallback(() => {
+    const parent = parentLevelId(levels, activeLevelId);
+    if (!parent) {
+      setStatusMsg("Already at the top of the hierarchy.");
+      return;
+    }
+    navigateToLevel(parent);
+  }, [activeLevelId, levels, navigateToLevel]);
+
+  const makeSubcircuit = useCallback(() => {
+    setContextMenu(null);
+    if (netlistMode === "netlist") return;
+    try {
+      const result = makeSubcircuitFromSelection(levels, activeLevelId, selectedIds);
+      pushEditorHistory();
+      setLevels(result.levels);
+      setSelectedIds(new Set([result.instanceId]));
+      const entity = result.levels.find((l) => l.id === result.newLevelId);
+      const instance = result.levels
+        .find((l) => l.id === activeLevelId)
+        ?.components.find((c) => c.id === result.instanceId);
+      const internal = result.internalPorts.length
+        ? ` Labels ${result.internalPorts.join(", ")} became ports too and stay labelled here.`
+        : "";
+      setStatus("idle");
+      setStatusMsg(
+        `Made '${entity?.title}' with ports ${result.ports.join(", ")}; ${instance?.name} replaces the selection. Double-click it to open.${internal}`
+      );
+    } catch (err) {
+      setStatus("error");
+      setStatusMsg(err instanceof HierarchyError ? err.message : String(err));
+    }
+  }, [activeLevelId, levels, netlistMode, pushEditorHistory, selectedIds]);
+
+  const dissolveInstance = useCallback(
+    (componentId?: string) => {
+      setContextMenu(null);
+      const id = componentId ?? (selectedIds.size === 1 ? Array.from(selectedIds)[0] : undefined);
+      if (!id) return;
+      try {
+        const result = dissolveSubcircuit(levels, activeLevelId, id);
+        pushEditorHistory();
+        setLevels(result.levels);
+        setSelectedIds(new Set(result.addedIds));
+        setStatus("idle");
+        setStatusMsg("Dissolved the subcircuit: its contents now sit on this level (the entity is kept).");
+      } catch (err) {
+        setStatus("error");
+        setStatusMsg(err instanceof HierarchyError ? err.message : String(err));
+      }
+    },
+    [activeLevelId, levels, pushEditorHistory, selectedIds]
+  );
+
+  const instantiateEntity = useCallback(
+    (entityId: string) => {
+      const entity = levels.find((l) => l.id === entityId);
+      if (!entity) return;
+      if (entityContainsLevel(levels, entityId, activeLevelId)) {
+        setStatus("error");
+        setStatusMsg(`'${entity.title}' contains the open level '${activeLevel.title}': instancing it here would be recursive.`);
+        return;
+      }
+      const template = instanceTemplate(levels, entityId);
+      if (!template) return;
+      setPendingDevice("SUBCKT");
+      setPendingTemplate(template);
+      setProbeMode(false);
+      setWireTool(false);
+      setStatus("idle");
+      setStatusMsg(`Placing an instance of '${entity.title}': click on the canvas, Esc to stop.`);
+      canvasHandleRef.current?.focus();
+    },
+    [activeLevel, activeLevelId, levels]
+  );
+
+  const duplicateLevel = useCallback(
+    (entityId: string) => {
+      try {
+        const result = duplicateEntity(levels, entityId);
+        pushEditorHistory();
+        setLevels(result.levels);
+        const copy = result.levels.find((l) => l.id === result.newLevelId);
+        setStatus("idle");
+        setStatusMsg(`Duplicated as '${copy?.title}'.`);
+      } catch (err) {
+        setStatus("error");
+        setStatusMsg(err instanceof HierarchyError ? err.message : String(err));
+      }
+    },
+    [levels, pushEditorHistory]
+  );
+
+  /** Refuse to run a hierarchy the backend would reject; returns true when it is fine. */
+  const checkHierarchyBeforeRun = useCallback((): boolean => {
+    const issue = firstHierarchyIssue(levels, activeLevelId);
+    if (!issue) return true;
+    setStatus("error");
+    setStatusMsg(issue);
+    return false;
+  }, [activeLevelId, levels]);
+
+  /* Derived view of the active level: instances carry their entity's pin layout. */
+  const canvasComponents = useMemo(
+    () => decorateSubcktInstances(activeLevel.components, levels),
+    [activeLevel.components, levels]
+  );
+  const subcktInfo = useMemo(() => {
+    const map = new Map<string, SubcktSymbolInfo>();
+    for (const [id, info] of subcktDecorations(levels, activeLevelId)) map.set(id, info);
+    return map;
+  }, [activeLevelId, levels]);
+  const canvasPendingTemplate = useMemo(() => {
+    if (!pendingTemplate || pendingDevice !== "SUBCKT") return pendingTemplate;
+    const ghost = withEntityPinLayout({ ...(pendingTemplate as CanvasComponent), type: "SUBCKT" }, levels);
+    return { ...pendingTemplate, pinLayout: ghost.pinLayout };
+  }, [levels, pendingDevice, pendingTemplate]);
+  const breadcrumb = useMemo(() => breadcrumbPath(levels, activeLevelId), [activeLevelId, levels]);
+  const focusOnMount = useCallback((el: HTMLElement | null) => el?.focus(), []);
 
   /* -------------- Run simulation -------------- */
 
@@ -784,6 +861,7 @@ export function App() {
     const effective: AnalysisState = override ? { ...analysis, ...override } : analysis;
     if (override) setAnalysis(effective);
     setOpenMenu(null);
+    if (netlistMode !== "netlist" && !checkHierarchyBeforeRun()) return;
     activeDynamicTilesRef.current.clear();
     startStatusTimer();
     setRunning(true);
@@ -885,7 +963,7 @@ export function App() {
       setRunning(false);
       stopStatusTimer();
     }
-  }, [analysis, activeLevel, levels, netlistMode, netlistText, running, setStatusIterationCount, startStatusTimer, stopStatusTimer]);
+  }, [analysis, activeLevel, checkHierarchyBeforeRun, levels, netlistMode, netlistText, running, setStatusIterationCount, startStatusTimer, stopStatusTimer]);
 
   /* -------------- Probe click → open .dyn tile -------------- */
 
@@ -896,6 +974,7 @@ export function App() {
         setStatusMsg("Dynamic probe needs a schematic. Run the edited netlist with Run.");
         return;
       }
+      if (!checkHierarchyBeforeRun()) return;
       const payload = buildSchematicPayload(
         activeLevel.components,
         activeLevel.wires,
@@ -976,7 +1055,7 @@ export function App() {
         endDynamicMetrics(tileId);
       };
     },
-    [activeLevel, analysis, beginDynamicMetrics, bumpStatusIteration, endDynamicMetrics, levels, netlistMode]
+    [activeLevel, analysis, beginDynamicMetrics, bumpStatusIteration, checkHierarchyBeforeRun, endDynamicMetrics, levels, netlistMode]
   );
 
   const startCaredNodeDisplay = useCallback(() => {
@@ -985,6 +1064,7 @@ export function App() {
       setStatusMsg("Dynamic display needs a schematic. Run the edited netlist with Run.");
       return;
     }
+    if (!checkHierarchyBeforeRun()) return;
     const payload = buildSchematicPayload(
       activeLevel.components,
       activeLevel.wires,
@@ -1071,7 +1151,7 @@ export function App() {
       setStatusMsg("Realtime display failed.");
       endDynamicMetrics(tileId);
     };
-  }, [activeLevel, analysis, beginDynamicMetrics, bumpStatusIteration, endDynamicMetrics, levels, netlistMode]);
+  }, [activeLevel, analysis, beginDynamicMetrics, bumpStatusIteration, checkHierarchyBeforeRun, endDynamicMetrics, levels, netlistMode]);
 
   /* Track tile-id → push/finalize handles without re-renders. */
   const tilesRef = useRef<Map<string, TileRecord>>(new Map());
@@ -1272,12 +1352,21 @@ export function App() {
   function addLevel(parentId: string | null) {
     pushEditorHistory();
     const id = genId("level");
-    const title = parentId === null ? `Level ${levels.length}` : `Subckt ${levels.filter((l) => l.parentId).length + 1}`;
+    const title = parentId === null ? `Level ${levels.length}` : nextSubcktTitle(levels);
+    // A new entity starts with two ports (NODE markers "in" and "out") so an
+    // instance of it is usable right away; edit, add or delete them freely.
+    const components: CanvasComponent[] =
+      parentId === null
+        ? []
+        : [
+            { id: genId("node"), type: "NODE", name: "in", value: "node", x: 120, y: 200, rotation: 0, mirrored: true },
+            { id: genId("node"), type: "NODE", name: "out", value: "node", x: 420, y: 200, rotation: 0 }
+          ];
     setLevels((cur) => [
       ...cur,
-      { id, title, components: [], wires: [], pins: ["a", "b"], parentId }
+      { id, title, components, wires: [], pins: parentId === null ? [] : ["in", "out"], parentId }
     ]);
-    setActiveLevelId(id);
+    navigateToLevel(id);
   }
   function renameLevel(id: string, title: string) {
     pushEditorHistory();
@@ -1387,14 +1476,23 @@ export function App() {
       const ctrl = event.ctrlKey || event.metaKey;
 
       if (event.key === "Escape") {
-        if (openMenu) setOpenMenu(null);
+        if (contextMenu) setContextMenu(null);
+        else if (openMenu) setOpenMenu(null);
         else if (helpOpen) setHelpOpen(false);
         else if (pendingDevice) {
           setPendingDevice(null);
+          setPendingTemplate(null);
           setStatusMsg("Component placement finished.");
         } else if (wireTool) setWireTool(false);
         else if (probeMode) setProbeMode(false);
         else return;
+        event.preventDefault();
+        return;
+      }
+
+      // Alt+Up: go to the parent level in the hierarchy tree.
+      if (event.altKey && !ctrl && event.key === "ArrowUp") {
+        ascendLevel();
         event.preventDefault();
         return;
       }
@@ -1476,6 +1574,10 @@ export function App() {
         case "o":
           openWorkspacePicker();
           break;
+        case "g":
+          if (!event.shiftKey) return;
+          makeSubcircuit();
+          break;
         case "=":
         case "+":
           canvasHandleRef.current?.zoomIn();
@@ -1505,6 +1607,33 @@ export function App() {
       ? activeLevel.components.find((c) => selectedIds.has(c.id)) ?? null
       : null;
   const hasSelection = selectedIds.size > 0;
+  const selectedInstance = selectedComponent?.type === "SUBCKT" ? selectedComponent : null;
+  const contextTarget = contextMenu?.componentId
+    ? activeLevel.components.find((c) => c.id === contextMenu.componentId) ?? null
+    : null;
+  const contextEntries: MenuEntry[] = [
+    { kind: "item", label: "Make subcircuit", shortcut: "Ctrl+Shift+G", onSelect: makeSubcircuit, disabled: !hasSelection || netlistMode === "netlist" },
+    ...(contextTarget?.type === "SUBCKT"
+      ? ([
+          { kind: "item", label: "Open subcircuit", shortcut: "Double-click", onSelect: () => descendIntoInstance(contextTarget.id) },
+          { kind: "item", label: "Dissolve subcircuit", onSelect: () => dissolveInstance(contextTarget.id) }
+        ] as MenuEntry[])
+      : []),
+    { kind: "item", label: "Up one level", shortcut: "Alt+Up", onSelect: ascendLevel, disabled: !parentLevelId(levels, activeLevelId) },
+    { kind: "separator" },
+    {
+      kind: "item",
+      label: "Properties",
+      shortcut: contextTarget?.type === "SUBCKT" ? undefined : "Double-click",
+      onSelect: () => setPropertiesFocusToken((t) => t + 1),
+      disabled: !contextTarget
+    },
+    { kind: "item", label: "Copy", shortcut: "Ctrl+C", onSelect: () => void copySelection(), disabled: !hasSelection },
+    { kind: "item", label: "Duplicate", shortcut: "Ctrl+D", onSelect: duplicateSelection, disabled: !hasSelection },
+    { kind: "item", label: "Rotate", shortcut: "R", onSelect: rotateSelection, disabled: !hasSelection },
+    { kind: "item", label: "Mirror", shortcut: "Ctrl+E", onSelect: mirrorSelection, disabled: !hasSelection },
+    { kind: "item", label: "Delete", shortcut: "Del", onSelect: deleteSelection, disabled: !hasSelection }
+  ];
 
   const fileMenu: MenuEntry[] = [
     { kind: "item", label: "New schematic", shortcut: "", onSelect: newWorkspace },
@@ -1527,7 +1656,12 @@ export function App() {
     { kind: "item", label: "Mirror", shortcut: "Ctrl+E", onSelect: mirrorSelection, disabled: !hasSelection },
     { kind: "separator" },
     { kind: "item", label: "Wire tool", shortcut: "W / F3", onSelect: toggleWireTool, checked: wireTool },
-    { kind: "item", label: "Place net label (NODE)", shortcut: "F4", onSelect: () => pickDevice("NODE"), checked: pendingDevice === "NODE" }
+    { kind: "item", label: "Place net label (NODE)", shortcut: "F4", onSelect: () => pickDevice("NODE"), checked: pendingDevice === "NODE" },
+    { kind: "separator" },
+    { kind: "item", label: "Make subcircuit", shortcut: "Ctrl+Shift+G", onSelect: makeSubcircuit, disabled: !hasSelection || netlistMode === "netlist" },
+    { kind: "item", label: "Open subcircuit", shortcut: "Double-click", onSelect: () => selectedInstance && descendIntoInstance(selectedInstance.id), disabled: !selectedInstance },
+    { kind: "item", label: "Dissolve subcircuit", onSelect: () => selectedInstance && dissolveInstance(selectedInstance.id), disabled: !selectedInstance },
+    { kind: "item", label: "Up one level", shortcut: "Alt+Up", onSelect: ascendLevel, disabled: !parentLevelId(levels, activeLevelId) }
   ];
   const viewMenu: MenuEntry[] = [
     { kind: "item", label: "Zoom in", shortcut: "Ctrl + =", onSelect: () => canvasHandleRef.current?.zoomIn() },
@@ -1744,10 +1878,13 @@ export function App() {
         onResetAnalysis={resetAnalysisControls}
         levels={levels}
         activeLevelId={activeLevelId}
-        onSelectLevel={setActiveLevelId}
+        onSelectLevel={(id) => navigateToLevel(id)}
         onAddLevel={addLevel}
         onRenameLevel={renameLevel}
         onDeleteLevel={deleteLevel}
+        onInstantiateLevel={instantiateEntity}
+        onDuplicateLevel={duplicateLevel}
+        onOpenEntity={(id) => navigateToLevel(id)}
         libraryComponents={LIBRARY_ITEMS}
         onStartDrag={startDragType}
         selectedComponent={selectedComponent}
@@ -1761,31 +1898,116 @@ export function App() {
       />
 
       <div className="canvasArea" style={{ position: "relative" }}>
-        <SchematicCanvas
-          ref={canvasHandleRef}
-          components={activeLevel.components}
-          wires={activeLevel.wires}
-          junctions={activeLevel.junctions}
-          selectedIds={selectedIds}
-          pendingDevice={pendingDevice}
-          probeMode={probeMode}
-          wireTool={wireTool}
-          showGrid={showGrid}
-          showNetNames={showNetNames}
-          onSetComponents={setActiveComponents}
-          onSetWires={setActiveWires}
-          onSelect={setSelectedIds}
-          onPendingResolved={() => setPendingDevice(null)}
-          onWireToolResolved={() => setWireTool(false)}
-          onBeforeEdit={pushEditorHistory}
-          onProbePick={onProbePick}
-          onCopy={() => void copySelection()}
-          onPaste={onPaste}
-          onDuplicate={duplicateSelection}
-          onOpenProperties={() => setPropertiesFocusToken((t) => t + 1)}
-          onZoomChange={setZoomScale}
-          onCursorChange={(pos) => cursorStore.current?.set(pos)}
-        />
+        <nav className="breadcrumbBar" aria-label="Hierarchy path">
+          {breadcrumb.map((level, index) => {
+            const last = index === breadcrumb.length - 1;
+            return (
+              <span key={level.id} className="breadcrumbBar__item">
+                {index > 0 ? <span className="breadcrumbBar__sep">›</span> : null}
+                {last ? (
+                  <span className="breadcrumbBar__current" aria-current="page">{level.title}</span>
+                ) : (
+                  <button className="breadcrumbBar__link" onClick={() => navigateToLevel(level.id)}>
+                    {level.title}
+                  </button>
+                )}
+              </span>
+            );
+          })}
+          {breadcrumb.length > 1 ? (
+            <button className="breadcrumbBar__up" onClick={ascendLevel} title="Up one level (Alt+Up)">
+              ↑ Up
+            </button>
+          ) : null}
+          {activeLevel.parentId !== null ? (
+            <span className="breadcrumbBar__ports" title="Ports of this entity (its NODE markers)">
+              ports: {entityPorts(activeLevel).join(", ") || "none"}
+            </span>
+          ) : null}
+        </nav>
+        <div className="canvasViewport">
+          <SchematicCanvas
+            ref={canvasHandleRef}
+            components={canvasComponents}
+            wires={activeLevel.wires}
+            junctions={activeLevel.junctions}
+            selectedIds={selectedIds}
+            pendingDevice={pendingDevice}
+            pendingTemplate={canvasPendingTemplate}
+            probeMode={probeMode}
+            wireTool={wireTool}
+            showGrid={showGrid}
+            showNetNames={showNetNames}
+            subcktInfo={subcktInfo}
+            onSetComponents={setActiveComponents}
+            onSetWires={setActiveWires}
+            onSelect={setSelectedIds}
+            onPendingResolved={() => {
+              setPendingDevice(null);
+              setPendingTemplate(null);
+            }}
+            onWireToolResolved={() => setWireTool(false)}
+            onBeforeEdit={pushEditorHistory}
+            onProbePick={onProbePick}
+            onCopy={() => void copySelection()}
+            onPaste={onPaste}
+            onDuplicate={duplicateSelection}
+            onOpenProperties={() => setPropertiesFocusToken((t) => t + 1)}
+            onDescend={descendIntoInstance}
+            onContextMenu={({ clientX, clientY, componentId }) => setContextMenu({ x: clientX, y: clientY, componentId })}
+            onZoomChange={setZoomScale}
+            onCursorChange={(pos) => cursorStore.current?.set(pos)}
+          />
+        </div>
+        {contextMenu ? (
+          <>
+            <div
+              className="menuBackdrop"
+              onMouseDown={() => setContextMenu(null)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setContextMenu(null);
+              }}
+            />
+            <div
+              className="contextMenu menubar__dropdownPanel"
+              role="menu"
+              tabIndex={-1}
+              ref={focusOnMount}
+              style={{
+                left: Math.max(4, Math.min(contextMenu.x, window.innerWidth - 270)),
+                top: Math.max(4, Math.min(contextMenu.y, window.innerHeight - 380))
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.stopPropagation();
+                  setContextMenu(null);
+                }
+              }}
+            >
+              {contextEntries.map((entry, index) =>
+                entry.kind === "separator" ? (
+                  <div key={`sep-${index}`} className="menuRow__sep" />
+                ) : (
+                  <button
+                    key={entry.label}
+                    className="menubar__dropdownItem menuRow"
+                    role="menuitem"
+                    disabled={entry.disabled}
+                    onClick={() => {
+                      setContextMenu(null);
+                      entry.onSelect();
+                    }}
+                  >
+                    <span className="menuRow__check" />
+                    <span className="menuRow__label">{entry.label}</span>
+                    {entry.shortcut ? <span className="menuRow__shortcut">{entry.shortcut}</span> : null}
+                  </button>
+                )
+              )}
+            </div>
+          </>
+        ) : null}
         <div className="tileLayer">
           {tiles.map((tile) => (
             tile.view === "op" && tile.opData ? (
@@ -1847,7 +2069,7 @@ export function App() {
         </span>
         <span style={{ flex: 1 }} />
         <span className="statusbar__slot statusbar__hint">
-          W wire · R rotate · Ctrl+E mirror · Ctrl+D duplicate · Ctrl+Z/Y undo/redo · Space fit · right-drag pan · double-click edit
+          W wire · R rotate · Ctrl+E mirror · Ctrl+D duplicate · Ctrl+Z/Y undo/redo · Space fit · right-drag pan · right-click menu · double-click edit / open subcircuit · Ctrl+Shift+G make subcircuit · Alt+↑ up
         </span>
       </div>
     </div>
