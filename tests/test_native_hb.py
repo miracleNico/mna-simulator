@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import dataclasses
 import importlib
-import sys
 import warnings
 from typing import Any
 
@@ -33,8 +32,6 @@ from mna_simulation.netlist import parse_netlist_text
 
 core = native.require_core()
 
-# libm's cos/sin are what NumPy uses on Linux; elsewhere allow one rounding step.
-BITWISE = sys.platform.startswith("linux")
 RTOL = 1e-6
 ATOL = 1e-9
 
@@ -42,10 +39,14 @@ MIXER = get_case("hb_ghz_mixer").netlist_text
 
 
 def _assert_same(a: np.ndarray, b: np.ndarray) -> None:
-    if BITWISE:
-        assert np.array_equal(a, b)
-    else:
-        np.testing.assert_allclose(a, b, rtol=1e-15, atol=1e-15)
+    """Equal up to the rounding of cos/sin: the core calls the C library, NumPy its own kernels.
+
+    They agree bit for bit on this development machine, but not on every platform (NumPy
+    dispatches SIMD sin/cos on some CPUs; the manylinux image ships an older glibc), so the
+    check allows a few ulps and never depends on the platform.
+    """
+
+    np.testing.assert_allclose(a, b, rtol=1e-15, atol=1e-15)
 
 
 def _assert_close(cur: Any, ref: Any, what: str) -> None:
