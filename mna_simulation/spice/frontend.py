@@ -527,7 +527,7 @@ class _Frontend:
         self.resolver = resolver
         self.context = _Context(self)
         self.netlist = Netlist()
-        self.cards: dict[tuple[int, int], ModelCard] = {}
+        self.cards: dict[tuple[int, _Scope], ModelCard] = {}
         self.referenced_cards: set[int] = set()
         self.instance_names: dict[str, set[str]] = {}
         self.global_nets: set[str] = set()
@@ -635,7 +635,9 @@ class _Frontend:
             card_scope = card_scope.parent
         if card_scope is None:
             card_scope = self.global_scope
-        cache_key = (id(entry), id(card_scope))
+        # Keyed by the scope object (not its id): a finished instance scope could free its id
+        # for the next instance, which would then reuse a card evaluated with other parameters.
+        cache_key = (id(entry), card_scope)
         card = self.cards.get(cache_key)
         if card is None:
             line, rest = entry

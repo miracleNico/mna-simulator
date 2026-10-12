@@ -515,6 +515,14 @@ def test_model_cards_inside_subcircuits_follow_the_instance_parameters() -> None
     assert circuit.diagnostics == []
 
 
+def test_each_instance_gets_its_own_evaluation_of_a_local_card() -> None:
+    # Many instances in a row: a card evaluated for one instance is never reused for another.
+    lines = [".subckt CLAMP a PARAMS: k=1", ".model DLOC D(IS={k*1e-15})", "D1 a 0 DLOC", ".ends", "V1 n 0 1"]
+    lines += [f"X{k} n CLAMP k={k}" for k in range(1, 41)]
+    records = _by_name(parse_netlist_text("\n".join(lines) + "\n"))
+    assert [records[f"X{k}.D1"].metadata["is"] for k in range(1, 41)] == [repr(k * 1e-15) for k in range(1, 41)]
+
+
 def test_component_names_stay_unique_across_the_flattened_design() -> None:
     text = ".subckt CELL a b\nV1 a m 0\nR1 m b 1k\n.ends\nV0 in 0 1\nX1 in 0 CELL\nX2 in 0 CELL\n.op\n"
     problem = build_mna_problem(parse_netlist_text(text))
