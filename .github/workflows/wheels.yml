@@ -12,6 +12,9 @@ on:
       - "pyproject.toml"
       - ".github/workflows/wheels.yml"
       - ".github/scripts/**"
+      # The wheel test runs the suite, so changes to it must re-validate the wheels too.
+      - "tests/**"
+      - "benchmarks/**"
 
 jobs:
   wheels:
