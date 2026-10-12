@@ -29,7 +29,8 @@ import {
   splitWireAtPoint,
   wireKey
 } from "../lib/schematic";
-import { DEFAULT_THEME, drawComponent } from "../lib/symbols";
+import { uniqueInstanceName } from "../lib/hierarchy";
+import { DEFAULT_THEME, SubcktSymbolInfo, drawComponent } from "../lib/symbols";
 
 export type ProbeTarget = { componentId: string; pin: string; netLabel?: string; x: number; y: number };
 
@@ -71,6 +72,14 @@ type Props = {
   onZoomChange?: (scale: number) => void;
   onCursorChange?: (pos: { x: number; y: number } | null) => void;
   onStatus?: (message: string) => void;
+  /** Entity title and validation message per SUBCKT instance id (drawn on the symbol). */
+  subcktInfo?: Map<string, SubcktSymbolInfo>;
+  /** Fields merged into every part placed while ``pendingDevice`` is set (e.g. a linked SUBCKT). */
+  pendingTemplate?: Partial<CanvasComponent> | null;
+  /** Double-click on a SUBCKT instance: open its entity. */
+  onDescend?: (componentId: string) => void;
+  /** Right-click without dragging: show the context menu (component under the cursor, if any). */
+  onContextMenu?: (target: { clientX: number; clientY: number; componentId: string | null }) => void;
 };
 
 type PanState = { x: number; y: number; scale: number };
@@ -351,7 +360,13 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
     if (props.pendingDevice) {
       const type = props.pendingDevice;
       const nextIndex = props.components.filter((c) => c.type === type).length + 1;
-      const nc = createDefaultComponent(type, nextIndex, wx, wy);
+      let nc = createDefaultComponent(type, nextIndex, wx, wy);
+      if (props.pendingTemplate) {
+        const { pinLayout: _derived, ...template } = props.pendingTemplate;
+        nc = { ...nc, ...template, pins: template.pins ? [...template.pins] : nc.pins };
+      }
+      // Instance names must be unique on a level (they prefix the inner nets).
+      if (type === "SUBCKT") nc.name = uniqueInstanceName(props.components);
       nc.rotation = pendingRotation;
       nc.mirrored = pendingMirror || undefined;
       props.onBeforeEdit();
@@ -457,7 +472,8 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
     const hit = findComponentAt(wx, wy);
     if (hit) {
       props.onSelect(new Set([hit.id]));
-      props.onOpenProperties(hit.id);
+      if (hit.type === "SUBCKT" && props.onDescend) props.onDescend(hit.id);
+      else props.onOpenProperties(hit.id);
     }
   }
 
@@ -542,6 +558,14 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
         }
         setSelection(picked);
       }
+    }
+    // A right click that did not pan opens the context menu; the part under
+    // the cursor joins the selection first, like desktop editors do.
+    if (interaction.kind === "panning" && !interaction.moved && e.button === 2 && props.onContextMenu) {
+      const { wx, wy } = clientToWorld(e.clientX, e.clientY);
+      const hit = findComponentAt(wx, wy);
+      if (hit && !props.selectedIds.has(hit.id)) props.onSelect(new Set([hit.id]));
+      props.onContextMenu({ clientX: e.clientX, clientY: e.clientY, componentId: hit?.id ?? null });
     }
     if (interaction.kind !== "wiring") {
       setInteraction({ kind: "idle" });
@@ -726,7 +750,7 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
       consume();
       return;
     }
-    if (!ctrl && e.key.startsWith("Arrow") && props.selectedIds.size > 0) {
+    if (!ctrl && !e.altKey && e.key.startsWith("Arrow") && props.selectedIds.size > 0) {
       const step = e.shiftKey ? GRID * 5 : GRID;
       if (e.key === "ArrowLeft") nudgeSelection(-step, 0);
       else if (e.key === "ArrowRight") nudgeSelection(step, 0);
@@ -768,7 +792,9 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
     props.showGrid,
     props.showNetNames,
     pendingRotation,
-    pendingMirror
+    pendingMirror,
+    props.subcktInfo,
+    props.pendingTemplate
   ]);
 
   function draw() {
@@ -877,7 +903,7 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
 
     // Components
     for (const c of props.components) {
-      drawComponent(ctx, c, DEFAULT_THEME);
+      drawComponent(ctx, c, DEFAULT_THEME, c.type === "SUBCKT" ? props.subcktInfo?.get(c.id) : undefined);
       const b = componentBounds(c);
       // SUBCKT blocks print their name inside the body, so skip the caption.
       if (c.type !== "LABEL" && c.type !== "NODE" && c.type !== "SUBCKT") {
@@ -1032,7 +1058,9 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
           y: snap(mousePos.wy),
           rotation: pendingRotation,
           mirrored: pendingMirror,
-          pins: props.pendingDevice === "SUBCKT" ? ["in_1", "out_1"] : undefined
+          pins: props.pendingDevice === "SUBCKT" ? ["in_1", "out_1"] : undefined,
+          ...(props.pendingTemplate ?? {}),
+          ...(props.pendingDevice === "SUBCKT" ? { name: uniqueInstanceName(props.components) } : {})
         },
         DEFAULT_THEME
       );
@@ -1049,6 +1077,11 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
         : props.pendingDevice
           ? `Placing ${props.pendingDevice}: click to place · R rotate · E mirror · Esc / right-click to finish`
           : null;
+
+  // Hovering a SUBCKT with a validation problem shows the message.
+  const hoveredPart =
+    mousePos && !hoverPin && interaction.kind === "idle" && props.subcktInfo?.size ? findComponentAt(mousePos.wx, mousePos.wy) : null;
+  const hoverIssue = hoveredPart?.type === "SUBCKT" ? props.subcktInfo?.get(hoveredPart.id)?.issue ?? null : null;
 
   const cursor = props.pendingDevice
     ? "copy"
@@ -1091,6 +1124,11 @@ export const SchematicCanvas = forwardRef<SchematicCanvasHandle, Props>(function
           ) : (
             <span className="hoverBadge__net hoverBadge__net--open">unconnected</span>
           )}
+        </div>
+      ) : null}
+      {hoverIssue && mousePos ? (
+        <div className="hoverBadge hoverBadge--issue" style={{ left: mousePos.x + 12, top: mousePos.y + 16 }}>
+          {hoverIssue}
         </div>
       ) : null}
       {hint ? <div className="canvasHint">{hint}</div> : null}

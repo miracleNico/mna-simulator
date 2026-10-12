@@ -15,7 +15,8 @@ The project includes:
 
 - **Single validation path:** schematic JSON is flattened to canonical netlist text, then parsed by the same parser used for raw netlists.
 - **Hierarchy-aware schematics:** `SUBCKT` instances connect to child ports through editable `NODE` markers. A child node named `in` exports as `port_in` and flattens as logical instance names such as `DiffAmp.in`.
-- **Scoped child ports:** each child entity owns its own port names. Renaming ports in one child syncs only instances of that entity and repairs connected wire endpoints.
+- **Scoped child ports:** each child entity owns its own port names, defined only by its `NODE` markers. Adding, renaming, moving, or deleting a marker updates every instance of that entity (renamed pins keep their wires, wires of deleted pins are detached and reported).
+- **Smooth encapsulation:** select parts and press `Ctrl+Shift+G` (Edit > Make subcircuit, or the right-click menu) to turn them into a new child entity with ports for every net that crosses the selection, replaced by a wired instance that simulates identically. Double-click an instance to open it, `Alt+Up` or the breadcrumb bar to go back; pins sit on the side chosen by each port marker; instances are validated as you edit (unlinked, port mismatch, recursion) and Run refuses an invalid hierarchy with the backend's wording. Entities can be instanced and duplicated from the hierarchy tree, and an instance can be dissolved back into its parent.
 - **SPICE-style transistor flow:** `QNPN`, `QPNP`, `NMOS`, and `PMOS` default to physical Level-1 nonlinear models. `.op` solves bias, `.ac` linearizes around that bias, and `.tran` keeps solving nonlinear I-V equations.
 - **Harmonic balance workflow:** `.hb <harmonics> [time_window]` supports harmonic-domain results and optional reconstructed time-domain waveforms.
 - **Close-tone HB demo:** Frequency Domain Demos includes a nonlinear diode mixer driven by 1 GHz and 1.005 GHz tones, showing the 5 MHz beat/difference product in a high-Q envelope tank that would need 40+ beat periods of picosecond-step transient settling.
@@ -216,9 +217,10 @@ The frontend supports:
 
 - Component placement, selection, copy/paste, rotation, and deletion.
 - Pin-to-pin and point-based wiring with orthogonal routing.
-- Multi-level hierarchy with editable `SUBCKT` pin names.
+- Multi-level hierarchy: Make subcircuit from a selection (`Ctrl+Shift+G`), descend by double-click, go up with `Alt+Up` or the breadcrumb bar above the canvas, Instantiate / Duplicate entities from the hierarchy tree, Dissolve subcircuit.
 - Editable `NODE` markers that connect by matching name within the same level.
-- Editable child ports: a `NODE` named `in` in a child entity exports as `port_in`.
+- Editable child ports: a `NODE` named `in` in a child entity exports as `port_in`; its optional `side` property (left/right/top/bottom, default left for names starting with `in`, right otherwise) places the pin on the `SUBCKT` symbol, ordered by the marker position.
+- Inline hierarchy checks on `SUBCKT` instances (unlinked entity, port mismatch, recursive instantiation) shown as a red badge; Run is refused with the same text the backend would produce.
 - Top-menu demos, including a BJT 3-stage amplifier built from real subcircuits, a GHz close-tone HB mixer, and Large Scale Circuits presets.
 - Toolbar Help opens the same practical guide stored in `USER_GUIDE.md`.
 - Raw netlist editing in the Visualization panel. Starting an edit asks for confirmation and then clears schematic hierarchy so the request is sent as `netlist_text`.
@@ -246,11 +248,12 @@ python benchmarks/concurrent_requests.py         # N concurrent SRAM requests ag
 
 The perf tests and the benchmarks compare ratios rather than absolute times, and they need an otherwise idle machine (`compare_backends.py` warns when the 1-minute load average is above 0.5). Committed results and their policy are in `benchmarks/results/README.md`.
 
-Build the frontend:
+Build the frontend and run its unit tests (vitest; `src/lib/hierarchy.test.ts` also keeps `tests/fixtures/make_subcircuit_payloads.json` current, refresh it with `npm test -- -u`):
 
 ```bash
 cd app/web
 npm run build
+npm test
 ```
 
 ## Benchmark

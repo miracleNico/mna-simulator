@@ -565,3 +565,106 @@ def test_service_accepts_schematic_without_netlist_text() -> None:
     assert response.status == "ok"
     assert response.dc_solution is not None
     assert response.metadata.get("generated_netlist")
+
+
+# ---------------------------------------------------------------------------
+# "Make subcircuit" in the web editor (app/web/src/lib/hierarchy.ts) moves a
+# selection into a new child entity and wires a SUBCKT instance in its place.
+# tests/fixtures/make_subcircuit_payloads.json holds the payloads the editor
+# sends before and after that transform (written by app/web/src/lib/
+# hierarchy.test.ts, which fails if the transform output drifts from the file).
+# The hierarchical payload must simulate exactly like the flat original.
+
+
+def _make_subcircuit_cases() -> list[dict]:
+    import json
+    from pathlib import Path
+
+    fixture = Path(__file__).parent / "fixtures" / "make_subcircuit_payloads.json"
+    return json.loads(fixture.read_text(encoding="utf-8"))["cases"]
+
+
+def _terminal_nodes(schematic: SchematicDocument) -> dict[tuple[str, str], str]:
+    """Net of every component terminal, keyed by the original component id."""
+    _, pin_to_node = schematic_to_netlist(schematic, AnalysisMode.OP)
+    nodes: dict[tuple[str, str], str] = {}
+    for key, node in pin_to_node.items():
+        _, component_id, pin = key.split(":", 2)
+        # Components inside an instance flatten to "<instance>.<id>"; the
+        # transform keeps the ids, so the last segment is the original id.
+        nodes[(component_id.rsplit(".", 1)[-1], pin)] = node
+    return nodes
+
+
+def _original_terminals(case: dict) -> list[tuple[str, str]]:
+    before = SchematicDocument.model_validate(case["before"])
+    return sorted(_terminal_nodes(before))
+
+
+@pytest.mark.parametrize("case_name", ["mixed", "ce_amplifier"])
+def test_make_subcircuit_payload_flattens_to_the_same_circuit(case_name: str) -> None:
+    case = next(c for c in _make_subcircuit_cases() if c["name"] == case_name)
+    before = SchematicDocument.model_validate(case["before"])
+    after = SchematicDocument.model_validate(case["after"])
+    assert not any(c.type == "SUBCKT" for c in before.components)
+    instances = [c for c in after.components if c.type == "SUBCKT"]
+    assert [c.name for c in instances] == [case["instance"]]
+    assert instances[0].subcircuit_id in after.subcircuits
+
+    before_nodes = _terminal_nodes(before)
+    after_nodes = _terminal_nodes(after)
+    # Every terminal of the original circuit still exists ...
+    assert set(before_nodes) <= set(after_nodes)
+    # ... and two terminals share a net after the transform exactly when they
+    # did before (net names may differ, the connectivity may not).
+    keys = sorted(before_nodes)
+    for i, left in enumerate(keys):
+        for right in keys[i + 1 :]:
+            same_before = before_nodes[left] == before_nodes[right]
+            same_after = after_nodes[left] == after_nodes[right]
+            assert same_before == same_after, (left, right)
+    for key in keys:
+        assert (before_nodes[key] == "0") == (after_nodes[key] == "0"), key
+
+
+@pytest.mark.parametrize("case_name", ["mixed", "ce_amplifier"])
+def test_make_subcircuit_payload_has_the_same_operating_point(case_name: str) -> None:
+    case = next(c for c in _make_subcircuit_cases() if c["name"] == case_name)
+    service = SimulationService()
+    voltages: list[dict[tuple[str, str], float]] = []
+    for side in ("before", "after"):
+        schematic = SchematicDocument.model_validate(case[side])
+        response = service.run_request(AnalysisRequest(mode=AnalysisMode.OP, schematic=schematic))
+        assert response.status == "ok"
+        values = dict(zip(response.labels, response.dc_solution or []))
+        nodes = _terminal_nodes(schematic)
+        voltages.append(
+            {key: 0.0 if node == "0" else values[f"V({node})"] for key, node in nodes.items()}
+        )
+    for key in _original_terminals(case):
+        assert voltages[1][key] == pytest.approx(voltages[0][key], rel=1e-9, abs=1e-12), key
+
+
+def test_make_subcircuit_payload_has_the_same_transient() -> None:
+    case = next(c for c in _make_subcircuit_cases() if c["name"] == "ce_amplifier")
+    service = SimulationService()
+    traces: list[dict[tuple[str, str], list[float]]] = []
+    times: list[list[float]] = []
+    for side in ("before", "after"):
+        schematic = SchematicDocument.model_validate(case[side])
+        response = service.run_request(AnalysisRequest(mode=AnalysisMode.TRAN, schematic=schematic))
+        assert response.status == "ok"
+        waveform = response.waveform
+        assert waveform is not None
+        rows = dict(zip(waveform["labels"], waveform["values"]))
+        times.append(list(waveform["time"]))
+        nodes = _terminal_nodes(schematic)
+        traces.append(
+            {
+                key: [0.0] * len(waveform["time"]) if node == "0" else list(rows[f"V({node})"])
+                for key, node in nodes.items()
+            }
+        )
+    assert times[1] == pytest.approx(times[0])
+    for key in _original_terminals(case):
+        assert traces[1][key] == pytest.approx(traces[0][key], rel=1e-7, abs=1e-9), key

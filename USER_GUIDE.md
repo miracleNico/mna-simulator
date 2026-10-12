@@ -13,9 +13,9 @@ This guide explains the normal web-app workflow for drawing circuits, running an
 - Use the toolbar to place passives, sources, BJTs, MOSFETs, controlled sources, subcircuits, net labels (`NODE`), and text labels. Placement is sticky like LTspice: every click drops another part, `R` rotates and `E` mirrors the part on the cursor, and `Esc` or right-click finishes.
 - Press `W` (or `F3`, or the wire tool button) to draw wires: click a pin, a wire, or empty space to start, click empty space to add a corner, click a pin or a wire to finish. Clicking a wire body splits it so the tap becomes a real T-junction. Clicking any pin also starts a wire without the tool.
 - Solid dots mark junctions where three or more connections meet. Amber hollow squares mark unconnected pins and a small amber ring marks a dangling wire end.
-- Click or drag to select, `Shift`+click to add, drag on empty space for a marquee. Double-click a part to jump to its Properties. Arrow keys nudge the selection by one grid step (`Shift` for five).
+- Click or drag to select, `Shift`+click to add, drag on empty space for a marquee. Double-click a part to jump to its Properties (double-clicking a subcircuit instance opens it instead). Arrow keys nudge the selection by one grid step (`Shift` for five).
 - `R` / `Ctrl+R` rotates, `Ctrl+E` mirrors, `Del` deletes, `Ctrl+C` / `Ctrl+V` copies and pastes, `Ctrl+D` (or `F6`) duplicates, `Ctrl+A` selects all, `Ctrl+Z` undoes and `Ctrl+Y` (or `Shift+Ctrl+Z`) redoes.
-- Wheel zooms, right-drag or middle-drag pans, `Space` (or `Ctrl+0`) zooms to fit, `Ctrl + =` / `Ctrl + -` zoom in and out. The View menu also toggles the grid and the automatic net names.
+- Wheel zooms, right-drag or middle-drag pans, `Space` (or `Ctrl+0`) zooms to fit, `Ctrl + =` / `Ctrl + -` zoom in and out. A right-click without dragging opens the context menu for the part under the cursor or the selection. The View menu also toggles the grid and the automatic net names.
 - `NODE` markers with the same name are connected within the same schematic level. `LABEL` components annotate the drawing without adding a part. Anonymous nets show their generated name (`n1`, `n2`, …) once per net.
 
 ## Files
@@ -35,6 +35,9 @@ This guide explains the normal web-app workflow for drawing circuits, running an
 | Copy / paste / duplicate | `Ctrl+C` / `Ctrl+V` / `Ctrl+D`, `F6` |
 | Undo / redo | `Ctrl+Z`, `F9` / `Ctrl+Y`, `Shift+F9` |
 | Select all | `Ctrl+A` |
+| Make subcircuit from the selection | `Ctrl+Shift+G` |
+| Open a subcircuit / go up one level | double-click the instance / `Alt+Up` |
+| Context menu | right-click (without dragging) |
 | Zoom to fit / in / out | `Space`, `Ctrl+0` / `Ctrl + =` / `Ctrl + -` |
 | Run current analysis | `Ctrl+Enter` |
 | Save / open workspace | `Ctrl+S` / `Ctrl+O` |
@@ -43,10 +46,17 @@ This guide explains the normal web-app workflow for drawing circuits, running an
 
 ## Use Hierarchy
 
-- Create child levels from the hierarchy panel, then place `SUBCKT` instances on the parent level.
-- A child port is an editable `NODE` marker inside the child entity.
-- The parent instance uses the child entity's pin list, so port names stay scoped to that entity.
-- Renaming a child port updates only instances of that child entity and repairs matching connected wires.
+- A workspace is a tree of levels. Every level below a top level is an *entity* (a subcircuit) that `SUBCKT` instances use. The Hierarchy panel shows the tree, and the breadcrumb bar above the canvas shows the path to the open level (top › … › entity). Click a level in either place to open it.
+- **Make a subcircuit from a selection.** Select parts and wires, then choose Edit > Make subcircuit, Make subcircuit in the canvas right-click menu, or press `Ctrl+Shift+G`. The selection moves into a new entity ("Subckt N") below the open level, and an instance (`X1`, `X2`, …) takes its place, wired to the same nets, so the circuit simulates exactly as before. One `Ctrl+Z` undoes the whole operation.
+  - Every net that connects the selection to the rest of the drawing becomes a port. Inside the entity it is a `NODE` marker at the left or right edge of the moved parts (the side the outside wiring came from), named after the net's label when it has one, otherwise `p1`, `p2`, … from top to bottom. Outside it is a pin on the instance.
+  - Ground stays global. Ground symbols in the selection move inside, and each side that loses its ground connection gets a ground symbol of its own.
+  - Every `NODE` marker in an entity is a port, so every net label in the selection becomes a pin too. Each label that no longer appears on the parent is put back there on its pin, so net names (and probes such as `V(base)`) survive, and making a subcircuit inside an entity keeps that entity's own ports.
+- **Open and leave subcircuits.** Double-click an instance to open its entity. `Alt+Up`, the ↑ Up button, or an earlier level in the breadcrumb goes back up. Double-clicking any other part still opens its Properties.
+- **Ports live in the entity.** The ports of an entity are its `NODE` markers, and the instance pins always follow them. Add, rename, move, or delete a marker inside the entity and every instance of it is updated: a renamed pin keeps its wires, and the wires of a deleted pin are detached (they keep a free end) with the count reported in the status line. A marker name is applied when you press Enter or leave the field. The Properties of a linked instance list its ports read-only; Edit ports in entity opens the entity.
+- **Pin sides and order.** A port marker's `side` property (left, right, top, bottom) picks the side of the instance symbol its pin is drawn on. The default (auto) puts names starting with `in` on the left and every other name on the right. Pins on the left and right are ordered by the marker's height in the entity, pins on the top and bottom by its horizontal position. The symbol grows with the number of pins on its longest side and shows the instance name and the entity title. Moving a marker only moves the pin on the symbol; attached wires stay attached.
+- **Reuse.** Hover an entity in the Hierarchy panel: `inst` places instances of it on the open level (click the canvas to drop each one, `Esc` to stop), `dup` copies it together with the entities below it, under new ids. `+sub` adds an empty entity that starts with an `in` and an `out` port. Dissolve subcircuit (Edit menu or right-click on an instance) puts the entity's contents back in place of the instance; the entity itself stays.
+- **Checks.** An instance with a problem has a red outline and badge, and its Properties show the message: not linked to an entity, pins that differ from the entity's ports, or a recursive link (the entity contains, directly or deeper down, the level the instance sits on). The entity list disables the entities that would be recursive. Run refuses to start with the first problem it finds, worded like the simulator's own error, for example `SUBCKT instance 'X1' port mismatch: missing child ports X1.out (local junctions: port_out)`. An unlinked instance, from the library or an older file, keeps its editable pin list until you link it.
+- Run simulates the open level. Open the top level to simulate the whole design.
 
 ## Run Analyses
 
@@ -134,5 +144,5 @@ To run the old core, start the server with `MNA_CORE=python` (or the CLI with `-
 
 - If a waveform is empty, check that the selected Display nodes exist in the generated netlist labels.
 - If a transistor amplifier has no gain, run `.op` first and confirm the device region and DC bias are sensible.
-- If a hierarchy error mentions an invalid pin, check that the parent `SUBCKT` instance pins match the child entity's exported `NODE` names.
+- If a hierarchy error mentions an invalid pin or a port mismatch, select the instance: its Properties show the entity's ports, and Use entity ports brings the instance pins in line with them.
 - If a Krylov subspace solver run is slower on a small circuit, use a larger sparse circuit such as the Large RLC Mesh demo; dense direct solve is often faster for tiny matrices.

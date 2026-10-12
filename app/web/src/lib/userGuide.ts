@@ -18,9 +18,9 @@ export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
       "Use the toolbar to place passives, sources, BJTs, MOSFETs, controlled sources, subcircuits, net labels (NODE), and text labels. Placement is sticky like LTspice: every click drops another part, R rotates and E mirrors the part on the cursor, and Esc or right-click finishes.",
       "Press W (or F3, or the wire tool button) to draw wires: click a pin, a wire, or empty space to start, click empty space to add a corner, click a pin or wire to finish. Clicking a wire body splits it so the tap becomes a real T-junction. Clicking any pin also starts a wire without the tool.",
       "Solid dots mark junctions where three or more connections meet; amber hollow squares mark unconnected pins; a small amber ring marks a dangling wire end.",
-      "Click or drag to select, Shift+click to add, drag on empty space for a marquee. Double-click a part to jump to its Properties. Arrow keys nudge the selection by one grid step (Shift for five).",
+      "Click or drag to select, Shift+click to add, drag on empty space for a marquee. Double-click a part to jump to its Properties (a subcircuit instance opens instead). Arrow keys nudge the selection by one grid step (Shift for five).",
       "R / Ctrl+R rotates, Ctrl+E mirrors, Del deletes, Ctrl+C / Ctrl+V copies and pastes, Ctrl+D (or F6) duplicates, Ctrl+A selects all, Ctrl+Z undoes and Ctrl+Y (or Shift+Ctrl+Z) redoes.",
-      "Wheel zooms, right-drag or middle-drag pans, Space (or Ctrl+0) zooms to fit, Ctrl + = / Ctrl + − zoom in and out. The View menu also toggles the grid and the automatic net names.",
+      "Wheel zooms, right-drag or middle-drag pans, Space (or Ctrl+0) zooms to fit, Ctrl + = / Ctrl + − zoom in and out. A right-click without dragging opens the context menu. The View menu also toggles the grid and the automatic net names.",
       "NODE markers with the same name are connected within the same schematic level. LABEL components annotate the drawing without adding a part. Anonymous nets show their generated name (n1, n2, …) once per net."
     ]
   },
@@ -35,9 +35,15 @@ export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
   {
     title: "Use Hierarchy",
     items: [
-      "Create child levels from the hierarchy panel, then place SUBCKT instances on the parent level.",
-      "A child port is an editable NODE marker inside the child entity. The parent instance uses the child entity's pin list, so port names stay scoped to that entity.",
-      "Renaming a child port updates only instances of that child entity and repairs matching connected wires."
+      "A workspace is a tree of levels; every level below a top level is an entity (a subcircuit) used by SUBCKT instances. The Hierarchy panel and the breadcrumb bar above the canvas (top › … › entity) both show where you are; click a level in either to open it.",
+      "Make subcircuit (Edit menu, canvas right-click menu, or Ctrl+Shift+G) moves the selected parts and wires into a new entity below the open level and puts an instance (X1, X2, …) in their place, wired to the same nets, so the circuit simulates exactly as before. One Ctrl+Z undoes it.",
+      "Every net that connects the selection to the rest of the drawing becomes a port: a NODE marker at the left or right edge inside the entity, named after the net's label or p1, p2, …, and a pin on the instance. Net labels in the selection become ports too and stay as labels on the parent, so net names and probes survive. Ground stays global: ground symbols move with the selection and each side that loses its ground gets one of its own.",
+      "Double-click an instance to open its entity; Alt+Up, the ↑ Up button, or an earlier level in the breadcrumb goes back up. Double-clicking other parts still opens their Properties.",
+      "The ports of an entity are its NODE markers and the instance pins always follow them: add, rename, move, or delete a marker inside the entity and every instance updates. Renamed pins keep their wires; wires of a deleted pin are detached and the status line reports how many. Marker names apply on Enter or when the field loses focus.",
+      "A port marker's side (left, right, top, bottom) picks where its pin sits on the instance symbol; auto puts names starting with in on the left and the rest on the right. Pins are ordered by the marker's position, the symbol grows with its longest side and shows the instance name and the entity title.",
+      "In the Hierarchy panel, hover an entity: inst places instances of it (click the canvas for each, Esc to stop), dup copies it with the entities below it, +sub adds an empty entity with in and out ports. Dissolve subcircuit (Edit menu or right-click an instance) puts the contents back in place of the instance.",
+      "Instances with a problem show a red badge and a message in Properties: not linked, pins that differ from the entity's ports, or a recursive link. Recursive entities are disabled in the entity list, and Run refuses to start with the first problem, worded like the simulator's error. Unlinked instances keep an editable pin list.",
+      "Run simulates the open level; open the top level to simulate the whole design."
     ]
   },
   {

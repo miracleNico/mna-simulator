@@ -1,0 +1,2247 @@
+{
+  "description": "Schematic payloads before and after makeSubcircuitFromSelection (app/web/src/lib/hierarchy.test.ts). tests/test_schematic_pipeline.py checks that each pair simulates alike.",
+  "cases": [
+    {
+      "name": "mixed",
+      "selection": [
+        "r2",
+        "r3",
+        "r5",
+        "tap-in",
+        "inner",
+        "w4"
+      ],
+      "instance": "X1",
+      "before": {
+        "title": "Schematic",
+        "components": [
+          {
+            "id": "v1",
+            "type": "V",
+            "name": "V1",
+            "value": "5",
+            "subtype": "DC",
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 100,
+              "y": 200
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g1",
+            "type": "GND",
+            "name": "G1",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 100,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r1",
+            "type": "R",
+            "name": "R1",
+            "value": "1k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 200,
+              "y": 120
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r2",
+            "type": "R",
+            "name": "R2",
+            "value": "2k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 320,
+              "y": 120
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r3",
+            "type": "R",
+            "name": "R3",
+            "value": "3k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 400,
+              "y": 200
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g2",
+            "type": "GND",
+            "name": "G2",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 400,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "c1",
+            "type": "C",
+            "name": "C1",
+            "value": "1u",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 520,
+              "y": 120
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g3",
+            "type": "GND",
+            "name": "G3",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 600,
+              "y": 200
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r4",
+            "type": "R",
+            "name": "R4",
+            "value": "4k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 700,
+              "y": 200
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g4",
+            "type": "GND",
+            "name": "G4",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 700,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r5",
+            "type": "R",
+            "name": "R5",
+            "value": "5k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 320,
+              "y": 260
+            },
+            "metadata": {}
+          }
+        ],
+        "wires": [
+          {
+            "id": "w1",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v1",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g1",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w2",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v1",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r1",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w3",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r1",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "jp_260_120"
+            }
+          },
+          {
+            "id": "w4",
+            "start": {
+              "kind": "junction",
+              "junction_id": "jp_260_120"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r2",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w5",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r2",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r3",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w6",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r3",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_tap"
+            }
+          },
+          {
+            "id": "w7",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r3",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g2",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w8",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r2",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "c1",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w9",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "c1",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g3",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w10",
+            "start": {
+              "kind": "junction",
+              "junction_id": "port_tap"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r4",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w11",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r4",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g4",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w12",
+            "start": {
+              "kind": "junction",
+              "junction_id": "port_inner"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r5",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w13",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r5",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r3",
+              "pin": "p"
+            }
+          }
+        ],
+        "junctions": [
+          {
+            "id": "port_tap",
+            "position": {
+              "x": 400,
+              "y": 100
+            }
+          },
+          {
+            "id": "port_inner",
+            "position": {
+              "x": 240,
+              "y": 260
+            }
+          },
+          {
+            "id": "jp_260_120",
+            "position": {
+              "x": 260,
+              "y": 120
+            }
+          }
+        ],
+        "analysis": {
+          "mode": "op",
+          "params": {}
+        },
+        "subcircuits": {}
+      },
+      "after": {
+        "title": "Schematic",
+        "components": [
+          {
+            "id": "v1",
+            "type": "V",
+            "name": "V1",
+            "value": "5",
+            "subtype": "DC",
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 100,
+              "y": 200
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g1",
+            "type": "GND",
+            "name": "G1",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 100,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r1",
+            "type": "R",
+            "name": "R1",
+            "value": "1k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 200,
+              "y": 120
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g2",
+            "type": "GND",
+            "name": "G2",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 400,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "c1",
+            "type": "C",
+            "name": "C1",
+            "value": "1u",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 520,
+              "y": 120
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g3",
+            "type": "GND",
+            "name": "G3",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 600,
+              "y": 200
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r4",
+            "type": "R",
+            "name": "R4",
+            "value": "4k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 700,
+              "y": 200
+            },
+            "metadata": {}
+          },
+          {
+            "id": "g4",
+            "type": "GND",
+            "name": "G4",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 700,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "subckt-t2",
+            "type": "SUBCKT",
+            "name": "X1",
+            "value": "",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": "level-t1",
+            "pins": [
+              "p1",
+              "tap",
+              "inner"
+            ],
+            "position": {
+              "x": 320,
+              "y": 190
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-t9",
+            "type": "GND",
+            "name": "GND1",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 400,
+              "y": 264
+            },
+            "metadata": {}
+          }
+        ],
+        "wires": [
+          {
+            "id": "w1",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v1",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g1",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w2",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v1",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r1",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w3",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r1",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "jp_260_120"
+            }
+          },
+          {
+            "id": "w7",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "gnd-t9",
+              "pin": "g"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g2",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w8",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "tap"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "c1",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w9",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "c1",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g3",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w10",
+            "start": {
+              "kind": "junction",
+              "junction_id": "port_tap"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r4",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "w11",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r4",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "g4",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w-t8",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "p1"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "jp_260_120"
+            }
+          },
+          {
+            "id": "w-t11",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "tap"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_tap"
+            }
+          },
+          {
+            "id": "w-t13",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "inner"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_inner"
+            }
+          }
+        ],
+        "junctions": [
+          {
+            "id": "port_tap",
+            "position": {
+              "x": 700,
+              "y": 100
+            }
+          },
+          {
+            "id": "port_inner",
+            "position": {
+              "x": 210,
+              "y": 200
+            }
+          },
+          {
+            "id": "jp_260_120",
+            "position": {
+              "x": 260,
+              "y": 120
+            }
+          }
+        ],
+        "analysis": {
+          "mode": "op",
+          "params": {}
+        },
+        "subcircuits": {
+          "level-t1": {
+            "components": [
+              {
+                "id": "r2",
+                "type": "R",
+                "name": "R2",
+                "value": "2k",
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 320,
+                  "y": 140
+                },
+                "metadata": {}
+              },
+              {
+                "id": "r3",
+                "type": "R",
+                "name": "R3",
+                "value": "3k",
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 400,
+                  "y": 220
+                },
+                "metadata": {}
+              },
+              {
+                "id": "r5",
+                "type": "R",
+                "name": "R5",
+                "value": "5k",
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 320,
+                  "y": 280
+                },
+                "metadata": {}
+              },
+              {
+                "id": "gnd-t6",
+                "type": "GND",
+                "name": "GND1",
+                "value": null,
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 400,
+                  "y": 304
+                },
+                "metadata": {}
+              }
+            ],
+            "wires": [
+              {
+                "id": "w4",
+                "start": {
+                  "kind": "junction",
+                  "junction_id": "jp_260_140"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "r2",
+                  "pin": "p"
+                }
+              },
+              {
+                "id": "w5",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r2",
+                  "pin": "n"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "r3",
+                  "pin": "p"
+                }
+              },
+              {
+                "id": "w6",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r3",
+                  "pin": "p"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_tap"
+                }
+              },
+              {
+                "id": "w12",
+                "start": {
+                  "kind": "junction",
+                  "junction_id": "port_inner"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "r5",
+                  "pin": "p"
+                }
+              },
+              {
+                "id": "w13",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r5",
+                  "pin": "n"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "r3",
+                  "pin": "p"
+                }
+              },
+              {
+                "id": "w-t5",
+                "start": {
+                  "kind": "junction",
+                  "junction_id": "jp_260_140"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_p1"
+                }
+              },
+              {
+                "id": "w-t7",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r3",
+                  "pin": "n"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "gnd-t6",
+                  "pin": "g"
+                }
+              }
+            ],
+            "junctions": [
+              {
+                "id": "port_p1",
+                "position": {
+                  "x": 150,
+                  "y": 210
+                }
+              },
+              {
+                "id": "port_tap",
+                "position": {
+                  "x": 500,
+                  "y": 210
+                }
+              },
+              {
+                "id": "port_inner",
+                "position": {
+                  "x": 240,
+                  "y": 280
+                }
+              },
+              {
+                "id": "jp_260_140",
+                "position": {
+                  "x": 260,
+                  "y": 140
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "ce_amplifier",
+      "selection": [
+        "q-1",
+        "r-c",
+        "r-e",
+        "r-btop",
+        "r-bbot",
+        "node-base",
+        "node-vcc-rc",
+        "node-vcc-bias",
+        "gnd-bias",
+        "gnd-e"
+      ],
+      "instance": "X1",
+      "before": {
+        "title": "Schematic",
+        "components": [
+          {
+            "id": "v-vcc",
+            "type": "V",
+            "name": "VCC",
+            "value": "15",
+            "subtype": "DC",
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 130
+            },
+            "metadata": {}
+          },
+          {
+            "id": "v-in",
+            "type": "V",
+            "name": "Vin",
+            "value": "0.02",
+            "subtype": "SIN",
+            "value2": "1k",
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 320
+            },
+            "metadata": {}
+          },
+          {
+            "id": "c-in",
+            "type": "C",
+            "name": "Cin",
+            "value": "1u",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 320,
+              "y": 280
+            },
+            "metadata": {}
+          },
+          {
+            "id": "q-1",
+            "type": "QNPN",
+            "name": "Q1",
+            "value": "1e-15",
+            "subtype": null,
+            "value2": "150",
+            "value3": "3",
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 500,
+              "y": 280
+            },
+            "metadata": {
+              "model": "level1",
+              "vaf": "100",
+              "var": "25",
+              "cje": "4p",
+              "cjc": "2p",
+              "rb": "50",
+              "re": "0.5",
+              "rc": "5"
+            }
+          },
+          {
+            "id": "r-c",
+            "type": "R",
+            "name": "Rc",
+            "value": "12k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 500,
+              "y": 170
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r-e",
+            "type": "R",
+            "name": "Re",
+            "value": "330",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 500,
+              "y": 390
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r-btop",
+            "type": "R",
+            "name": "RbTop",
+            "value": "220k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 420,
+              "y": 210
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r-bbot",
+            "type": "R",
+            "name": "RbBot",
+            "value": "15k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 420,
+              "y": 350
+            },
+            "metadata": {}
+          },
+          {
+            "id": "c-out",
+            "type": "C",
+            "name": "Cout",
+            "value": "4.7u",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 640,
+              "y": 240
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r-load",
+            "type": "R",
+            "name": "Rload",
+            "value": "10k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 760,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-vcc",
+            "type": "GND",
+            "name": "GNDvcc",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 190
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-in",
+            "type": "GND",
+            "name": "GNDin",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 380
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-bias",
+            "type": "GND",
+            "name": "GNDbias",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 420,
+              "y": 430
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-e",
+            "type": "GND",
+            "name": "GNDe",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 500,
+              "y": 450
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-load",
+            "type": "GND",
+            "name": "GNDload",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 760,
+              "y": 360
+            },
+            "metadata": {}
+          }
+        ],
+        "wires": [
+          {
+            "id": "ce-w-vcc-p",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-vcc",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_vcc"
+            }
+          },
+          {
+            "id": "ce-w-vcc-n",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-vcc",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-vcc",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "ce-w-in-g",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-in",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-in",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "ce-w-in-node",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-in",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_vin"
+            }
+          },
+          {
+            "id": "ce-w-in-c",
+            "start": {
+              "kind": "junction",
+              "junction_id": "port_vin"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "c-in",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "ce-w-c-base",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "c-in",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_base"
+            }
+          },
+          {
+            "id": "ce-w-q-base",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "q-1",
+              "pin": "b"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_base"
+            }
+          },
+          {
+            "id": "ce-w-btop-vcc",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-btop",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_vcc"
+            }
+          },
+          {
+            "id": "ce-w-btop-base",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-btop",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_base"
+            }
+          },
+          {
+            "id": "ce-w-bbot-base",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-bbot",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_base"
+            }
+          },
+          {
+            "id": "ce-w-bbot-g",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-bbot",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-bias",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "ce-w-rc-vcc",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-c",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_vcc"
+            }
+          },
+          {
+            "id": "ce-w-rc-c",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-c",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "q-1",
+              "pin": "c"
+            }
+          },
+          {
+            "id": "ce-w-e-re",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "q-1",
+              "pin": "e"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r-e",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "ce-w-re-g",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-e",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-e",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "ce-w-c-out",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "q-1",
+              "pin": "c"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "c-out",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "ce-w-out-node",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "c-out",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_out"
+            }
+          },
+          {
+            "id": "ce-w-out-load",
+            "start": {
+              "kind": "junction",
+              "junction_id": "port_out"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r-load",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "ce-w-load-g",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-load",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-load",
+              "pin": "g"
+            }
+          }
+        ],
+        "junctions": [
+          {
+            "id": "port_vcc",
+            "position": {
+              "x": 160,
+              "y": 90
+            }
+          },
+          {
+            "id": "port_vin",
+            "position": {
+              "x": 240,
+              "y": 290
+            }
+          },
+          {
+            "id": "port_base",
+            "position": {
+              "x": 420,
+              "y": 280
+            }
+          },
+          {
+            "id": "port_out",
+            "position": {
+              "x": 720,
+              "y": 260
+            }
+          }
+        ],
+        "analysis": {
+          "mode": "tran",
+          "params": {
+            "t_stop": "2m",
+            "t_step": "10u"
+          }
+        },
+        "subcircuits": {}
+      },
+      "after": {
+        "title": "Schematic",
+        "components": [
+          {
+            "id": "v-vcc",
+            "type": "V",
+            "name": "VCC",
+            "value": "15",
+            "subtype": "DC",
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 130
+            },
+            "metadata": {}
+          },
+          {
+            "id": "v-in",
+            "type": "V",
+            "name": "Vin",
+            "value": "0.02",
+            "subtype": "SIN",
+            "value2": "1k",
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 320
+            },
+            "metadata": {}
+          },
+          {
+            "id": "c-in",
+            "type": "C",
+            "name": "Cin",
+            "value": "1u",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 320,
+              "y": 280
+            },
+            "metadata": {}
+          },
+          {
+            "id": "c-out",
+            "type": "C",
+            "name": "Cout",
+            "value": "4.7u",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 640,
+              "y": 240
+            },
+            "metadata": {}
+          },
+          {
+            "id": "r-load",
+            "type": "R",
+            "name": "Rload",
+            "value": "10k",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 760,
+              "y": 300
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-vcc",
+            "type": "GND",
+            "name": "GNDvcc",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 190
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-in",
+            "type": "GND",
+            "name": "GNDin",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 160,
+              "y": 380
+            },
+            "metadata": {}
+          },
+          {
+            "id": "gnd-load",
+            "type": "GND",
+            "name": "GNDload",
+            "value": null,
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": null,
+            "pins": null,
+            "position": {
+              "x": 760,
+              "y": 360
+            },
+            "metadata": {}
+          },
+          {
+            "id": "subckt-t2",
+            "type": "SUBCKT",
+            "name": "X1",
+            "value": "",
+            "subtype": null,
+            "value2": null,
+            "value3": null,
+            "ctrl_node1": null,
+            "ctrl_node2": null,
+            "ctrl_source": null,
+            "subcircuit_id": "level-t1",
+            "pins": [
+              "vcc",
+              "base",
+              "p1"
+            ],
+            "position": {
+              "x": 460,
+              "y": 290
+            },
+            "metadata": {}
+          }
+        ],
+        "wires": [
+          {
+            "id": "ce-w-vcc-p",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-vcc",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_vcc"
+            }
+          },
+          {
+            "id": "ce-w-vcc-n",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-vcc",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-vcc",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "ce-w-in-g",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-in",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-in",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "ce-w-in-node",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "v-in",
+              "pin": "p"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_vin"
+            }
+          },
+          {
+            "id": "ce-w-in-c",
+            "start": {
+              "kind": "junction",
+              "junction_id": "port_vin"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "c-in",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "ce-w-c-base",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "c-in",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "base"
+            }
+          },
+          {
+            "id": "ce-w-c-out",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "p1"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "c-out",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "ce-w-out-node",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "c-out",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_out"
+            }
+          },
+          {
+            "id": "ce-w-out-load",
+            "start": {
+              "kind": "junction",
+              "junction_id": "port_out"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "r-load",
+              "pin": "p"
+            }
+          },
+          {
+            "id": "ce-w-load-g",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "r-load",
+              "pin": "n"
+            },
+            "end": {
+              "kind": "component_pin",
+              "component_id": "gnd-load",
+              "pin": "g"
+            }
+          },
+          {
+            "id": "w-t8",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "vcc"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_vcc"
+            }
+          },
+          {
+            "id": "w-t10",
+            "start": {
+              "kind": "component_pin",
+              "component_id": "subckt-t2",
+              "pin": "base"
+            },
+            "end": {
+              "kind": "junction",
+              "junction_id": "port_base"
+            }
+          }
+        ],
+        "junctions": [
+          {
+            "id": "port_vcc",
+            "position": {
+              "x": 160,
+              "y": 90
+            }
+          },
+          {
+            "id": "port_vin",
+            "position": {
+              "x": 240,
+              "y": 290
+            }
+          },
+          {
+            "id": "port_out",
+            "position": {
+              "x": 720,
+              "y": 260
+            }
+          },
+          {
+            "id": "port_base",
+            "position": {
+              "x": 350,
+              "y": 300
+            }
+          }
+        ],
+        "analysis": {
+          "mode": "tran",
+          "params": {
+            "t_stop": "2m",
+            "t_step": "10u"
+          }
+        },
+        "subcircuits": {
+          "level-t1": {
+            "components": [
+              {
+                "id": "q-1",
+                "type": "QNPN",
+                "name": "Q1",
+                "value": "1e-15",
+                "subtype": null,
+                "value2": "150",
+                "value3": "3",
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 330,
+                  "y": 270
+                },
+                "metadata": {
+                  "model": "level1",
+                  "vaf": "100",
+                  "var": "25",
+                  "cje": "4p",
+                  "cjc": "2p",
+                  "rb": "50",
+                  "re": "0.5",
+                  "rc": "5"
+                }
+              },
+              {
+                "id": "r-c",
+                "type": "R",
+                "name": "Rc",
+                "value": "12k",
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 330,
+                  "y": 160
+                },
+                "metadata": {}
+              },
+              {
+                "id": "r-e",
+                "type": "R",
+                "name": "Re",
+                "value": "330",
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 330,
+                  "y": 380
+                },
+                "metadata": {}
+              },
+              {
+                "id": "r-btop",
+                "type": "R",
+                "name": "RbTop",
+                "value": "220k",
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 250,
+                  "y": 200
+                },
+                "metadata": {}
+              },
+              {
+                "id": "r-bbot",
+                "type": "R",
+                "name": "RbBot",
+                "value": "15k",
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 250,
+                  "y": 340
+                },
+                "metadata": {}
+              },
+              {
+                "id": "gnd-bias",
+                "type": "GND",
+                "name": "GNDbias",
+                "value": null,
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 250,
+                  "y": 420
+                },
+                "metadata": {}
+              },
+              {
+                "id": "gnd-e",
+                "type": "GND",
+                "name": "GNDe",
+                "value": null,
+                "subtype": null,
+                "value2": null,
+                "value3": null,
+                "ctrl_node1": null,
+                "ctrl_node2": null,
+                "ctrl_source": null,
+                "subcircuit_id": null,
+                "pins": null,
+                "position": {
+                  "x": 330,
+                  "y": 440
+                },
+                "metadata": {}
+              }
+            ],
+            "wires": [
+              {
+                "id": "ce-w-q-base",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "q-1",
+                  "pin": "b"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_base"
+                }
+              },
+              {
+                "id": "ce-w-btop-vcc",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r-btop",
+                  "pin": "p"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_vcc"
+                }
+              },
+              {
+                "id": "ce-w-btop-base",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r-btop",
+                  "pin": "n"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_base"
+                }
+              },
+              {
+                "id": "ce-w-bbot-base",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r-bbot",
+                  "pin": "p"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_base"
+                }
+              },
+              {
+                "id": "ce-w-bbot-g",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r-bbot",
+                  "pin": "n"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "gnd-bias",
+                  "pin": "g"
+                }
+              },
+              {
+                "id": "ce-w-rc-vcc",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r-c",
+                  "pin": "p"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_vcc"
+                }
+              },
+              {
+                "id": "ce-w-rc-c",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r-c",
+                  "pin": "n"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "q-1",
+                  "pin": "c"
+                }
+              },
+              {
+                "id": "ce-w-e-re",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "q-1",
+                  "pin": "e"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "r-e",
+                  "pin": "p"
+                }
+              },
+              {
+                "id": "ce-w-re-g",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "r-e",
+                  "pin": "n"
+                },
+                "end": {
+                  "kind": "component_pin",
+                  "component_id": "gnd-e",
+                  "pin": "g"
+                }
+              },
+              {
+                "id": "w-t6",
+                "start": {
+                  "kind": "component_pin",
+                  "component_id": "q-1",
+                  "pin": "c"
+                },
+                "end": {
+                  "kind": "junction",
+                  "junction_id": "port_p1"
+                }
+              }
+            ],
+            "junctions": [
+              {
+                "id": "port_vcc",
+                "position": {
+                  "x": 150,
+                  "y": 260
+                }
+              },
+              {
+                "id": "port_base",
+                "position": {
+                  "x": 150,
+                  "y": 300
+                }
+              },
+              {
+                "id": "port_p1",
+                "position": {
+                  "x": 430,
+                  "y": 280
+                }
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
