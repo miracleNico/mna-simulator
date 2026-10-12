@@ -68,7 +68,12 @@ def reference_core_version() -> str:
     """``python-reference@<commit>``: the commit the frozen core was copied from."""
 
     commit = "unknown"
-    frozen_at = REFERENCE_DIR / REFERENCE_PACKAGE / "FROZEN_AT.txt"
+    # Next to the package that is actually imported: under tests/reference of a checkout, or
+    # wherever a test run put it on sys.path when the package itself is an installed wheel.
+    try:
+        frozen_at = Path(load_reference_package().__file__ or "").resolve().parent / "FROZEN_AT.txt"
+    except ReferenceCoreUnavailable:
+        frozen_at = REFERENCE_DIR / REFERENCE_PACKAGE / "FROZEN_AT.txt"
     try:
         for line in frozen_at.read_text(encoding="utf-8").splitlines():
             key, _, value = line.partition(":")
