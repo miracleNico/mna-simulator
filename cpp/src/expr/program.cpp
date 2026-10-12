@@ -425,6 +425,9 @@ void evaluate_dual(const Program& program, const double* x, double t, const std:
                     case Op::Sqrt: result = std::sqrt(va); c = 0.5 / result; break;
                     case Op::Exp: result = std::exp(va); c = result; break;
                     case Op::Log: result = std::log(va); c = 1.0 / va; break;
+                    // sin and cos of one argument: program.cpp is compiled with -fno-builtin-sin
+                    // and -fno-builtin-cos (CMakeLists.txt) so the pair is not fused into
+                    // sincos(), whose rounding can differ from the value-only path's lone sin().
                     case Op::Sin: result = std::sin(va); c = std::cos(va); break;
                     case Op::Cos: result = std::cos(va); c = -std::sin(va); break;
                     case Op::Tan: result = std::tan(va); c = 1.0 + result * result; break;

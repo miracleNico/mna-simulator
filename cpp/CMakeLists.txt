@@ -199,6 +199,17 @@ if(MNA_BUILD_TESTS)
   add_test(NAME mna_core_tests COMMAND mna_core_tests)
 endif()
 
+# The dual-number evaluator of the expression VM computes sin and cos of the same argument
+# when a derivative is requested (value and slope). GCC and Clang fuse such a pair into one
+# sincos() call, and on some C libraries (glibc 2.28 in the manylinux image) sincos() rounds
+# differently from a lone sin() by an ulp, so the value of a program depended on whether its
+# gradient was requested. Keep sin/cos as plain library calls in that file (no builtin
+# recognition, hence no sincos fusion); MSVC does not fuse them.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/src/expr/program.cpp
+    PROPERTIES COMPILE_OPTIONS "-fno-builtin-sin;-fno-builtin-cos")
+endif()
+
 message(STATUS "mna_core ${PROJECT_VERSION}: build type '${CMAKE_BUILD_TYPE}', tests ${MNA_BUILD_TESTS}, "
                "python module ${_mna_module_built}, sanitizers ${MNA_ENABLE_SANITIZERS}, "
                "coverage ${MNA_ENABLE_COVERAGE}, native arch ${MNA_NATIVE_ARCH}")
