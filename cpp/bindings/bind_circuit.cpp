@@ -121,6 +121,45 @@ std::shared_ptr<Circuit> build_circuit(const nb::dict& spec) {
     s.bjt.var = column<double>(bjt, "bjt", "var");
     s.bjt.sign = column<std::int32_t>(bjt, "bjt", "sign");
 
+    const nb::dict sd = sub_table(spec, "spice_diodes");
+    s.spice_diodes.anode = column<std::int64_t>(sd, "spice_diodes", "anode");
+    s.spice_diodes.cathode = column<std::int64_t>(sd, "spice_diodes", "cathode");
+    s.spice_diodes.is = column<double>(sd, "spice_diodes", "is");
+    s.spice_diodes.n = column<double>(sd, "spice_diodes", "n");
+    s.spice_diodes.bv = column<double>(sd, "spice_diodes", "bv");
+    s.spice_diodes.ibv = column<double>(sd, "spice_diodes", "ibv");
+
+    const nb::dict gp = sub_table(spec, "gummel_poon");
+    s.gummel_poon.collector = column<std::int64_t>(gp, "gummel_poon", "collector");
+    s.gummel_poon.base = column<std::int64_t>(gp, "gummel_poon", "base");
+    s.gummel_poon.emitter = column<std::int64_t>(gp, "gummel_poon", "emitter");
+    s.gummel_poon.is = column<double>(gp, "gummel_poon", "is");
+    s.gummel_poon.bf = column<double>(gp, "gummel_poon", "bf");
+    s.gummel_poon.nf = column<double>(gp, "gummel_poon", "nf");
+    s.gummel_poon.br = column<double>(gp, "gummel_poon", "br");
+    s.gummel_poon.nr = column<double>(gp, "gummel_poon", "nr");
+    s.gummel_poon.vaf = column<double>(gp, "gummel_poon", "vaf");
+    s.gummel_poon.var = column<double>(gp, "gummel_poon", "var");
+    s.gummel_poon.ikf = column<double>(gp, "gummel_poon", "ikf");
+    s.gummel_poon.ikr = column<double>(gp, "gummel_poon", "ikr");
+    s.gummel_poon.ise = column<double>(gp, "gummel_poon", "ise");
+    s.gummel_poon.ne = column<double>(gp, "gummel_poon", "ne");
+    s.gummel_poon.isc = column<double>(gp, "gummel_poon", "isc");
+    s.gummel_poon.nc = column<double>(gp, "gummel_poon", "nc");
+    s.gummel_poon.sign = column<std::int32_t>(gp, "gummel_poon", "sign");
+
+    const nb::dict m4 = sub_table(spec, "mos4");
+    s.mos4.drain = column<std::int64_t>(m4, "mos4", "drain");
+    s.mos4.gate = column<std::int64_t>(m4, "mos4", "gate");
+    s.mos4.source = column<std::int64_t>(m4, "mos4", "source");
+    s.mos4.bulk = column<std::int64_t>(m4, "mos4", "bulk");
+    s.mos4.beta = column<double>(m4, "mos4", "beta");
+    s.mos4.vto = column<double>(m4, "mos4", "vto");
+    s.mos4.lambda = column<double>(m4, "mos4", "lambda");
+    s.mos4.gamma = column<double>(m4, "mos4", "gamma");
+    s.mos4.phi = column<double>(m4, "mos4", "phi");
+    s.mos4.sign = column<std::int32_t>(m4, "mos4", "sign");
+
     const nb::dict beh = sub_table(spec, "behavioral");
     s.behavioral.node_p = column<std::int64_t>(beh, "behavioral", "node_p");
     s.behavioral.node_n = column<std::int64_t>(beh, "behavioral", "node_n");
@@ -173,7 +212,18 @@ void bind_circuit(nb::module_& m) {
                          d["bjt"] = c.device_counts().bjt;
                          d["behavioral"] = c.device_counts().behavioral;
                          return d;
-                     })
+                     },
+                     "Devices per Level-1 / ideal class: diode, mos, bjt, behavioral (model-card devices are in\n"
+                     "card_device_counts).")
+        .def_prop_ro("card_device_counts",
+                     [](const Circuit& c) {
+                         nb::dict d;
+                         d["spice_diode"] = c.device_counts().spice_diodes;
+                         d["gummel_poon"] = c.device_counts().gummel_poon;
+                         d["mos4"] = c.device_counts().mos4;
+                         return d;
+                     },
+                     "Model-card devices (phase M2): spice_diode, gummel_poon, mos4.")
         .def("pattern",
              [](const Circuit& c) {
                  std::vector<std::int32_t> col_ptr = c.col_ptr();
@@ -217,6 +267,12 @@ void bind_circuit(nb::module_& m) {
                      slots = c.bjt().slots;
                  } else if (kind == "behavioral") {
                      slots = c.behavioral().slots;
+                 } else if (kind == "spice_diode") {
+                     slots = c.spice_diodes().slots;
+                 } else if (kind == "gummel_poon") {
+                     slots = c.gummel_poon().slots;
+                 } else if (kind == "mos4") {
+                     slots = c.mos4().slots;
                  } else {
                      throw mna::Error(mna::ErrorCode::NetlistFatal, "unknown device kind '" + kind + "'");
                  }
@@ -237,8 +293,15 @@ void bind_circuit(nb::module_& m) {
                  return d;
              },
              "Exponential junctions used by the junction voltage-step limiter: dict of arrays anode, cathode\n"
-             "(int32, -1 = ground), vt, is, vcrit (diodes first, then each BJT's base-emitter and\n"
-             "base-collector junction).");
+             "(int32, -1 = ground), vt, is, vcrit (diodes first, then each Level-1 BJT's base-emitter and\n"
+             "base-collector junction, then the SPICE diodes, then each Gummel-Poon BJT's junctions).")
+        .def("spice_diode_breakdown_voltages",
+             [](const Circuit& c) {
+                 std::vector<double> v = c.spice_diodes().bv_eff;
+                 const std::size_t size = v.size();
+                 return to_numpy(std::move(v), {size});
+             },
+             "Effective (continuity-shifted) breakdown voltage of every SPICE diode, +inf without breakdown.");
 
     m.def("build_circuit", &build_circuit, "spec"_a,
           "Compile a circuit from plain tables (see mna_simulation/native/circuit.py for the layout).\n"

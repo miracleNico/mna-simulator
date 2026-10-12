@@ -4,11 +4,13 @@
 // Phase 1 evaluates every device into its own scratch slots, in parallel over
 // device chunks (mna::parallel_for_chunks). Phase 2 gathers the scratch into
 // residual rows and pattern slots through the circuit's assembly map: each
-// output is summed by one thread in a fixed device order, in three groups
-// ((diodes + behavioral), MOS, BJT) whose totals are added in that order, the
-// grouping of the Python core (`f = f_symbolic; f += f_mos; f += f_bjt`). The
-// result is bitwise identical for every thread count; num_threads <= 1 runs
-// the same chunk functions inline.
+// output is summed by one thread in a fixed device order, in four groups
+// ((diodes + behavioral), MOS, BJT, model-card devices) whose totals are added
+// in that order; the first three are the grouping of the Python core
+// (`f = f_symbolic; f += f_mos; f += f_bjt`), the fourth (SPICE diodes,
+// Gummel-Poon BJTs, card MOS, phase M2) is empty for every circuit without
+// them. The result is bitwise identical for every thread count;
+// num_threads <= 1 runs the same chunk functions inline.
 #pragma once
 
 #include <cstdint>
@@ -38,11 +40,21 @@ void evaluate_device_range(const circuit::Circuit& circuit, const double* x, dou
 /// MOS: ids, gds = dIds/dVd, gm = dIds/dVg, d_source = dIds/dVs, region
 /// (mna::devices::MosRegion). BJT: ic, ib, ie, gm = dIc/dVb, go = dIc/dVc,
 /// rpi = 1/(dIb/dVb) (inf when |dIb/dVb| <= 1e-30), region (BjtRegion).
+/// SPICE diodes: junction voltage vd, current id, conductance gd, the
+/// effective breakdown voltage, region (DiodeRegion). Gummel-Poon BJTs: as
+/// the Level-1 BJT at the intrinsic terminals. Card MOS: as the Level-1 MOS
+/// plus gmbs = dIds/dVb and the body-adjusted threshold vth (n-channel frame).
 struct OperatingPoints {
     std::vector<double> mos_ids, mos_gds, mos_gm, mos_d_source;
     std::vector<std::int32_t> mos_region;
     std::vector<double> bjt_ic, bjt_ib, bjt_ie, bjt_gm, bjt_go, bjt_rpi;
     std::vector<std::int32_t> bjt_region;
+    std::vector<double> spice_diode_vd, spice_diode_id, spice_diode_gd, spice_diode_bv_eff;
+    std::vector<std::int32_t> spice_diode_region;
+    std::vector<double> gp_ic, gp_ib, gp_ie, gp_gm, gp_go, gp_rpi;
+    std::vector<std::int32_t> gp_region;
+    std::vector<double> mos4_ids, mos4_gds, mos4_gm, mos4_d_source, mos4_gmbs, mos4_vth;
+    std::vector<std::int32_t> mos4_region;
 };
 
 OperatingPoints operating_points(const circuit::Circuit& circuit, const double* x);

@@ -21,7 +21,6 @@ from ..solvers import (
     _problem_is_nonlinear,
     _time_sources,
     _transient_time_points,
-    is_nonlinear,
     solve_transient,
 )
 from .linear import _problem_size, count_input_directions
@@ -215,8 +214,7 @@ def solve_transient_tpwl(
         values = selector @ snapshots
         waveform = WaveformResult(time=np.asarray(entry["time"], dtype=float), values=values, labels=output_labels)
     else:
-        solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
-        if not (is_nonlinear(solver_f_str) or problem.level1_mos_devices or problem.level1_bjt_devices):
+        if not _problem_is_nonlinear(problem):
             values = selector @ snapshots
             waveform = WaveformResult(time=np.asarray(entry["time"], dtype=float), values=values, labels=output_labels)
         else:

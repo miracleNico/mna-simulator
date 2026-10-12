@@ -358,9 +358,26 @@ def _compile_temporary_circuit(
     )
 
 
+def has_card_devices(problem: MnaProblem) -> bool:
+    """True when the problem holds model-card devices (phase M2: SPICE diode, Gummel-Poon, card MOS).
+
+    They live only in the native tables of ``problem.native`` (``solver_f_str`` has no rows
+    for them, ``f_str`` only display placeholders); the builder lists them in
+    ``problem.metadata["card_devices"]``.
+    """
+
+    metadata = problem.metadata
+    return bool(metadata.get("card_devices")) if metadata else False
+
+
 def _problem_is_nonlinear(problem: MnaProblem) -> bool:
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
-    return is_nonlinear(solver_f_str) or bool(problem.level1_mos_devices) or bool(problem.level1_bjt_devices)
+    return (
+        is_nonlinear(solver_f_str)
+        or bool(problem.level1_mos_devices)
+        or bool(problem.level1_bjt_devices)
+        or has_card_devices(problem)
+    )
 
 
 def _problem_circuit(problem: MnaProblem, nonlinear: bool):
@@ -779,9 +796,27 @@ def solve_ac(
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
     level1_devices = problem.level1_mos_devices
     level1_bjt_devices = problem.level1_bjt_devices
+    card_devices = has_card_devices(problem)
     spectrum_metadata: dict[str, object] = {}
     x_op: np.ndarray | None = None
-    if is_nonlinear(solver_f_str) or level1_devices or level1_bjt_devices:
+    if card_devices:
+        # Model-card devices exist only in problem.native: the operating point runs there
+        # (G + gmin * stamps, node-to-ground gmin included), like .op.
+        dc_solution = solve_operating_point(
+            problem,
+            problem.b_dc,
+            max_iter=max_iter,
+            v_tol=v_tol,
+            f_tol=f_tol,
+            use_krylov=use_krylov,
+            krylov_tol=krylov_tol,
+            krylov_max_iter=krylov_max_iter,
+            krylov_restart=krylov_restart,
+            krylov_rank=krylov_rank,
+            krylov_method=krylov_method,
+            krylov_stats=krylov_stats,
+        )
+    elif is_nonlinear(solver_f_str) or level1_devices or level1_bjt_devices:
         dc_solution = solve_dc_nr(
             problem.G,
             solver_f_str,
@@ -799,13 +834,16 @@ def solve_ac(
             level1_mos_devices=level1_devices,
             level1_bjt_devices=level1_bjt_devices,
         )
+    if card_devices or is_nonlinear(solver_f_str) or level1_devices or level1_bjt_devices:
         x_op = np.ascontiguousarray(np.asarray(dc_solution, dtype=float).reshape(-1))
         spectrum_metadata["op_used"] = True
         spectrum_metadata["operating_point"] = {
             "labels": problem.metadata["labels"],
             "values": np.asarray(dc_solution).flatten().tolist(),
         }
-        spectrum_metadata["linearized_device_count"] = len(level1_devices) + len(level1_bjt_devices)
+        spectrum_metadata["linearized_device_count"] = (
+            len(level1_devices) + len(level1_bjt_devices) + len(problem.metadata.get("card_devices", ()))
+        )
     else:
         spectrum_metadata["op_used"] = False
         spectrum_metadata["linearized_device_count"] = 0
@@ -1054,7 +1092,7 @@ def solve_harmonic_balance(
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
     level1_devices = problem.level1_mos_devices
     level1_bjt_devices = problem.level1_bjt_devices
-    nonlinear = is_nonlinear(solver_f_str) or bool(level1_devices) or bool(level1_bjt_devices)
+    nonlinear = _problem_is_nonlinear(problem)
     circuit = problem.native
     if circuit is None:
         # The builder leaves ``native`` unset only when a behavioral expression

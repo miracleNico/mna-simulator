@@ -9,6 +9,8 @@
 
 #include "mna/devices/bjt_level1.hpp"
 #include "mna/devices/diode.hpp"
+#include "mna/devices/gummel_poon.hpp"
+#include "mna/devices/spice_diode.hpp"
 #include "mna/error.hpp"
 
 namespace mna::circuit {
@@ -34,6 +36,27 @@ std::int32_t checked_index(std::int64_t index, std::int64_t n, const char* table
                  " is outside [-1, " + std::to_string(n) + ")");
     }
     return static_cast<std::int32_t>(index);
+}
+
+void check_positive(const char* table, const char* column, double value, std::size_t i, bool allow_inf = false) {
+    if (!(value > 0.0) || (!allow_inf && !std::isfinite(value))) {
+        bad_spec(std::string(table) + "." + column + "[" + std::to_string(i) + "] = " + std::to_string(value) +
+                 " must be a positive " + (allow_inf ? "number" : "finite number"));
+    }
+}
+
+void check_non_negative(const char* table, const char* column, double value, std::size_t i) {
+    if (!(value >= 0.0)) {
+        bad_spec(std::string(table) + "." + column + "[" + std::to_string(i) + "] = " + std::to_string(value) +
+                 " must not be negative");
+    }
+}
+
+void check_finite(const char* table, const char* column, double value, std::size_t i) {
+    if (!std::isfinite(value)) {
+        bad_spec(std::string(table) + "." + column + "[" + std::to_string(i) + "] = " + std::to_string(value) +
+                 " must be finite");
+    }
 }
 
 void check_triplets(const TripletList& t, const char* name, std::int64_t n) {
@@ -151,10 +174,123 @@ void Circuit::build(const CircuitSpec& spec) {
             behavioral_.slot_ptr[i] + 2 * static_cast<std::int64_t>(program->unknowns().size());
     }
 
+    // ---- model-card devices (phase M2) -----------------------------------------
+    const SpiceDiodeTable& sdt = spec.spice_diodes;
+    const std::size_t nsd = sdt.anode.size();
+    check_length("spice_diodes", "cathode", sdt.cathode.size(), nsd);
+    check_length("spice_diodes", "is", sdt.is.size(), nsd);
+    check_length("spice_diodes", "n", sdt.n.size(), nsd);
+    check_length("spice_diodes", "bv", sdt.bv.size(), nsd);
+    check_length("spice_diodes", "ibv", sdt.ibv.size(), nsd);
+    spice_diodes_.anode.resize(nsd);
+    spice_diodes_.cathode.resize(nsd);
+    spice_diodes_.is = sdt.is;
+    spice_diodes_.n = sdt.n;
+    spice_diodes_.bv = sdt.bv;
+    spice_diodes_.ibv = sdt.ibv;
+    spice_diodes_.bv_eff.resize(nsd);
+    for (std::size_t i = 0; i < nsd; ++i) {
+        spice_diodes_.anode[i] = checked_index(sdt.anode[i], n, "spice_diodes", "anode", i);
+        spice_diodes_.cathode[i] = checked_index(sdt.cathode[i], n, "spice_diodes", "cathode", i);
+        check_positive("spice_diodes", "is", sdt.is[i], i);
+        check_positive("spice_diodes", "n", sdt.n[i], i);
+        check_positive("spice_diodes", "bv", sdt.bv[i], i, true);
+        check_positive("spice_diodes", "ibv", sdt.ibv[i], i);
+        spice_diodes_.bv_eff[i] = devices::spice_diode_breakdown_voltage(sdt.is[i], sdt.bv[i], sdt.ibv[i]);
+    }
+
+    const GummelPoonTable& gt = spec.gummel_poon;
+    const std::size_t ng = gt.collector.size();
+    using Column = std::pair<const char*, const std::vector<double>*>;
+    const Column gp_positive[] = {{"is", &gt.is}, {"bf", &gt.bf}, {"nf", &gt.nf}, {"br", &gt.br},
+                                  {"nr", &gt.nr}, {"ne", &gt.ne}, {"nc", &gt.nc}};
+    const Column gp_non_negative[] = {{"vaf", &gt.vaf}, {"var", &gt.var}, {"ikf", &gt.ikf},
+                                      {"ikr", &gt.ikr}, {"ise", &gt.ise}, {"isc", &gt.isc}};
+    check_length("gummel_poon", "base", gt.base.size(), ng);
+    check_length("gummel_poon", "emitter", gt.emitter.size(), ng);
+    for (const Column& column : gp_positive) {
+        check_length("gummel_poon", column.first, column.second->size(), ng);
+    }
+    for (const Column& column : gp_non_negative) {
+        check_length("gummel_poon", column.first, column.second->size(), ng);
+    }
+    check_length("gummel_poon", "sign", gt.sign.size(), ng);
+    gummel_poon_.collector.resize(ng);
+    gummel_poon_.base.resize(ng);
+    gummel_poon_.emitter.resize(ng);
+    gummel_poon_.params.resize(ng);
+    gummel_poon_.sign.resize(ng);
+    for (std::size_t i = 0; i < ng; ++i) {
+        gummel_poon_.collector[i] = checked_index(gt.collector[i], n, "gummel_poon", "collector", i);
+        gummel_poon_.base[i] = checked_index(gt.base[i], n, "gummel_poon", "base", i);
+        gummel_poon_.emitter[i] = checked_index(gt.emitter[i], n, "gummel_poon", "emitter", i);
+        for (const Column& column : gp_positive) {
+            check_positive("gummel_poon", column.first, (*column.second)[i], i);
+        }
+        for (const Column& column : gp_non_negative) {
+            check_non_negative("gummel_poon", column.first, (*column.second)[i], i);
+        }
+        check_finite("gummel_poon", "ise", gt.ise[i], i);
+        check_finite("gummel_poon", "isc", gt.isc[i], i);
+        devices::GummelPoonParams& p = gummel_poon_.params[i];
+        p.is = gt.is[i];
+        p.bf = gt.bf[i];
+        p.nf = gt.nf[i];
+        p.br = gt.br[i];
+        p.nr = gt.nr[i];
+        p.vaf = gt.vaf[i];
+        p.var = gt.var[i];
+        p.ikf = gt.ikf[i];
+        p.ikr = gt.ikr[i];
+        p.ise = gt.ise[i];
+        p.ne = gt.ne[i];
+        p.isc = gt.isc[i];
+        p.nc = gt.nc[i];
+        gummel_poon_.sign[i] = gt.sign[i] < 0 ? -1 : 1;
+    }
+
+    const MosCardTable& ct = spec.mos4;
+    const std::size_t nc = ct.drain.size();
+    check_length("mos4", "gate", ct.gate.size(), nc);
+    check_length("mos4", "source", ct.source.size(), nc);
+    check_length("mos4", "bulk", ct.bulk.size(), nc);
+    check_length("mos4", "beta", ct.beta.size(), nc);
+    check_length("mos4", "vto", ct.vto.size(), nc);
+    check_length("mos4", "lambda", ct.lambda.size(), nc);
+    check_length("mos4", "gamma", ct.gamma.size(), nc);
+    check_length("mos4", "phi", ct.phi.size(), nc);
+    check_length("mos4", "sign", ct.sign.size(), nc);
+    mos4_.drain.resize(nc);
+    mos4_.gate.resize(nc);
+    mos4_.source.resize(nc);
+    mos4_.bulk.resize(nc);
+    mos4_.beta = ct.beta;
+    mos4_.vto = ct.vto;
+    mos4_.lambda = ct.lambda;
+    mos4_.gamma = ct.gamma;
+    mos4_.phi = ct.phi;
+    mos4_.sign.resize(nc);
+    for (std::size_t i = 0; i < nc; ++i) {
+        mos4_.drain[i] = checked_index(ct.drain[i], n, "mos4", "drain", i);
+        mos4_.gate[i] = checked_index(ct.gate[i], n, "mos4", "gate", i);
+        mos4_.source[i] = checked_index(ct.source[i], n, "mos4", "source", i);
+        mos4_.bulk[i] = checked_index(ct.bulk[i], n, "mos4", "bulk", i);
+        check_finite("mos4", "beta", ct.beta[i], i);
+        check_finite("mos4", "vto", ct.vto[i], i);
+        check_finite("mos4", "lambda", ct.lambda[i], i);
+        check_non_negative("mos4", "gamma", ct.gamma[i], i);
+        check_finite("mos4", "gamma", ct.gamma[i], i);
+        check_positive("mos4", "phi", ct.phi[i], i);
+        mos4_.sign[i] = ct.sign[i] < 0 ? -1 : 1;
+    }
+
     counts_.diodes = static_cast<std::int64_t>(nd);
     counts_.mos = static_cast<std::int64_t>(nm);
     counts_.bjt = static_cast<std::int64_t>(nb);
     counts_.behavioral = static_cast<std::int64_t>(nh);
+    counts_.spice_diodes = static_cast<std::int64_t>(nsd);
+    counts_.gummel_poon = static_cast<std::int64_t>(ng);
+    counts_.mos4 = static_cast<std::int64_t>(nc);
 
     // ---- union pattern: CSC by a counting sort over columns ---------------------
     // Footprint entries (row, col), ground dropped.
@@ -162,7 +298,8 @@ void Circuit::build(const CircuitSpec& spec) {
     std::vector<std::int32_t> entry_cols;
     const std::size_t expected = spec.g.rows.size() + spec.c.rows.size() + spec.gmin_stamps.rows.size() +
                                  static_cast<std::size_t>(node_count_) + kDiodeJ * nd + kMosJ * nm + kBjtJ * nb +
-                                 static_cast<std::size_t>(behavioral_.slot_ptr[nh]);
+                                 static_cast<std::size_t>(behavioral_.slot_ptr[nh]) + kSpiceDiodeJ * nsd +
+                                 kGummelPoonJ * ng + kMosCardJ * nc;
     entry_rows.reserve(expected);
     entry_cols.reserve(expected);
     auto add_entry = [&entry_rows, &entry_cols](std::int64_t row, std::int64_t col) {
@@ -207,6 +344,31 @@ void Circuit::build(const CircuitSpec& spec) {
         const std::int32_t terms[3] = {bjt_.collector[i], bjt_.base[i], bjt_.emitter[i]};
         for (std::int32_t r : terms) {
             for (std::int32_t c : terms) {
+                add_entry(r, c);
+            }
+        }
+    }
+    for (std::size_t i = 0; i < nsd; ++i) {
+        const std::int32_t a = spice_diodes_.anode[i];
+        const std::int32_t k = spice_diodes_.cathode[i];
+        for (std::int32_t r : {a, k}) {
+            for (std::int32_t c : {a, k}) {
+                add_entry(r, c);
+            }
+        }
+    }
+    for (std::size_t i = 0; i < ng; ++i) {
+        const std::int32_t terms[3] = {gummel_poon_.collector[i], gummel_poon_.base[i], gummel_poon_.emitter[i]};
+        for (std::int32_t r : terms) {
+            for (std::int32_t c : terms) {
+                add_entry(r, c);
+            }
+        }
+    }
+    for (std::size_t i = 0; i < nc; ++i) {
+        const std::int32_t cols[4] = {mos4_.drain[i], mos4_.gate[i], mos4_.source[i], mos4_.bulk[i]};
+        for (std::int32_t r : {mos4_.drain[i], mos4_.source[i]}) {
+            for (std::int32_t c : cols) {
                 add_entry(r, c);
             }
         }
@@ -297,6 +459,25 @@ void Circuit::build(const CircuitSpec& spec) {
             add_junction(b, c, devices::kBjtVt, bjt_.is[i]);
         }
     }
+    // Model-card junctions (phase M2) after every Level-1 one, so the limiter visits the
+    // junctions of existing circuits in the same order as before.
+    for (std::size_t i = 0; i < nsd; ++i) {
+        add_junction(spice_diodes_.anode[i], spice_diodes_.cathode[i], spice_diodes_.n[i] * devices::kCardVt,
+                     spice_diodes_.is[i]);
+    }
+    for (std::size_t i = 0; i < ng; ++i) {
+        const std::int32_t c = gummel_poon_.collector[i];
+        const std::int32_t b = gummel_poon_.base[i];
+        const std::int32_t e = gummel_poon_.emitter[i];
+        const double is = gummel_poon_.params[i].is;
+        if (gummel_poon_.sign[i] < 0) {
+            add_junction(e, b, devices::kCardVt, is);
+            add_junction(c, b, devices::kCardVt, is);
+        } else {
+            add_junction(b, e, devices::kCardVt, is);
+            add_junction(b, c, devices::kCardVt, is);
+        }
+    }
 
     // ---- device slots ---------------------------------------------------------
     diodes_.slots.resize(kDiodeJ * nd);
@@ -341,11 +522,50 @@ void Circuit::build(const CircuitSpec& spec) {
         }
     }
 
+    spice_diodes_.slots.resize(kSpiceDiodeJ * nsd);
+    for (std::size_t i = 0; i < nsd; ++i) {
+        const std::int32_t a = spice_diodes_.anode[i];
+        const std::int32_t k = spice_diodes_.cathode[i];
+        std::int32_t* s = &spice_diodes_.slots[kSpiceDiodeJ * i];
+        s[0] = key_slot(a, a);
+        s[1] = key_slot(a, k);
+        s[2] = key_slot(k, a);
+        s[3] = key_slot(k, k);
+    }
+    gummel_poon_.slots.resize(kGummelPoonJ * ng);
+    for (std::size_t i = 0; i < ng; ++i) {
+        const std::int32_t terms[3] = {gummel_poon_.collector[i], gummel_poon_.base[i], gummel_poon_.emitter[i]};
+        std::int32_t* s = &gummel_poon_.slots[kGummelPoonJ * i];
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                s[3 * r + c] = key_slot(terms[r], terms[c]);
+            }
+        }
+    }
+    mos4_.slots.resize(kMosCardJ * nc);
+    for (std::size_t i = 0; i < nc; ++i) {
+        const std::int32_t cols[4] = {mos4_.drain[i], mos4_.gate[i], mos4_.source[i], mos4_.bulk[i]};
+        const std::int32_t rows[2] = {mos4_.drain[i], mos4_.source[i]};
+        std::int32_t* s = &mos4_.slots[kMosCardJ * i];
+        for (int r = 0; r < 2; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                s[4 * r + c] = key_slot(rows[r], cols[c]);
+            }
+        }
+    }
+
     // ---- assembly map ------------------------------------------------------------
     AssemblyMap& m = map_;
     const std::int64_t D = counts_.total();
-    m.class_begin = {0, counts_.diodes, counts_.diodes + counts_.behavioral,
-                     counts_.diodes + counts_.behavioral + counts_.mos, D};
+    {
+        const std::int64_t sizes[kDeviceClasses] = {counts_.diodes,       counts_.behavioral,   counts_.mos,
+                                                    counts_.bjt,          counts_.spice_diodes, counts_.gummel_poon,
+                                                    counts_.mos4};
+        m.class_begin[0] = 0;
+        for (std::size_t c = 0; c < static_cast<std::size_t>(kDeviceClasses); ++c) {
+            m.class_begin[c + 1] = m.class_begin[c] + sizes[c];
+        }
+    }
     m.f_offset.assign(static_cast<std::size_t>(D) + 1, 0);
     m.j_offset.assign(static_cast<std::size_t>(D) + 1, 0);
     // Scratch targets in device order; -1 for ground.
@@ -353,9 +573,10 @@ void Circuit::build(const CircuitSpec& spec) {
     std::vector<std::int32_t> j_target;
     std::vector<std::int8_t> f_group;
     std::vector<std::int8_t> j_group;
-    const std::size_t f_total = kDiodeF * nd + kBehavioralF * nh + kMosF * nm + kBjtF * nb;
-    const std::size_t j_total =
-        kDiodeJ * nd + static_cast<std::size_t>(behavioral_.slot_ptr[nh]) + kMosJ * nm + kBjtJ * nb;
+    const std::size_t f_total = kDiodeF * nd + kBehavioralF * nh + kMosF * nm + kBjtF * nb + kSpiceDiodeF * nsd +
+                                kGummelPoonF * ng + kMosCardF * nc;
+    const std::size_t j_total = kDiodeJ * nd + static_cast<std::size_t>(behavioral_.slot_ptr[nh]) + kMosJ * nm +
+                                kBjtJ * nb + kSpiceDiodeJ * nsd + kGummelPoonJ * ng + kMosCardJ * nc;
     f_target.reserve(f_total);
     f_group.reserve(f_total);
     j_target.reserve(j_total);
@@ -392,6 +613,17 @@ void Circuit::build(const CircuitSpec& spec) {
         push_device(DeviceClass::Bjt, {bjt_.collector[i], bjt_.base[i], bjt_.emitter[i]}, &bjt_.slots[kBjtJ * i],
                     kBjtJ);
     }
+    for (std::size_t i = 0; i < nsd; ++i) {
+        push_device(DeviceClass::SpiceDiode, {spice_diodes_.anode[i], spice_diodes_.cathode[i]},
+                    &spice_diodes_.slots[kSpiceDiodeJ * i], kSpiceDiodeJ);
+    }
+    for (std::size_t i = 0; i < ng; ++i) {
+        push_device(DeviceClass::GummelPoon, {gummel_poon_.collector[i], gummel_poon_.base[i], gummel_poon_.emitter[i]},
+                    &gummel_poon_.slots[kGummelPoonJ * i], kGummelPoonJ);
+    }
+    for (std::size_t i = 0; i < nc; ++i) {
+        push_device(DeviceClass::MosCard, {mos4_.drain[i], mos4_.source[i]}, &mos4_.slots[kMosCardJ * i], kMosCardJ);
+    }
 
     // Stable counting sort of scratch entries by target. Scratch entries are in
     // device order and device classes are laid out in assembly-group order, so
@@ -424,7 +656,8 @@ void Circuit::build(const CircuitSpec& spec) {
     build_gather(f_target, f_group, static_cast<std::size_t>(n), m.f);
     build_gather(j_target, j_group, nnz, m.j);
     m.groups_present = static_cast<int>(counts_.diodes + counts_.behavioral > 0) +
-                       static_cast<int>(counts_.mos > 0) + static_cast<int>(counts_.bjt > 0);
+                       static_cast<int>(counts_.mos > 0) + static_cast<int>(counts_.bjt > 0) +
+                       static_cast<int>(counts_.spice_diodes + counts_.gummel_poon + counts_.mos4 > 0);
 }
 
 std::int32_t Circuit::slot(std::int32_t row, std::int32_t col) const noexcept {

@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import numpy as np
 
+import math
+
 from .api.contracts import ComponentRecord
 from .api.contracts import AnalysisMode, AnalysisOptions, MnaProblem, SimulationResult
+from .card_devices import card_kind
 from .errors import error_handler
 from .mna_builder import build_mna_problem
 from .solvers import (
     _level1_bjt_currents_and_derivatives,
     _level1_mos_current_and_derivatives,
+    _native_core,
     compile_time_source_func,
     describe_krylov_choice,
+    has_card_devices,
     is_nonlinear,
     solve_ac,
     solve_dc_nr,
@@ -284,9 +289,112 @@ def _mos_level1_operating_point(component: ComponentRecord, problem: MnaProblem,
     }
 
 
+def _finite_or_none(value: float) -> float | None:
+    """A float for the response, ``None`` for inf/NaN (the JSON response rejects non-finite numbers)."""
+
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _card_operating_points(problem: MnaProblem, solution: np.ndarray) -> list[dict[str, object]]:
+    """Operating points of the model-card devices, in component order (``_core.operating_points``).
+
+    The native kernels report the intrinsic device (internal nodes of RS/RB/RE/RC); terminal
+    currents equal the intrinsic ones because the series resistances carry them unchanged.
+    Non-finite values (``rpi`` of a device with no base conductance, ``bv_eff`` without
+    breakdown) are reported as ``None``.
+    """
+
+    entries = problem.metadata.get("card_devices") or []
+    circuit = problem.native
+    if not entries or circuit is None:
+        return [
+            {"name": entry.get("name"), "type": entry.get("type"), "model": entry.get("model"), "region": "n/a"}
+            for entry in entries
+        ]
+    core = _native_core()
+    x = np.ascontiguousarray(np.asarray(solution, dtype=float).reshape(-1))
+    op = core.operating_points(circuit, x)
+    index = {"spice_diode": 0, "gummel_poon": 0, "mos4": 0}
+    by_name = {component.name: component for component in problem.components}
+    points: list[dict[str, object]] = []
+    for entry in entries:
+        kind = entry["kind"]
+        i = index[kind]
+        index[kind] += 1
+        table = op[kind]
+        component = by_name.get(entry["name"])
+        point: dict[str, object] = {
+            "name": entry["name"],
+            "type": entry["type"],
+            "model": entry["model"],
+            "model_name": entry.get("model_name"),
+            "internal_nodes": list(entry.get("internal_nodes", [])),
+        }
+        if kind == "spice_diode":
+            point.update(
+                {
+                    "region": core.diode_region_names[int(table["region"][i])],
+                    "vd": float(table["vd"][i]),
+                    "id": float(table["id"][i]),
+                    "gd": float(table["gd"][i]),
+                    "bv_eff": _finite_or_none(table["bv_eff"][i]),
+                }
+            )
+        elif kind == "gummel_poon":
+            ic, ib = float(table["ic"][i]), float(table["ib"][i])
+            go = float(table["go"][i])
+            point.update(
+                {
+                    "region": core.bjt_region_names[int(table["region"][i])],
+                    "ic": ic,
+                    "ib": ib,
+                    "ie": float(table["ie"][i]),
+                    "beta_dc": _finite_or_none(ic / ib) if ib != 0.0 else None,
+                    "gm": float(table["gm"][i]),
+                    "rpi": _finite_or_none(table["rpi"][i]),
+                    "ro": _finite_or_none(1.0 / go) if abs(go) > 1e-30 else None,
+                }
+            )
+            if component is not None:
+                vc = _terminal_voltage(problem, solution, component.node1)
+                vb = _terminal_voltage(problem, solution, component.ctrl_node1)
+                ve = _terminal_voltage(problem, solution, component.node2)
+                point.update({"vc": vc, "vb": vb, "ve": ve, "vbe": vb - ve, "vbc": vb - vc, "vce": vc - ve})
+        else:
+            point.update(
+                {
+                    "region": core.mos_region_names[int(table["region"][i])],
+                    "ids": float(table["ids"][i]),
+                    "gm": float(table["gm"][i]),
+                    "gds": float(table["gds"][i]),
+                    "gmbs": float(table["gmbs"][i]),
+                    "dIds_dVs": float(table["d_source"][i]),
+                    "vth": float(table["vth"][i]),
+                }
+            )
+            if component is not None:
+                vd = _terminal_voltage(problem, solution, component.node1)
+                vg = _terminal_voltage(problem, solution, component.ctrl_node1)
+                vs = _terminal_voltage(problem, solution, component.node2)
+                bulk = component.node2 if component.ctrl_node2 is None else component.ctrl_node2
+                vb = _terminal_voltage(problem, solution, bulk)
+                point.update(
+                    {"vd": vd, "vg": vg, "vs": vs, "vb": vb, "vgs": vg - vs, "vds": vd - vs, "vbs": vb - vs}
+                )
+        points.append(point)
+    return points
+
+
 def _device_operating_points(problem: MnaProblem, solution: np.ndarray) -> list[dict[str, object]]:
     points: list[dict[str, object]] = []
+    card_points = iter(_card_operating_points(problem, solution)) if has_card_devices(problem) else None
     for component in problem.components:
+        if card_points is not None and card_kind(component) is not None:
+            point = next(card_points, None)
+            if point is not None:
+                points.append(point)
+            continue
         if component.type in {"QNPN", "QPNP"}:
             if component.metadata.get("model") == "level1":
                 points.append(_bjt_level1_operating_point(component, problem, solution))
@@ -302,7 +410,12 @@ def _device_operating_points(problem: MnaProblem, solution: np.ndarray) -> list[
 
 def _has_nonlinear_terms(problem: MnaProblem) -> bool:
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
-    return is_nonlinear(solver_f_str) or bool(problem.level1_mos_devices) or bool(problem.level1_bjt_devices)
+    return (
+        is_nonlinear(solver_f_str)
+        or bool(problem.level1_mos_devices)
+        or bool(problem.level1_bjt_devices)
+        or has_card_devices(problem)
+    )
 
 
 def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> SimulationResult:
@@ -312,7 +425,8 @@ def run_basic_analysis(problem: MnaProblem, options: AnalysisOptions) -> Simulat
     krylov_stats: list[dict[str, object]] | None = [] if options.use_krylov else None
     linear_kwargs = _linear_solver_kwargs(options, krylov_stats)
     solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
-    has_level1_devices = bool(problem.level1_mos_devices or problem.level1_bjt_devices)
+    # Model-card devices report their initial operating point in .tran like Level-1 ones.
+    has_level1_devices = bool(problem.level1_mos_devices or problem.level1_bjt_devices) or has_card_devices(problem)
 
     if options.mode == AnalysisMode.SHOW_MATRIX:
         metadata = _result_metadata(problem, options, krylov_stats)

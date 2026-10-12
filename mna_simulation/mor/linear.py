@@ -21,7 +21,6 @@ from ..solvers import (
     _problem_is_nonlinear,
     _time_sources,
     _transient_time_points,
-    is_nonlinear,
     solve_operating_point,
     solve_transient,
 )
@@ -134,12 +133,11 @@ def _linearized_operands(
 ) -> tuple[native_mor.MorOperands, dict[str, object]]:
     """``(operands, metadata)``: ``G + J(x_op)`` (or ``G``) and ``C`` in the circuit pattern, plus the op metadata."""
 
-    solver_f_str = problem.solver_f_str if problem.solver_f_str is not None else problem.f_str
     level1_mos_devices = problem.level1_mos_devices
     level1_bjt_devices = problem.level1_bjt_devices
     metadata: dict[str, object] = {}
 
-    if is_nonlinear(solver_f_str) or level1_mos_devices or level1_bjt_devices:
+    if _problem_is_nonlinear(problem):
         dc_solution = solve_operating_point(
             problem,
             problem.b_dc,
@@ -159,7 +157,9 @@ def _linearized_operands(
                     "labels": problem.metadata["labels"],
                     "values": np.asarray(dc_solution).flatten().tolist(),
                 },
-                "linearized_device_count": len(level1_mos_devices) + len(level1_bjt_devices),
+                "linearized_device_count": len(level1_mos_devices)
+                + len(level1_bjt_devices)
+                + len(problem.metadata.get("card_devices", ())),
             }
         )
         return native_mor.circuit_operands(circuit, g_values=g_linearized), metadata

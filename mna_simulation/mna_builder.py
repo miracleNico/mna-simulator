@@ -10,6 +10,7 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 from .api.contracts import CircuitIR, ComponentRecord, IndexMap, MnaProblem
+from .card_devices import CardDevice, prepare_card_devices
 from .device_models import (
     diode_current_expression,
     mos_level1_current_expression,
@@ -124,11 +125,23 @@ def _normalize_components(components: list[ComponentRecord]) -> list[ComponentRe
 _BRANCH_TYPES = frozenset({"V", "VCVS", "CCVS", "L"})
 
 
-def _build_index_map(components: list[ComponentRecord]) -> IndexMap:
+def _build_index_map(components: list[ComponentRecord], card_devices: list[CardDevice] | None = None) -> IndexMap:
+    """Node and branch numbering: sorted external nodes, then internal nodes, then branch currents.
+
+    ``card_devices`` (``card_devices.prepare_card_devices``) contributes the internal nodes of
+    the model-card series resistances (``D1#a``, ``Q1#b`` ...) in component order, numbered
+    after the sorted external nodes and before the branch currents (plan 3.4). The substrate
+    node (``ctrl_node2``) of a Gummel-Poon BJT is ignored in phase M2, so it only becomes an
+    unknown when another component uses it.
+    """
+
     node_names: set[str] = set()
     add_node = node_names.add
     branch_names: list[str] = []
     seen_branch_names: set[str] = set()
+    no_substrate = (
+        {id(device.component) for device in card_devices if device.kind == "gummel_poon"} if card_devices else None
+    )
 
     for component in components:
         node = component.node1
@@ -141,7 +154,7 @@ def _build_index_map(components: list[ComponentRecord]) -> IndexMap:
         if node:
             add_node(node)
         node = component.ctrl_node2
-        if node:
+        if node and (no_substrate is None or id(component) not in no_substrate):
             add_node(node)
 
         if component.type in _BRANCH_TYPES:
@@ -156,6 +169,22 @@ def _build_index_map(components: list[ComponentRecord]) -> IndexMap:
 
     node_names.discard("0")
     sorted_nodes = sorted(node_names)
+    if card_devices:
+        internal_owner: dict[str, str] = {}
+        for device in card_devices:
+            for internal in device.internal.values():
+                if internal in node_names:
+                    error_handler(
+                        f"NETLIST_FATAL: Internal node '{internal}' of '{device.name}' collides with a circuit node "
+                        f"of the same name."
+                    )
+                if internal in internal_owner:
+                    error_handler(
+                        f"NETLIST_FATAL: Duplicate component name '{device.name}' (internal node '{internal}'). "
+                        f"Use unique names or rename via '<name>:<TYPE>'."
+                    )
+                internal_owner[internal] = device.name
+        sorted_nodes.extend(internal_owner)
     num_nodes = len(sorted_nodes)
     node_to_index = {name: index for index, name in enumerate(sorted_nodes)}
     branch_to_index = {name: index + num_nodes for index, name in enumerate(branch_names)}
@@ -269,15 +298,29 @@ def _compile_native(
     behavioral_devices: list[dict[str, Any]],
     level1_mos_devices: list[dict[str, Any]],
     level1_bjt_devices: list[dict[str, Any]],
+    card_tables: dict[str, list[dict[str, Any]]] | None = None,
+    node_count: int | None = None,
 ) -> Any | None:
     """Compile the native circuit; ``None`` when a behavioral expression cannot be compiled.
 
     The native ``G`` excludes the gmin stamps (they go to the unit gmin table)
     so one compiled circuit serves every gmin step; ``g_gmin_records`` lists the
     records of those stamps in ``g_stamps`` (empty when ``gmin <= 0``).
+    ``card_tables`` holds the model-card device dictionaries per native table
+    (``spice_diodes``, ``gummel_poon``, ``mos4``); circuits with any pass their
+    ``node_count`` (internal nodes included), the others let the core infer it.
     """
 
-    from .native.circuit import behavioral_table, bjt_table, build_circuit, diode_table, mos_table
+    from .native.circuit import (
+        behavioral_table,
+        bjt_table,
+        build_circuit,
+        diode_table,
+        gummel_poon_table,
+        mos4_table,
+        mos_table,
+        spice_diode_table,
+    )
     from .native.expressions import compile_expression
 
     try:
@@ -289,6 +332,17 @@ def _compile_native(
         # Same timing as the reference core: the error surfaces when an analysis
         # evaluates the expression (solvers.compile_nl_functions), not at build time.
         return None
+    card_kwargs: dict[str, Any] = {}
+    if card_tables:
+        for key, make_table in (
+            ("spice_diodes", spice_diode_table),
+            ("gummel_poon", gummel_poon_table),
+            ("mos4", mos4_table),
+        ):
+            devices = card_tables.get(key)
+            if devices:
+                card_kwargs[key] = make_table(devices)
+        card_kwargs["node_count"] = node_count
     return build_circuit(
         size,
         gmin=gmin,
@@ -307,6 +361,7 @@ def _compile_native(
         )
         if behavioral_devices
         else None,
+        **card_kwargs,
     )
 
 
@@ -379,7 +434,9 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
     # and rewrite their referenced node names to the canonical ground "0".
     components = _normalize_components(circuit.components)
 
-    index_map = _build_index_map(components)
+    # Model-card devices (plan 3.2, phase M2): parsed card values, internal nodes.
+    card_devices = prepare_card_devices(components)
+    index_map = _build_index_map(components, card_devices)
     num_nodes = len(index_map.node_names)
     num_branches = len(index_map.branch_names)
     size = num_nodes + num_branches
@@ -417,6 +474,9 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
     x_exprs: list[str] | None = None
     # Level-1 MOS parameters per distinct parameter strings (built once per set).
     mos_parameters: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+    # Model-card devices by component identity, and their native table rows.
+    card_lookup = {id(device.component): device for device in card_devices} if card_devices else None
+    card_tables: dict[str, list[dict[str, Any]]] = {"spice_diodes": [], "gummel_poon": [], "mos4": []}
 
     def get_branch_index(branch_name: str) -> int:
         if branch_name not in branch_to_index:
@@ -459,10 +519,91 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
         entry_g(out_n, ctrl_p, -gain)
         entry_g(out_n, ctrl_n, gain)
 
+    def stamp_card_device(device: CardDevice, j: int, k: int) -> None:
+        """Linear parts (series resistances, constant capacitors, gmin) and the native table row."""
+
+        component = device.component
+        params = device.params
+        name = component.name
+        if device.kind == "spice_diode":
+            junction_anode = j
+            internal = device.internal.get("a")
+            if internal is not None:
+                junction_anode = node_index[internal]
+                stamp_g(j, junction_anode, 1.0 / params["rs"])
+            stamp_c(junction_anode, k, params["cjo"])
+            _add_nonlinear_current(f_str, junction_anode, k, f"I_spice_diode({name})")
+            card_tables["spice_diodes"].append(
+                {
+                    "name": name,
+                    "anode": junction_anode,
+                    "cathode": k,
+                    "is": params["is"],
+                    "n": params["n"],
+                    "bv": params["bv"],
+                    "ibv": params["ibv"],
+                }
+            )
+            stamp_gmin(junction_anode, k)
+            return
+        if device.kind == "gummel_poon":
+            terminals = {"c": j, "b": get_index(component.ctrl_node1), "e": k}
+            intrinsic = dict(terminals)
+            for terminal, key in (("b", "rb"), ("c", "rc"), ("e", "re")):
+                internal = device.internal.get(terminal)
+                if internal is not None:
+                    intrinsic[terminal] = node_index[internal]
+                    stamp_g(terminals[terminal], intrinsic[terminal], 1.0 / params[key])
+            collector, base, emitter = intrinsic["c"], intrinsic["b"], intrinsic["e"]
+            stamp_c(base, emitter, params["cje"])
+            stamp_c(base, collector, params["cjc"])
+            _add_symbolic(f_str, collector, f"Ic_gummel_poon({name})")
+            _add_symbolic(f_str, base, f"Ib_gummel_poon({name})")
+            _add_symbolic(f_str, emitter, f"Ie_gummel_poon({name})")
+            row = {"name": name, "type": component.type, "collector": collector, "base": base, "emitter": emitter}
+            for key in ("is", "bf", "nf", "br", "nr", "vaf", "var", "ikf", "ikr", "ise", "ne", "isc", "nc"):
+                row[key] = params[key]
+            card_tables["gummel_poon"].append(row)
+            stamp_gmin(base, emitter)
+            stamp_gmin(base, collector)
+            return
+        # Four-terminal card MOS; a three-node instance has its bulk on the source.
+        drain, source = j, k
+        gate = get_index(component.ctrl_node1)
+        bulk = source if component.ctrl_node2 is None else get_index(component.ctrl_node2)
+        stamp_c(gate, source, params["cgs"])
+        stamp_c(gate, drain, params["cgd"])
+        stamp_c(gate, bulk, params["cgb"])
+        _add_nonlinear_current(f_str, drain, source, f"Id_spice_level1({name})")
+        card_tables["mos4"].append(
+            {
+                "name": name,
+                "type": component.type,
+                "drain": drain,
+                "gate": gate,
+                "source": source,
+                "bulk": bulk,
+                "beta": params["beta"],
+                "vto": params["vto"],
+                "lambda": params["lambda"],
+                "gamma": params["gamma"],
+                "phi": params["phi"],
+            }
+        )
+        stamp_gmin(drain, source)
+        if bulk != source:
+            stamp_gmin(bulk, source)
+
     for component in components:
         comp_type = component.type
         j = get_index(component.node1)
         k = get_index(component.node2)
+
+        if card_lookup is not None:
+            card_device = card_lookup.get(id(component))
+            if card_device is not None:
+                stamp_card_device(card_device, j, k)
+                continue
 
         if comp_type == "NMOS" or comp_type == "PMOS":
             gate = get_index(component.ctrl_node1)
@@ -749,6 +890,9 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
         "nonlinear_mos_devices": len(level1_mos_devices),
         "nonlinear_bjt_devices": len(level1_bjt_devices),
     }
+    if card_devices:
+        # JSON-safe: name, type, equation set, card name, native table, internal nodes.
+        metadata["card_devices"] = [device.summary() for device in card_devices]
     native = _compile_native(
         size,
         gmin,
@@ -760,6 +904,8 @@ def build_mna_problem(circuit: CircuitIR, gmin: float = 0.0) -> MnaProblem:
         behavioral_devices,
         level1_mos_devices,
         level1_bjt_devices,
+        card_tables if card_devices else None,
+        num_nodes,
     )
 
     return MnaProblem(
