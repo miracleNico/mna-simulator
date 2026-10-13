@@ -11,6 +11,17 @@ The project includes:
 - Physical Level-1 BJT/MOSFET defaults, plus opt-in small-signal compatibility models.
 - Sparse Krylov-capable solver path for large linear transient circuits.
 
+## Recent Changes
+
+Newest first. Phases refer to `HIERARCHY_AND_MODELS_PLAN.md` (H, M), `MIXED_SIGNAL.md` (D) and `CPP_MIGRATION_PLAN.md` (P).
+
+- **2026-10-13: digital stimulus and table sources (D1).** `PULSE` and `PWL` run as native table sources with exact linear ramps, and every corner lands on the `.tran` grid (`breakpoints` option, on by default). Requests can drive nodes with waveforms sent as arrays (`stimuli`; CLI `--stimulus FILE.json`), and `mna_simulation.stimulus` builds bit streams and USB low-/full-speed packets. See [API](#api) and `MIXED_SIGNAL.md`.
+- **2026-10-12: SPICE netlists and vendor model cards (M1, M2, M3).** The parser reads `.model` cards, `.subckt`/`X` macromodels, `.param` and `{...}` expressions, `.include`/`.lib` (CLI `--lib`), `.global`, `+` continuations and the SPICE source forms. SPICE diodes, Gummel-Poon BJTs and Level-1 card MOSFETs (LEVEL 1-3 cards, body effect) evaluate the card parameters. End-to-end tests run published cards (1N4148, 2N2222/2N2907, BS170/2N7000, an op-amp macromodel). See [Netlist dialect](#netlist-dialect) and [Vendor model cards](#vendor-model-cards).
+- **2026-10-12: hierarchy editing (H1).** Make subcircuit from a selection (`Ctrl+Shift+G`), double-click to open an instance, `Alt+Up` and a breadcrumb bar to go back, ports owned by the entity's `NODE` markers, pin sides, inline hierarchy checks, and instantiate / duplicate / dissolve. The web app has a vitest suite (`npm test`).
+- **2026-10-12: Python core mode.** `MNA_CORE=python` (server) or `--core python` (CLI) runs the frozen pre-migration Python core behind the same API, for comparisons; the C++ core stays the default. See [Quick Start](#quick-start).
+- **2026-10-12: Windows performance baseline.** `benchmarks/results/baseline-windows.md` (idle 16-thread laptop, MSVC Release) joins the Linux baseline: every unit at parity, every perf-gate floor met, the 205-harmonic HB mixer in 0.39 s at one thread and 0.30 s at four.
+- **2026-10-11: native C++ core (P0-P6).** Every analysis moved from Python to `mna_simulation._core` and runs 3x to several hundred times faster. This also brought a machine-wide thread budget with a Threads control (`num_threads`) and strict option checking (HTTP 400). Convergence aids engage only when the plain iteration fails: junction limiting, gmin continuation, node-to-ground gmin and a damped HB Newton. Behaviour changes are listed in `USER_GUIDE.md` ("What Changed With The Native Core"). Wheels for Linux and Windows run the full test suite on Python 3.12 and 3.13.
+
 ## Highlights
 
 - **Single validation path:** schematic JSON is flattened to canonical netlist text, then parsed by the same parser used for raw netlists.
@@ -21,6 +32,7 @@ The project includes:
 - **Harmonic balance workflow:** `.hb <harmonics> [time_window]` supports harmonic-domain results and optional reconstructed time-domain waveforms.
 - **Close-tone HB demo:** Frequency Domain Demos includes a nonlinear diode mixer driven by 1 GHz and 1.005 GHz tones, showing the 5 MHz beat/difference product in a high-Q envelope tank that would need 40+ beat periods of picosecond-step transient settling.
 - **Krylov subspace solver controls:** API/UI requests can use automatic method selection or explicitly choose Arnoldi/GMRES, MINRES/CR, or Conjugate Gradient for full-system iterative solves. Auto Krylov rank resolves after MNA assembly as `ceil(0.5 * matrix_dimension)`.
+- **SPICE netlists and vendor models:** paste vendor `.model` cards and `.subckt` macromodels (with `.param`, `{...}` expressions and `.include`/`.lib`) into raw netlist mode; SPICE diode, Gummel-Poon BJT and Level-1 card MOS equations use the card parameters.
 - **Digital stimulus from Python:** `PULSE`, `PWL` and waveforms sent as arrays (`stimuli`) run as native table sources (binary-search lookup, up to 10^6 points) whose corners land exactly on the transient grid; `mna_simulation.stimulus` builds bit streams and USB low-/full-speed packets (`MIXED_SIGNAL.md`).
 - **Selected-output MOR:** optional model-order reduction keeps only cared outputs. Linear `.ac` and linearized `.tran` use output-aware rational Krylov projection; nonlinear `.tran` can use TPWL/POD with an in-memory ROM cache.
 - **Sparse large-circuit path:** every direct solve runs through SuiteSparse KLU on the circuit's sparse pattern; linear transients reuse one factorization of `G + C/h` while the step size is unchanged, and linear transient Krylov runs use the CSR Backward-Euler operator.
@@ -35,6 +47,8 @@ The project includes:
 ## Repository Layout
 
 - `mna_simulation/`: Python parser, MNA builder, solver facades, schematic pipeline, API service, and backend adapters.
+- `mna_simulation/spice/`: SPICE-dialect front end (model cards, subcircuits, parameters and `{...}` expressions, libraries, source forms), flattened into the usual component records; `mna_simulation/card_devices.py`: the model-card devices (SPICE diode, Gummel-Poon BJT, card MOS).
+- `mna_simulation/api/reference_service.py`: Python core mode (`MNA_CORE=python`) on the frozen oracle.
 - `mna_simulation/stimulus/`: Python-defined digital stimulus (`DigitalSignal`, USB packet builder); `mna_simulation/table_sources.py`: table sources and the breakpoint-aware transient grid.
 - `mna_simulation/native/`: the Python side of the native core: import guard, circuit tables, expression compiler, linear-algebra and MOR facades, and the thread budget.
 - `cpp/`: C++17 sources of the extension `mna_simulation._core` (headers, sources, nanobind bindings, doctest unit tests, vendored Eigen/SuiteSparse/doctest).
@@ -44,6 +58,8 @@ The project includes:
 - `benchmarks/`: benchmark entry points, the Python-vs-C++ comparison harness, the concurrent-request benchmark, workload netlists, committed results, and performance research prototypes.
 - `CPP_MIGRATION_PLAN.md`: plan, edge-case rulings, and status of the move of the numerical core to C++.
 - `PERFORMANCE_PLAN.md`: measured performance review, multithreading plan, C++ migration research, and the status of what landed.
+- `HIERARCHY_AND_MODELS_PLAN.md`: hierarchy UX, SPICE dialect and vendor model plan (phases H, M) with its status.
+- `MIXED_SIGNAL.md`: mixed-signal assessment, the digital-stimulus design (phase D1) and what landed.
 - `legacy/`: older simulator snapshots kept for comparison.
 - `USER_GUIDE.md`: user-facing web-app guide mirrored by the in-app Help dialog.
 - `DESIGN_AUDIT.md`: front end design audit, changes made, and LTspice feature comparison.
@@ -57,7 +73,7 @@ Every analysis runs in the compiled extension `mna_simulation._core`, built from
 - Sparse direct solves with SuiteSparse KLU (with AMD, COLAMD, and BTF); dense linear algebra, complex arithmetic, and SVD with Eigen 3.4. Both are vendored, unmodified, under `cpp/third_party/` (versions, licenses, and the LGPL note for the statically linked KLU/BTF are in `cpp/third_party/README.md`), so a build downloads nothing.
 - Deterministic internal threading: each call starts its own `std::thread` workers for the threads it was granted (no OpenMP, no process-wide pool) and splits work into chunks that depend only on the item count, so results are bitwise identical for every thread count (`tests/test_determinism.py`). Parallel work: device evaluation from 2048 devices, AC sweep frequencies, harmonic-balance samples and block factorizations, the reduced MOR AC sweep, MOR shift factorizations from 2048 unknowns, and Krylov matrix-vector products from 4096 unknowns. A transient steps sequentially; below those sizes a call runs on one thread whatever it was granted.
 - The GIL is released for the whole native region of a call. FUNC time sources and `B` behavioral sources are parsed by SymPy once in Python and compiled to a bytecode that the core evaluates.
-- The extension is mandatory: there is no Python numerical fallback. The pure-Python core as of the migration start survives only as the test oracle `tests/reference/mna_reference`, which never ships.
+- The extension is mandatory: there is no automatic Python numerical fallback. The pure-Python core as of the migration start survives as the test oracle `tests/reference/mna_reference`, which never ships in a wheel; from a source checkout it can be run on purpose with `MNA_CORE=python` ([Quick Start](#quick-start)).
 
 Build requirements (Linux and Windows are the supported, CI-tested platforms):
 
@@ -97,7 +113,7 @@ The server runs every analysis in the native C++ core. To compare with the simul
 MNA_CORE=python python -m uvicorn app.server.main:app --host 127.0.0.1 --port 8010
 ```
 
-In PowerShell, run `$env:MNA_CORE="python"` first. Python mode runs the parser, MNA builder and solvers of `tests/reference/mna_reference`, the pre-migration package kept as the test oracle, behind the same API. Requests are validated by the same option rules as in the default mode (HTTP 400 for the same inputs), each run uses one thread, and results report `core_backend: "python"` and `core_version: "python-reference@e5172cb"`. Pre-migration behaviour is kept as it was, including what `USER_GUIDE.md` lists as changed with the native core. The oracle is not shipped in wheels, so this mode needs a source checkout (`pip install -e .`). Expect analyses to run roughly 5x to 300x slower, depending on the analysis (`benchmarks/results/baseline-*.md`). The startup log line `MNA core: ...` and `GET /health` (`core_backend`) show which core is running.
+In PowerShell, run `$env:MNA_CORE="python"` first. Python mode runs the parser, MNA builder and solvers of `tests/reference/mna_reference`, the pre-migration package kept as the test oracle, behind the same API. Requests are validated by the same option rules as in the default mode (HTTP 400 for the same inputs), each run uses one thread, and results report `core_backend: "python"` and `core_version: "python-reference@e5172cb"`. Pre-migration behaviour is kept as it was, including what `USER_GUIDE.md` lists as changed with the native core. The old core predates the SPICE dialect, model cards and table sources: such netlists fail with a netlist error (HTTP 400) and request `stimuli` are refused (`NETLIST_FATAL`). The oracle is not shipped in wheels, so this mode needs a source checkout (`pip install -e .`). Expect analyses to run roughly 5x to 300x slower, depending on the analysis (`benchmarks/results/baseline-*.md`). The startup log line `MNA core: ...` and `GET /health` (`core_backend`) show which core is running.
 
 Start the frontend:
 
@@ -186,6 +202,7 @@ OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MNA_NUM_THREADS=4 python -m uvicorn app
 
 ## Environment Variables
 
+- `MNA_CORE`: numerical core of the server and the CLI, `cpp` (default, the native core) or `python` (the frozen pre-migration core, source checkouts only; [Quick Start](#quick-start)). Any other value stops the server at startup with a `ValueError`; the CLI's `--core` overrides it.
 - `MNA_NUM_THREADS`: size of the machine-wide thread budget (a positive integer, capped at `os.cpu_count()`; unset means the CPU count; an invalid value is ignored with a `RuntimeWarning`).
 - `MNA_HB_MAX_NNZ`: upper bound on the matrix entries a harmonic-balance run may store (default `3e7`, the core's `HB_DEFAULT_MAX_NNZ`; any positive number such as `5e7` or `250000`; an invalid value is ignored with a `RuntimeWarning`). A larger system fails before anything is allocated with `HB_ERROR` "HB system too large (N=..., nnz=...); reduce harmonics". The HB dimension N = n (2H + 1) is also capped at 1e6.
 - `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`: set them to 1 for servers (above).

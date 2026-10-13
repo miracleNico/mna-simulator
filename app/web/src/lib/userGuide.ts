@@ -5,6 +5,16 @@ export type UserGuideSection = {
 
 export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
   {
+    title: "Recent Changes",
+    items: [
+      "Digital stimulus and fast edges (2026-10-13): PULSE and PWL sources run as exact piecewise-linear tables, and every corner is a time point of a .tran result, so short edges are never stepped over. From Python, mna_simulation.stimulus turns bits into waveforms (USB packets included) and sends them with a run as stimuli.",
+      "SPICE netlists and vendor model cards (2026-10-12): raw netlist mode accepts vendor .model cards, .subckt macromodels with X instances, .param values and {...} expressions, and the SPICE source forms. Diodes, BJTs and MOSFETs that name a card follow the SPICE diode, Gummel-Poon and Level-1 equations with the card's parameters.",
+      "Hierarchy editing (2026-10-12): Make subcircuit from a selection (Ctrl+Shift+G), double-click an instance to open it, Alt+Up or the breadcrumb bar to go back. Ports are the entity's NODE markers, each with a pin side, and instances are checked as you edit.",
+      "Python core mode (2026-10-12): a server started with MNA_CORE=python runs the pre-migration Python core, for comparing results and speed with the old simulator. It does not know the SPICE dialect, model cards or table sources. Result metadata and /health report the core as core_backend.",
+      "Native C++ core (2026-10-11): every analysis runs in a compiled core, 3x to several hundred times faster than before, with a Threads control. USER_GUIDE.md in the repository lists the behaviours that changed on purpose."
+    ]
+  },
+  {
     title: "Start From A Demo",
     items: [
       "Open Demo and choose an amplifier, frequency-domain circuit, SRAM array, or large RLC benchmark. The view zooms to fit the loaded schematic.",
@@ -62,7 +72,8 @@ export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
       "Threads in the Simulation panel sets how many worker threads a run may use. auto (the default) takes a fair share of what the server has free, but never more than the analysis can use (a small .op/.tran or harmonic-balance run takes one thread, an .ac sweep at most half its point count); a number is an upper limit. The list goes up to the server's thread budget.",
       "The server enforces one machine-wide budget (MNA_NUM_THREADS, default: the CPU count). Concurrent runs share it: a run waits while every thread is in use, so simultaneous requests divide the cores instead of oversubscribing them.",
       "After each run the status line shows the threads granted and the solver time, e.g. TRAN complete (ok) · 4 threads · 412 ms. The thread count changes speed only, never results.",
-      "Every analysis runs in the native core and uses the granted threads for device evaluation, frequency sweeps and harmonic-balance assembly; circuits below a few thousand devices gain nothing from extra threads, so auto keeps them free for other runs. NumPy/SciPy BLAS is always kept to one thread per run."
+      "Every analysis runs in the native core and uses the granted threads for device evaluation, frequency sweeps and harmonic-balance assembly; circuits below a few thousand devices gain nothing from extra threads, so auto keeps them free for other runs. NumPy/SciPy BLAS is always kept to one thread per run.",
+      "On a server started with MNA_CORE=python every run uses the pre-migration Python core on one thread, whatever the Threads setting."
     ]
   },
   {
