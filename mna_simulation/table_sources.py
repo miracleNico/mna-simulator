@@ -30,12 +30,12 @@ import math
 import numbers
 import re
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
 
-from .api.contracts import ComponentRecord
+from .api.contracts import CircuitIR, ComponentRecord
 from .errors import error_handler
 from .native.expressions import MAX_TABLE_POINTS, TimeTable, table_placeholder
 from .utils import parse_value
@@ -51,11 +51,13 @@ __all__ = [
     "has_table_reference",
     "merge_breakpoints",
     "pulse_table",
+    "register_table",
     "resolve_tables",
     "stimulus_op_rhs",
     "stimulus_records",
+    "stimulus_table_of",
     "table_spec",
-    "table_source_terms",
+    "with_stimuli",
 ]
 
 #: ``MnaProblem.metadata`` key of the table specs (index k = placeholder ``__table_k``).
@@ -236,38 +238,18 @@ def table_spec(component: ComponentRecord) -> TableSpec | None:
     return None
 
 
-def table_source_terms(
-    component: ComponentRecord, spec: TableSpec, tables: list[TableSpec]
-) -> tuple[float, complex, str]:
-    """``(dc, ac phasor, time expression)`` of a table source; appends ``spec`` to ``tables``.
+def register_table(tables: list[TableSpec], spec: TableSpec) -> str:
+    """Append ``spec`` to the builder's table list and return its placeholder ``__table_k(t)``."""
 
-    The time expression is the placeholder of the new table minus the DC value, so
-    ``b_dc + b_time(t)`` is the waveform (the SPICE-form contract of plan 3.2: ``.op``
-    uses the DC value, ``.ac`` the ``ac_mag``/``ac_phase`` phasor). A request stimulus
-    has no DC or AC part.
-    """
-
-    index = len(tables)
     tables.append(spec)
-    placeholder = table_placeholder(index)
-    metadata = component.metadata or {}
-    if isinstance(metadata.get(STIMULUS_KEY), TimeTable):
-        return 0.0, 0j, placeholder
-    subtype = (component.subtype or "").upper()
-    dc = 0.0 if subtype == "AC" or component.value in (None, "") else _number(component.value, "DC value", component.name)
-    ac = 0j
-    if "ac_mag" in metadata:
-        magnitude = _number(metadata["ac_mag"], "AC magnitude", component.name)
-        phase = math.radians(_number(metadata.get("ac_phase") or "0", "AC phase", component.name))
-        ac = complex(magnitude * math.cos(phase), magnitude * math.sin(phase)) if phase else complex(magnitude, 0.0)
-    if dc != 0.0:
-        return dc, ac, f"({placeholder} - {_literal(dc)})"
-    return dc, ac, placeholder
+    return table_placeholder(len(tables) - 1)
 
 
-def _literal(value: float) -> str:
-    text = repr(float(value))
-    return f"({text})" if text.startswith("-") else text
+def stimulus_table_of(component: ComponentRecord) -> TimeTable | None:
+    """The table of a request-stimulus record (``metadata["stimulus"]``), else ``None``."""
+
+    table = component.metadata.get(STIMULUS_KEY) if component.metadata else None
+    return table if isinstance(table, TimeTable) else None
 
 
 def has_table_reference(text: object) -> bool:
@@ -551,6 +533,15 @@ def stimulus_records(stimuli: Sequence[object] | None, components: Sequence[Comp
         )
         records.append(record)
     return records
+
+
+def with_stimuli(circuit: CircuitIR, stimuli: Sequence[object] | None) -> CircuitIR:
+    """``circuit`` with the validated request ``stimuli`` appended as table voltage sources."""
+
+    records = stimulus_records(stimuli, circuit.components)
+    if not records:
+        return circuit
+    return replace(circuit, components=[*circuit.components, *records])
 
 
 def public_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:

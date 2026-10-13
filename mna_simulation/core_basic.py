@@ -32,7 +32,7 @@ from .utils import parse_value
 def breakpoints_enabled(options: AnalysisOptions) -> bool:
     """The ``breakpoints`` option (default ``True``: table corners are merged into the transient grid)."""
 
-    return bool(getattr(options, "breakpoints", True))
+    return bool(options.breakpoints)
 
 
 def op_rhs(problem: MnaProblem) -> np.ndarray:

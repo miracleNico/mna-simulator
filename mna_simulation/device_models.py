@@ -8,6 +8,7 @@ import re
 
 from .api.contracts import ComponentRecord
 from .spice.sources import render_transient, source_terms
+from .table_sources import TableSpec, register_table, table_spec
 from .utils import parse_value
 
 V_T = "0.025"
@@ -19,15 +20,30 @@ def _periodize_time_symbol(expression: str, period: float) -> str:
     return re.sub(r"\bt\b", f"(np.mod(t, {period}))", expression)
 
 
-def source_expression(component: ComponentRecord) -> str:
+def _table_waveform(component: ComponentRecord, time_tables: list[TableSpec] | None) -> str | None:
+    """The table placeholder of a ``PULSE``/``PWL`` record (appending its spec), else ``None``."""
+
+    if time_tables is None or not component.metadata:
+        return None
+    spec = table_spec(component)
+    return None if spec is None else register_table(time_tables, spec)
+
+
+def source_expression(component: ComponentRecord, time_tables: list[TableSpec] | None = None) -> str:
     """Build the time-domain expression string for a source.
 
     SPICE forms (``PULSE``, ``PWL``, ``EXP`` and the parenthesised ``SIN``, recognised by
     their ``metadata``) render as piecewise-linear / exponential / sinusoidal expressions
-    of ``t`` (``spice.sources``); the dialect's own forms keep their expressions.
+    of ``t`` (``spice.sources``); the dialect's own forms keep their expressions. With
+    ``time_tables`` (the builder's list), ``PULSE`` and ``PWL`` (strictly increasing times)
+    become the native table placeholder ``__table_k(t)`` and their spec is appended
+    (``table_sources``, MIXED_SIGNAL.md phase D1).
     """
 
     subtype = (component.subtype or "").upper()
+    table = _table_waveform(component, time_tables)
+    if table is not None:
+        return table
     if component.metadata:
         waveform = render_transient(subtype, component.metadata)
         if waveform is not None:
@@ -63,15 +79,20 @@ def source_expression(component: ComponentRecord) -> str:
     return "0"
 
 
-def spice_source_terms(component: ComponentRecord) -> tuple[float, complex, str | None]:
+def spice_source_terms(
+    component: ComponentRecord, time_tables: list[TableSpec] | None = None
+) -> tuple[float, complex, str | None]:
     """``(dc, ac phasor, time expression or None)`` of a SPICE-form ``V``/``I`` record.
 
     A SPICE-form record is one with ``metadata`` (``DC x AC mag phase``, ``PULSE``,
     ``PWL``, ``EXP``, ``SIN(...)``); ``.op`` uses ``dc``, ``.ac`` the phasor, and
-    ``.tran``/``.hb`` ``dc`` plus the time expression (the waveform minus ``dc``).
+    ``.tran``/``.hb`` ``dc`` plus the time expression (the waveform minus ``dc``). With
+    ``time_tables``, a ``PULSE``/``PWL`` waveform is the table placeholder (see
+    :func:`source_expression`); ``dc`` and the phasor are the same either way.
     """
 
-    return source_terms((component.subtype or "").upper(), component.value, component.metadata)
+    subtype = (component.subtype or "").upper()
+    return source_terms(subtype, component.value, component.metadata, waveform=_table_waveform(component, time_tables))
 
 
 def diode_current_expression(component: ComponentRecord, j_expr: str, k_expr: str) -> str:

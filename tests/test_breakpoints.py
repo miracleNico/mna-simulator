@@ -15,7 +15,8 @@ import numpy as np
 import pytest
 
 from mna_simulation import native, solvers
-from mna_simulation.api.contracts import AnalysisMode, AnalysisOptions, CircuitIR, ComponentRecord
+from mna_simulation.api.contracts import AnalysisMode, AnalysisOptions, AnalysisRequest, CircuitIR, ComponentRecord
+from mna_simulation.api.service import SimulationService
 from mna_simulation.core_basic import run_basic_analysis
 from mna_simulation.errors import NetlistError
 from mna_simulation.mna_builder import build_mna_problem
@@ -94,10 +95,10 @@ def test_ramp_refinement_counts() -> None:
     on_ramp = grid[(grid >= 20.5e-9) & (grid <= 25.5e-9)]
     assert on_ramp.size >= 5
     assert grid.size == 51 + 2
-    # A flat segment shorter than the step is not a ramp: corners only.
+    # A flat segment shorter than the step is not a ramp: corners only. 10 ns and 11 ns replace
+    # the uniform points they coincide with (within the grid tolerance), 10.5 ns is the one new point.
     flat = _stimulus("VZ", "z", [10e-9, 10.5e-9, 11e-9], [1.0, 1.0, 1.0])
-    assert _run(_rc(flat), 50e-9, 1e-9).time.size == 51 + 1  # 10 ns is a uniform point; 10.5 ns and 11 ns ...
-    # ... 11 ns is a uniform point too: only 10.5 ns is new.
+    assert _run(_rc(flat), 50e-9, 1e-9).time.size == 51 + 1
 
 
 def test_breakpoints_false_restores_the_uniform_grid() -> None:
@@ -210,3 +211,29 @@ def test_tpwl_and_linear_mor_use_the_merged_grid() -> None:
     )
     result = run_basic_analysis(build_mna_problem(nonlinear), options)
     np.testing.assert_array_equal(result.waveform.time, _run(nonlinear, 100e-9, 1e-9).time)
+
+
+PULSE_NETLIST = "V1 a 0 PULSE(0 1 10.3n 0.5n 0.5n 20n 50n)\nR1 a b 1k\nC1 b 0 1p\n.tran 200n 2n\n"
+
+
+def test_the_breakpoints_option_through_the_service() -> None:
+    service = SimulationService()
+    merged = service.run_request(AnalysisRequest(netlist_text=PULSE_NETLIST))
+    uniform = service.run_request(AnalysisRequest(netlist_text=PULSE_NETLIST, options={"breakpoints": "off"}))
+    assert uniform.waveform["time"] == solvers._transient_time_points(parse_value("200n"), parse_value("2n")).tolist()
+    assert merged.metadata["time_points"] == len(merged.waveform["time"]) > uniform.metadata["time_points"] == 101
+    td = parse_value("10.3n")
+    assert td in merged.waveform["time"] and td + 50e-9 in merged.waveform["time"]
+    with pytest.raises(ValueError, match="breakpoints must be a boolean"):
+        service.run_request(AnalysisRequest(netlist_text=PULSE_NETLIST, options={"breakpoints": "maybe"}))
+
+
+def test_output_max_points_decimates_the_merged_grid() -> None:
+    # Ruling: decimation strides over the grid actually used (corners may be dropped from the
+    # response); metadata keeps the full grid size.
+    service = SimulationService()
+    response = service.run_request(AnalysisRequest(netlist_text=PULSE_NETLIST, options={"output_max_points": 40}))
+    full = response.metadata["time_points"]
+    decimation = response.metadata["output_decimation"]
+    assert decimation["original_points"] == full and decimation["returned_points"] == len(response.waveform["time"]) <= 41
+    assert response.waveform["time"][0] == 0.0 and response.waveform["time"][-1] == parse_value("200n")

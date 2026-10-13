@@ -54,6 +54,7 @@ BOOL_OPTIONS = {
     "use_mor": "use_mor",
     "mor": "use_mor",
     "mor_validate": "mor_validate",
+    "breakpoints": "breakpoints",
 }
 TRUE_FORMS = [True, 1, np.True_, "true", "TRUE", " True ", "yes", "YES", "on", "On", "1", " 1 "]
 FALSE_FORMS = [False, 0, np.False_, "false", "False", " FALSE ", "no", "No", "off", "OFF", "0", " 0 "]
@@ -81,6 +82,7 @@ def test_boolean_rejects_everything_else(backend, circuit, name: str, value: obj
 def test_boolean_defaults_and_none(backend, circuit) -> None:
     defaults = _options(backend, circuit)
     assert (defaults.use_krylov, defaults.use_mor, defaults.mor_validate) == (False, False, True)
+    assert defaults.breakpoints is True and _options(backend, circuit, breakpoints=None).breakpoints is True
     explicit_none = _options(backend, circuit, use_krylov=None, use_mor=None, mor_validate=None)
     assert (explicit_none.use_krylov, explicit_none.use_mor, explicit_none.mor_validate) == (False, False, True)
 

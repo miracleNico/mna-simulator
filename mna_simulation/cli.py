@@ -51,6 +51,41 @@ def _add_lib_option(parser: argparse.ArgumentParser, relative_to: str) -> None:
     )
 
 
+def _add_stimulus_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--stimulus",
+        action="append",
+        type=Path,
+        default=[],
+        metavar="FILE.json",
+        help="JSON file with a stimulus object {name, node_p, node_n, points: [[t, v], ...], period} or a "
+        "list of them; each becomes a table voltage source (repeatable). See mna_simulation.stimulus.",
+    )
+
+
+def load_stimuli(paths: list[Path]) -> list[object]:
+    """The stimulus objects of ``--stimulus`` files (each holds one object or a list of them).
+
+    ``ValueError`` names the file for unreadable files, invalid JSON or entries that are not
+    objects; the fields themselves are validated by the request model and the service.
+    """
+
+    stimuli: list[object] = []
+    for path in paths:
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ValueError(f"--stimulus {path}: {exc.strerror or exc}") from None
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"--stimulus {path}: invalid JSON ({exc})") from None
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError(f"--stimulus {path}: expected a stimulus object or a list of them")
+            stimuli.append(entry)
+    return stimuli
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command-line parser."""
 
@@ -68,6 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     _add_threads_option(run_parser)
     _add_lib_option(run_parser, "the directory of the including file")
+    _add_stimulus_option(run_parser)
 
     text_parser = subparsers.add_parser("run-text", help="Run a simulation from inline netlist text.")
     text_parser.add_argument("netlist_text", help="Raw netlist text.")
@@ -80,6 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
     text_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     _add_threads_option(text_parser)
     _add_lib_option(text_parser, "the current directory")
+    _add_stimulus_option(text_parser)
 
     return parser
 
@@ -136,7 +173,12 @@ def main(argv: list[str] | None = None) -> int:
 
         mode = AnalysisMode(args.mode) if args.mode else None
         options = {} if args.threads is None else {"num_threads": args.threads}
-        request = AnalysisRequest(netlist_text=text, mode=mode, options=options)
+        try:
+            stimuli = load_stimuli(args.stimulus)
+            request = AnalysisRequest(netlist_text=text, mode=mode, options=options, stimuli=stimuli)
+        except ValueError as exc:  # unreadable file, bad JSON, or a stimulus the request model rejects
+            print(f"error: {exc}")
+            return 2
         if isinstance(service, SimulationService):
             # .include/.lib resolve next to the netlist file (or the current directory), then --lib.
             response = service.run_request(request, include_resolver=resolver)

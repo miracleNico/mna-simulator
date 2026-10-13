@@ -19,9 +19,11 @@ from mna_simulation import native, solvers
 from mna_simulation.api.contracts import AnalysisMode, AnalysisOptions, CircuitIR, ComponentRecord
 from mna_simulation.core_advanced import build_and_run_advanced
 from mna_simulation.core_basic import build_and_run_basic, run_basic_analysis
+from mna_simulation.device_models import source_expression
 from mna_simulation.errors import NetlistError
 from mna_simulation.mna_builder import build_mna_problem
 from mna_simulation.native.expressions import TimeTable, compile_expression
+from mna_simulation.netlist import parse_netlist_text
 from mna_simulation.stimulus import DigitalSignal
 from mna_simulation.table_sources import TIME_TABLES_KEY, pulse_table, resolve_tables, table_spec
 from mna_simulation.utils import parse_value
@@ -301,3 +303,37 @@ def test_netlists_without_table_sources_have_no_table_metadata() -> None:
     result = run_basic_analysis(problem, AnalysisOptions(mode=AnalysisMode.TRAN, tran_stop=1e-3, tran_step=1e-5))
     assert "table_sources" not in result.metadata
     np.testing.assert_array_equal(result.waveform.time, solvers._transient_time_points(1e-3, 1e-5))
+
+
+# ---------------------------------------------------------------------------
+# Netlist text: the parser's PULSE/PWL records become tables in the build
+# ---------------------------------------------------------------------------
+
+
+def test_netlist_pulse_and_pwl_become_tables() -> None:
+    text = "V1 a 0 PULSE(0 5 1u 1u 1u 5u 10u)\nV2 b 0 DC 1 PWL(0 0 1u 4 3u 0) R=0 TD=1u\nV3 c 0 PWL(0 0 1u 0 1u 5 2u 5)\n"
+    text += "R1 a 0 1k\nR2 b 0 1k\nR3 c 0 1k\n"
+    circuit = parse_netlist_text(text)
+    problem = build_mna_problem(circuit)
+    rows = {name: problem.b_time_str[problem.index_map.branch_to_index[name], 0] for name in ("V1", "V2", "V3")}
+    assert rows["V1"] == "__table_0(t)"
+    assert rows["V2"] == "(__table_1(t) - 1.0)"  # the waveform minus the DC value (the .op value)
+    assert "__table_" not in rows["V3"]  # a vertical step keeps the expression rendering
+    assert problem.b_dc[problem.index_map.branch_to_index["V2"], 0] == 1.0
+    # The tables and the parser's expression rendering agree.
+    for record, index in ((circuit.components[0], 0), (circuit.components[1], 1)):
+        reference = compile_expression(source_expression(record), time_dependent=True, n_unknowns=0)
+        table = resolve_tables(problem.metadata, 1e-7, 1e-5)[index]
+        times = np.linspace(0.0, 25e-6, 2501)
+        np.testing.assert_allclose(_program(table).evaluate_batch(times), reference.evaluate_batch(times), atol=1e-12, rtol=0)
+    # source_expression with the builder's list gives the placeholder as well.
+    tables: list = []
+    assert source_expression(circuit.components[0], tables) == "__table_0(t)" and len(tables) == 1
+
+
+def test_a_digital_signal_netlist_line_round_trips_through_the_parser() -> None:
+    signal = DigitalSignal.from_string("0110100", bit_period=83.33e-9, t_rise=8e-9, t_fall=8e-9)
+    text = signal.netlist_line("VDP", "dp", "0") + "\nR1 dp 0 90\n.tran 600n 1n\n"
+    problem = build_mna_problem(parse_netlist_text(text))
+    table = resolve_tables(problem.metadata, 1e-9, 600e-9)[0]
+    np.testing.assert_array_equal(np.column_stack((table.times, table.values)), signal.points())

@@ -1,7 +1,7 @@
 # Mixed-Signal Simulation with Python-Defined Digital Stimulus
 
-Status: assessment and design (phase D1 implementation is listed at the end; nothing in this
-document has landed yet unless the status table at the end says so).
+Status: assessment and design; phase D1 (section 4, L1) has landed, see section 6 for what was
+measured and where the implementation deviates from the design below.
 Companion: `HIERARCHY_AND_MODELS_PLAN.md` (part C), `CPP_MIGRATION_PLAN.md` (native core).
 
 ## 1. Question and verdict
@@ -171,6 +171,57 @@ costs roughly 0.1-0.3 s; a whole frame (1 ms of bus time, ~12 000 bits) a few se
 
 | Phase | Content | Status |
 | --- | --- | --- |
-| D1 | native table source, breakpoint-aware grid, `mna_simulation.stimulus` with the USB builder, `stimuli` request option, tests, docs | planned, runs after the parser phase M1 lands (it owns the `PWL`/`PULSE` records) |
+| D1 | native table source, breakpoint-aware grid, `mna_simulation.stimulus` with the USB builder, `stimuli` request option, tests, docs | landed (section 6.1) |
 | D2 | control-slot hook and Python scheduler for bidirectional co-simulation | designed, not scheduled |
 | L3 | HDL kernel, IBIS, transmission lines | not planned |
+
+### 6.1 Phase D1 as built
+
+What landed:
+
+* **VM table lookup.** `Op::Table k` (opcode 30) pushes table `k` of the program evaluated at
+  `t`: binary search (`std::upper_bound`) and one interpolation `v_i + slope_i (t - t_i)` with
+  the slopes precomputed when the program is built; the first value is held up to `times[0]`,
+  the last from `times[-1]`; with `period > 0` a time `t >= origin` is folded to
+  `origin + mod(t - origin, period)` first (`origin` is `times[0]` by default; a SPICE
+  `PWL ... R=r` uses `origin = r`). A `Program` owns its tables (`std::vector<Table>`, validated
+  at construction: strictly increasing finite times, finite values, finite non-negative period,
+  finite slopes), `evaluate_dual` gives a table zero derivative in every direction, and
+  `_core.compile_program(..., tables=[(times, values, period, origin), ...])` takes them. Python
+  lowers the placeholder call `__table_k(t)` to `TABLE k`, so a row that mixes tables and other
+  terms is still one program (`compile_expression(text, ..., tables=[TimeTable, ...])`).
+* **Records.** `PULSE` and `PWL` records (strictly increasing times) become tables in the build
+  (`device_models.spice_source_terms(component, time_tables)`); the DC and AC parts and `.op`
+  keep the parser's rules. Request stimuli are `V` records with `metadata["stimulus"]`. The
+  specs live in `MnaProblem.metadata["_time_tables"]` (the result metadata replaces them by a
+  JSON-safe `table_sources` summary); `PULSE`'s zero `tr`/`tf`/`pw` are resolved per analysis.
+* **Grid.** `solvers.transient_grid` merges the uniform grid with every corner inside
+  `[0, t_stop]` and `RAMP_POINTS = 4` points across each ramp shorter than `t_step`, at the
+  core's grid tolerance (`TIME_GRID_REL_TOL`, 1e-9 relative); `solve_transient`, the TPWL
+  training and reduced loops and linear MOR use it. Option `breakpoints` (default `true`, strict
+  boolean coercion); `.tran` metadata `time_points`.
+* **`mna_simulation.stimulus`** (`DigitalSignal`, `usb`), the `stimuli` request field, the CLI's
+  `--stimulus FILE.json`.
+
+Measured (this cloud container, shared, one thread; treat as orders of magnitude):
+
+| Run | Result |
+| --- | --- |
+| Acceptance: 64-byte DATA0 full-speed packet (556 bit times with idle, SYNC, stuffing and EOP) into the receiver front end of `tests/test_stimulus.py` (33 Ω series resistors, 90 Ω terminations to ground, 1N4148-card ESD diodes to 0 and 3.3 V, 10 pF loads, Q2N2222-card Gummel-Poon differential pair with 100 Ω base resistors, 1 kΩ loads and a 1.5 kΩ tail), `t_step = 1 ns` | 46 699 grid points, 0.084 s median of 5 (build plus `.tran`), decoded D+ and receiver output equal to the transmitted stream |
+| Diode clamp of section 3 (20 000 steps), stimulus with 16 / 128 / 512 edges | table 8.7 / 8.1 / 8.5 ms; `heaviside` sum 14.4 / 63.5 / 234.7 ms |
+| Same, 1024 edges and a 10^5-point table | 8.8 ms and 8.1 ms (the expression form fails above ~1000 terms) |
+
+Deviations from the design above:
+
+* `differential(v_common=None)` takes no `v_swing`: the swing is `v_high - v_low` of the
+  signal, centred on `v_common` when given (the negative output is `invert()`, edges aligned).
+* Every `PWL` with strictly increasing times is a table (plan 3.2 said "more than 64 points");
+  a `PWL` with a vertical step (two equal times) keeps the parser's expression, because tables
+  need strictly increasing times.
+* `.op` of a request stimulus is its value at t = 0; `.ac` ignores stimuli (DC value 0, no AC
+  part). Netlist `PULSE`/`PWL` sources keep the parser's `.op` rule (the `DC` value, else the
+  waveform at t = 0 by the parser's formulas).
+* `.hb` does not take its base frequency from a `PULSE` period (only `SIN`/`COS` sources set
+  it, as before); a table is sampled at the `2H + 1` collocation points, and a zero `tr`/`tf`
+  there is one sample spacing `T / (2H + 1)`, a zero `pw` the period `T`.
+* The acceptance packet has 556 bit times rather than the 600 bits estimated in section 4.

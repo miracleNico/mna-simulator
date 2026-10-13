@@ -66,6 +66,23 @@ This guide explains the normal web-app workflow for drawing circuits, running an
 - `.hb` solves steady-state harmonic balance. Supplying a time window reconstructs a time-domain waveform from harmonic-balance coefficients.
 - `.dyn` is the frontend dynamic display path. It streams transient samples through the backend websocket.
 - API callers that pass options directly: booleans such as `use_krylov` must be `true`/`false` (or `yes/no/on/off/1/0`), counts must be whole numbers, and times/frequencies may use metric suffixes like `"1m"`, as in the netlist directives. Other values return HTTP 400.
+- Breakpoints: `PULSE` and `PWL` sources (and waveforms sent as `stimuli`) are piecewise-linear tables. In `.tran` every corner of every table is a time point of the result, exactly, and a ramp shorter than the time step gets four extra points (at 1/5 ... 4/5 of the ramp), so a fast edge is never stepped over: a 1 ns edge under a 10 ns step is resolved, a 5 ns edge under a 1 ns step is sampled by the regular grid. The result's time axis is therefore not uniform when the circuit has table sources; `time_points` in the metadata gives its length, and `output_max_points` thins it for the response like any grid (the thinned response may skip corners). The option `breakpoints: false` keeps the uniform `t_step` grid. Circuits without table sources are unaffected.
+- Digital stimulus from Python: `mna_simulation.stimulus` turns bits into waveforms. `DigitalSignal.from_bits(...)` / `from_string("1011")` / `from_events(...)` / `from_numpy(t, v)` build a signal with edges (`t_rise`, `t_fall`), `nrzi()`, `bit_stuff()`, `invert()`, `delay(td)` and `differential()` transform it, and `netlist_line(...)` (a `PWL` line for raw netlist mode) or `to_stimulus(...)` (a `stimuli` entry for the API, or a file for the CLI's `--stimulus`) render it. `stimulus.usb` builds USB packets on D+/D- (SYNC, PID, CRC5/CRC16, bit stuffing, NRZI, EOP; full speed 12 Mbit/s with 8 ns edges, low speed 1.5 Mbit/s):
+
+  ```python
+  from mna_simulation.api.contracts import AnalysisRequest
+  from mna_simulation.api.service import SimulationService
+  from mna_simulation.stimulus import usb
+
+  dplus, dminus = usb.full_speed_packet("DATA0", bytes(range(8)))
+  netlist = "RTP dp 0 90\nRTM dm 0 90\nCP dp 0 10p\nCM dm 0 10p\n.tran 12u 1n\n"
+  response = SimulationService().run_request(AnalysisRequest(
+      netlist_text=netlist,
+      stimuli=[dplus.to_stimulus("Vdp", "dp", "0"), dminus.to_stimulus("Vdm", "dm", "0")],
+  ))
+  ```
+
+  `.op` uses a stimulus's value at t = 0, `.ac` ignores stimuli, `.hb` samples them at its collocation points.
 
 ## Threads
 

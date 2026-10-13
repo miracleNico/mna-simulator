@@ -425,14 +425,17 @@ def transient_value(subtype: str, metadata: dict[str, object], t: float) -> floa
     return None
 
 
-def source_terms(subtype: str, value: str | None, metadata: dict[str, object]) -> tuple[float, complex, str | None]:
+def source_terms(
+    subtype: str, value: str | None, metadata: dict[str, object], waveform: str | None = None
+) -> tuple[float, complex, str | None]:
     """``(dc, ac phasor, time expression)`` of a SPICE-form source record.
 
     ``.op`` uses ``dc``: the explicit ``DC`` value, or (as in SPICE) the waveform's value
     at t = 0 when the line gives none (``PULSE(5 0 ...)`` gives 5). ``.ac`` uses the phasor
     ``ac_mag * exp(j ac_phase deg)``. ``.tran`` and ``.hb`` evaluate ``b_dc + b_time(t)``,
     so the time expression is the waveform minus ``dc`` (``None`` when the source has no
-    transient function).
+    transient function). ``waveform`` replaces the rendered waveform expression (the
+    builder passes a table placeholder ``__table_k(t)`` for ``PULSE``/``PWL``).
     """
 
     if subtype == "AC":
@@ -448,7 +451,8 @@ def source_terms(subtype: str, value: str | None, metadata: dict[str, object]) -
         ac = complex(magnitude * math.cos(phase), magnitude * math.sin(phase)) if phase else complex(magnitude, 0.0)
     elif subtype == "AC" and value is not None:
         ac = complex(parse_value(value), 0.0)
-    waveform = render_transient(subtype, metadata)
+    if waveform is None:
+        waveform = render_transient(subtype, metadata)
     if waveform is not None and dc != 0.0:
         waveform = f"({waveform} - {_num(dc)})"
     return dc, ac, waveform

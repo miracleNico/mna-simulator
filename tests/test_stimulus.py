@@ -18,7 +18,8 @@ import time
 import numpy as np
 import pytest
 
-from mna_simulation.api.contracts import AnalysisMode, AnalysisOptions, CircuitIR, ComponentRecord
+from mna_simulation.api.contracts import AnalysisMode, AnalysisOptions, AnalysisRequest, CircuitIR, ComponentRecord
+from mna_simulation.api.service import SimulationService
 from mna_simulation.core_basic import run_basic_analysis
 from mna_simulation.errors import NetlistError
 from mna_simulation.mna_builder import build_mna_problem
@@ -431,3 +432,147 @@ def test_usb_acceptance_run_is_fast() -> None:
     _usb_acceptance_run()  # warm-up (imports, compile caches)
     _, _, _, elapsed = _usb_acceptance_run()
     assert elapsed < 2.0, f"acceptance run took {elapsed:.3f} s"
+
+
+# ---------------------------------------------------------------------------
+# Request integration: SimulationService, HTTP, schematic, CLI
+# ---------------------------------------------------------------------------
+
+RX_NETLIST = "RT dp 0 90\nCL dp 0 10p\n.tran 1.2u 1n\n"
+
+
+def _ack_stimulus() -> dict:
+    dplus, _ = usb.full_speed_packet("ACK")
+    return dplus.to_stimulus("VDP", "dp", "0")
+
+
+def test_request_round_trip_through_the_service() -> None:
+    entry = _ack_stimulus()
+    service = SimulationService()
+    response = service.run_request(AnalysisRequest(netlist_text=RX_NETLIST, stimuli=[entry]))
+    assert "I(VDP)" in response.labels
+    time_grid = np.asarray(response.waveform["time"])
+    v_dp = np.asarray(response.waveform["values"][response.labels.index("V(dp)")])
+    corners = np.asarray(entry["points"])
+    inside = corners[corners[:, 0] <= time_grid[-1]]
+    assert set(inside[:, 0].tolist()) <= set(time_grid.tolist())
+    np.testing.assert_allclose(v_dp[np.isin(time_grid, inside[:, 0])], inside[:, 1], atol=1e-9)
+    assert response.metadata["table_sources"] == [{"name": "VDP", "kind": "table", "points": len(corners), "period": 0.0}]
+    # The netlist PWL line of the same signal: the same grid, the same values up to rounding (the
+    # netlist source has a .op value, its waveform at t = 0, which b_time subtracts and b_dc adds).
+    dplus, _ = usb.full_speed_packet("ACK")
+    text = dplus.netlist_line("VDP", "dp", "0") + "\n" + RX_NETLIST
+    from_text = service.run_request(AnalysisRequest(netlist_text=text))
+    np.testing.assert_array_equal(np.asarray(from_text.waveform["time"]), time_grid)
+    np.testing.assert_allclose(
+        np.asarray(from_text.waveform["values"]), np.asarray(response.waveform["values"]), rtol=0, atol=1e-12
+    )
+    # .op: the value at t = 0 (idle J on D+); .ac: no AC part.
+    op = service.run_request(AnalysisRequest(netlist_text=RX_NETLIST, mode=AnalysisMode.OP, stimuli=[entry]))
+    assert op.dc_solution[op.labels.index("V(dp)")] == pytest.approx(3.3)
+    ac = service.run_request(
+        AnalysisRequest(netlist_text=RX_NETLIST, mode=AnalysisMode.AC, options={"f_start": 1e3, "f_stop": 1e6, "points": 3}, stimuli=[entry])
+    )
+    assert np.all(np.asarray(ac.spectrum["magnitudes"]) == 0.0)
+
+
+def test_request_stimuli_are_validated() -> None:
+    service = SimulationService()
+    entry = _ack_stimulus()
+    with pytest.raises(NetlistError, match="stimulus 'VDP' has the name of an existing component"):
+        service.run_request(AnalysisRequest(netlist_text="VDP dp 0 DC 1\n" + RX_NETLIST, stimuli=[entry]))
+    with pytest.raises(NetlistError, match="times must be strictly increasing"):
+        service.run_request(AnalysisRequest(netlist_text=RX_NETLIST, stimuli=[{**entry, "points": [[0, 0], [0, 1]]}]))
+    # Node names are matched case-insensitively against the netlist.
+    response = service.run_request(AnalysisRequest(netlist_text=RX_NETLIST, stimuli=[{**entry, "node_p": "DP", "node_n": 0}]))
+    assert "V(dp)" in response.labels and "V(DP)" not in response.labels
+
+
+def test_http_request_with_stimuli() -> None:
+    from fastapi.testclient import TestClient
+
+    import app.server.main as server
+
+    entry = _ack_stimulus()
+    with TestClient(server.app) as client:
+        ok = client.post("/api/simulate", json={"netlist_text": RX_NETLIST, "stimuli": [entry], "options": {"output_max_points": 100}})
+        assert ok.status_code == 200
+        body = ok.json()
+        assert body["metadata"]["output_decimation"]["original_points"] == body["metadata"]["time_points"]
+        bad = client.post("/api/simulate", json={"netlist_text": RX_NETLIST, "stimuli": [{**entry, "points": [[1, 0], [0, 1]]}]})
+        assert bad.status_code == 400
+        assert bad.json()["detail"]["code"] == "NETLIST_FATAL" and "stimulus 'VDP'" in bad.json()["detail"]["message"]
+        missing = client.post("/api/simulate", json={"netlist_text": RX_NETLIST, "stimuli": [{"name": "VDP"}]})
+        assert missing.status_code == 422  # the request model's own field validation
+
+
+def test_schematic_request_with_stimuli() -> None:
+    def pin(component_id: str, name: str) -> dict:
+        return {"kind": "component_pin", "component_id": component_id, "pin": name}
+
+    schematic = {
+        "components": [
+            {"id": "gnd1", "type": "GND", "name": "GND1"},
+            {"id": "v1", "type": "V", "name": "V1", "subtype": "DC", "value": "0"},
+            {"id": "r0", "type": "R", "name": "R0", "value": "1k"},
+            {"id": "r1", "type": "R", "name": "R1", "value": "1k"},
+            {"id": "c1", "type": "C", "name": "C1", "value": "10p"},
+        ],
+        "wires": [
+            {"id": "w0", "start": pin("v1", "n"), "end": pin("gnd1", "g")},
+            {"id": "w1", "start": pin("v1", "p"), "end": pin("r0", "p")},
+            {"id": "w2", "start": pin("r0", "n"), "end": pin("r1", "p")},
+            {"id": "w3", "start": pin("r1", "n"), "end": pin("c1", "p")},
+            {"id": "w4", "start": pin("c1", "n"), "end": pin("gnd1", "g")},
+        ],
+        "analysis": {"mode": "tran", "params": {"t_stop": "200n", "t_step": "1n"}},
+    }
+    request = AnalysisRequest.model_validate({"schematic": schematic, "stimuli": []})
+    response = SimulationService().run_request(request)
+    # Drive the net between R0 and R1: its name comes from the generated netlist.
+    net = next(line.split()[1] for line in response.metadata["generated_netlist"].splitlines() if line.startswith("R1 "))
+    signal = DigitalSignal.from_events([(0.0, 0), (50e-9, 1)], t_rise=1e-9, t_fall=1e-9)
+    driven = SimulationService().run_request(
+        AnalysisRequest.model_validate({"schematic": schematic, "stimuli": [signal.to_stimulus("VIN", net, "0")]})
+    )
+    assert "I(VIN)" in driven.labels
+    time_grid = np.asarray(driven.waveform["time"])
+    assert 50e-9 in time_grid and 51e-9 in time_grid
+
+
+def test_cli_stimulus_files(tmp_path, capsys) -> None:
+    import json
+
+    from mna_simulation.cli import main
+
+    entry = _ack_stimulus()
+    single = tmp_path / "dp.json"
+    single.write_text(json.dumps(entry), encoding="utf-8")
+    listed = tmp_path / "both.json"
+    _, dminus = usb.full_speed_packet("ACK")
+    listed.write_text(json.dumps([dminus.to_stimulus("VDM", "dm", "0")]), encoding="utf-8")
+    netlist = tmp_path / "rx.cir"
+    netlist.write_text(RX_NETLIST + "RTM dm 0 90\n", encoding="utf-8")
+    assert main(["run", str(netlist), "--stimulus", str(single), "--stimulus", str(listed), "--json"]) == 0
+    body = json.loads(capsys.readouterr().out)
+    assert {"I(VDP)", "I(VDM)"} <= set(body["labels"])
+    assert body["metadata"]["time_points"] == len(body["waveform"]["time"])
+    broken = tmp_path / "broken.json"
+    broken.write_text("{", encoding="utf-8")
+    assert main(["run", str(netlist), "--stimulus", str(broken)]) == 2
+    assert "invalid JSON" in capsys.readouterr().out
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({**entry, "points": [[1, 0], [0, 1]]}), encoding="utf-8")
+    assert main(["run", str(netlist), "--stimulus", str(bad)]) == 1
+    assert "NETLIST_FATAL: stimulus 'VDP': times must be strictly increasing" in capsys.readouterr().out
+
+
+def test_the_python_core_refuses_stimuli() -> None:
+    from mna_simulation.api.reference_service import ReferenceSimulationService
+
+    try:
+        service = ReferenceSimulationService()
+    except RuntimeError:  # no source checkout of the frozen core
+        pytest.skip("the frozen Python core is not available")
+    with pytest.raises(NetlistError, match="need the native core"):
+        service.run_request(AnalysisRequest(netlist_text=RX_NETLIST, stimuli=[_ack_stimulus()]))

@@ -262,6 +262,7 @@ class PythonBackend:
         mor_key = "use_mor" if "use_mor" in option_values else "mor"
         use_mor = _coerce_bool(option_values.get(mor_key), mor_key, False)
         mor_validate = _coerce_bool(option_values.get("mor_validate"), "mor_validate", True)
+        breakpoints = _coerce_bool(option_values.get("breakpoints"), "breakpoints", True)
 
         krylov_restart = _coerce_optional_int(option_values.get("krylov_restart"), "krylov_restart", 80)
         if "krylov_rank" in option_values:
@@ -304,6 +305,7 @@ class PythonBackend:
             mor_output_nodes=_coerce_label_list(option_values.get("mor_output_nodes")),
             mor_validate=mor_validate,
             num_threads=num_threads,
+            breakpoints=breakpoints,
         )
 
     def run(self, circuit: CircuitIR, options: AnalysisOptions) -> SimulationResult:

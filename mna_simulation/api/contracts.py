@@ -90,6 +90,9 @@ class AnalysisOptions:
     # Worker threads for this run: None/"auto" or a positive int on input; the service
     # replaces it with the count granted by the thread budget before the backend runs.
     num_threads: int | str | None = None
+    # Merge the corners of table sources (PULSE, PWL, request stimuli) into the transient
+    # grid (MIXED_SIGNAL.md phase D1); False keeps the uniform t_step grid.
+    breakpoints: bool = True
 
 
 @dataclass(slots=True)
@@ -217,6 +220,24 @@ class BackendCapabilities:
     supports_cpp_acceleration: bool = False
 
 
+class StimulusSpec(BaseModel):
+    """A waveform sent as an array: a table voltage source appended to the circuit.
+
+    ``points`` are ``[t, v]`` pairs (strictly increasing finite times, finite values, at
+    most 1e6 points; the first value is held before the first time and the last after the
+    last), ``period`` (seconds, optional) repeats the waveform from the first time. The
+    service validates them (``NETLIST_FATAL`` naming the stimulus, see
+    ``mna_simulation.table_sources.stimulus_records``); ``mna_simulation.stimulus``
+    builds them (``DigitalSignal.to_stimulus``).
+    """
+
+    name: str = Field(description="Voltage-source name ('V...'), unique and not a netlist component name.")
+    node_p: str | int = Field(description="Positive node.")
+    node_n: str | int = Field(description="Negative node ('0' is ground).")
+    points: list[Any] = Field(description="[[t, v], ...] corner points of the piecewise-linear waveform.")
+    period: float | None = Field(default=None, description="Repetition period in seconds (none: no repetition).")
+
+
 class AnalysisRequest(BaseModel):
     """HTTP/API request payload."""
 
@@ -224,6 +245,10 @@ class AnalysisRequest(BaseModel):
     mode: AnalysisMode | None = Field(default=None)
     options: dict[str, Any] = Field(default_factory=dict)
     schematic: "SchematicDocument | None" = None
+    stimuli: list[StimulusSpec] = Field(
+        default_factory=list,
+        description="Table voltage sources appended to the circuit (netlist text or schematic) before the build.",
+    )
 
 
 class SimulationResponse(BaseModel):

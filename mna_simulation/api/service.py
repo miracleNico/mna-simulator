@@ -16,6 +16,7 @@ from ..errors import CircuitSimulatorError
 from ..native import build_info, core_version
 from ..native.threads import ThreadBudget, default_budget, pin_blas_threads, useful_threads
 from ..schematic_pipeline import schematic_to_circuit_ir
+from ..table_sources import with_stimuli
 from ..utils import ndarray_to_list
 
 
@@ -91,6 +92,9 @@ class SimulationService:
             circuit = self.backend.parse_text(request.netlist_text, include_resolver=include_resolver)
         else:
             circuit = self.backend.parse_text(request.netlist_text)
+        if request.stimuli:
+            # Table voltage sources sent as arrays (MIXED_SIGNAL.md phase D1), validated here.
+            circuit = with_stimuli(circuit, request.stimuli)
         try:
             options = self.backend.build_options(circuit, overrides=request.options, mode=request.mode)
         except ValueError as exc:

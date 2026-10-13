@@ -132,6 +132,12 @@ class ReferenceSimulationService:
     def run_request(self, request: AnalysisRequest) -> SimulationResponse:
         """Run a request on the frozen Python core and return the live response model."""
 
+        if request.stimuli:
+            # The frozen core predates table sources (MIXED_SIGNAL.md phase D1).
+            raise errors.NetlistError(
+                "Request stimuli need the native core; the Python core (MNA_CORE=python) has no table sources.",
+                code="NETLIST_FATAL",
+            )
         # Same option rules (and HTTP 400s) as the C++ mode; the circuit's own directive
         # parameters are left to the frozen parser.
         try:
