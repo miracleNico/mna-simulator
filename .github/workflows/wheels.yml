@@ -4,11 +4,15 @@ on:
   workflow_dispatch:
   push:
     tags: ["v*"]
-    # Build the wheels whenever the compiled extension or its packaging changes;
-    # the pure-Python package is covered by ci.yml on every push.
+    # Build the wheels whenever anything that ends up in the wheel or in its test run
+    # changes. ci.yml covers the editable install on every push; the wheel test runs the
+    # suite against the installed package, whose layout differs (no checkout next to it),
+    # so pure-Python changes must re-validate the wheels too.
     branches: [dev, main]
     paths:
       - "cpp/**"
+      - "mna_simulation/**"
+      - "app/server/**"
       - "pyproject.toml"
       - ".github/workflows/wheels.yml"
       - ".github/scripts/**"
