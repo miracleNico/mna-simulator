@@ -52,7 +52,8 @@ export const USER_GUIDE_SECTIONS: UserGuideSection[] = [
       ".op solves the DC operating point and shows MNA matrices, operating-point values, and device states as lists and tables.",
       ".tran runs nonlinear transient simulation with Backward Euler; physical BJTs/MOSFETs continue using their I-V equations at each timestep.",
       ".ac first solves .op, then linearizes nonlinear devices around that bias and sweeps frequency.",
-      ".hb solves steady-state harmonic balance and can reconstruct a time-domain waveform when a time window is supplied."
+      ".hb solves steady-state harmonic balance and can reconstruct a time-domain waveform when a time window is supplied.",
+      "Digital stimulus: PULSE(...) and PWL(...) sources in raw netlist mode, and waveforms sent as arrays through the API's stimuli field, run as native table sources whose corner times land exactly on the transient grid (option breakpoints, default on). The Python package mna_simulation.stimulus builds bit streams and USB low-/full-speed packets for them; see MIXED_SIGNAL.md in the repository."
     ]
   },
   {

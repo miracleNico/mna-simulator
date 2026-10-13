@@ -1,6 +1,7 @@
 # Hierarchy UX, Vendor Model Import and Mixed-Signal Plan
 
-Status: **in progress** (phase H1 and phases M1/M2 running, see "Status" below).
+Status: **phases H1, M1, M2, M3 and D1 landed on `dev`** (see section 5); M4 and D2 are the
+next round.
 Companion documents: `MIXED_SIGNAL.md` (feasibility assessment and design for Python-defined
 digital stimulus), `CPP_MIGRATION_PLAN.md` (native core, rulings), `USER_GUIDE.md`.
 
@@ -242,8 +243,8 @@ problem for this simulator.
 | A (frontend) | Part A, phase H1 | landed on `dev` (make subcircuit, navigation, entity-owned ports, pin sides, instantiate/duplicate/dissolve, inline checks, vitest suite); follow-up: Run from inside an entity still simulates that entity alone |
 | B (parser) | Part B, phase M1 | landed on `dev` (`mna_simulation/spice/`, `tests/test_spice_dialect.py`; rulings in `tests/EDGE_CASES.md`: SPICE current-source sign inside `.subckt` bodies, `.op` takes the waveform's t = 0 value without a `DC` value, node names case-insensitive, `.ac dec/oct` run as linear sweeps for now) |
 | C (devices) | Part B, phase M2 | landed on `dev` (`cpp/include/mna/devices/{spice_diode,gummel_poon,mos_card}.hpp`, `mna_simulation/card_devices.py`, `tests/device_reference/`, `tests/test_spice_devices.py`) |
-| D (stimulus) | `MIXED_SIGNAL.md` phase D1 | running (parser-owned wiring staged until M1 lands) |
-| coordinator | M3 integration, `MIXED_SIGNAL.md` | assessment written; M3 after M1 |
+| D (stimulus) | `MIXED_SIGNAL.md` phase D1 | landed on `dev` (`Op::Table` in the VM, `mna_simulation/table_sources.py`, breakpoint-aware grid, `mna_simulation/stimulus/` with the USB packet builder, `stimuli` request field, `--stimulus`; `MIXED_SIGNAL.md` section 6.1 has the measurements) |
+| coordinator | M3 integration, `MIXED_SIGNAL.md` | done: `tests/vendor/` published-format cards end to end, SPICE process-parameter derivation (KP/PHI/GAMMA from UO/TOX/NSUB), docs; next round: M4 (charge-based capacitances, temperature, bulk diodes, model library UI), D2 (bidirectional co-simulation hook) |
 
 Each worker reports its branch and commits; the coordinator audits the diff, runs the full
 suite (`python -m pytest -q`, the C++ tests, the differential harness) and merges into `dev`.
